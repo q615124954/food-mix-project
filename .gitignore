@@ -1,0 +1,21 @@
+# 敏感信息（真实密钥，勿提交）
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 运行时状态（自动生成，可删）
+webapp/state.json
+
+# Dify 官方源码子仓库（不属于本采购单工作台项目）
+dify/
+
+# IDE / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

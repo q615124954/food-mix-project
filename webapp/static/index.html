@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>采购单审核工作台</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Microsoft YaHei", sans-serif; background: #f5f6f8; color: #222; display: flex; height: 100vh; }
+  /* 侧栏 */
+  .sidebar { width: 260px; background: #fff; border-right: 1px solid #e5e7eb; display: flex; flex-direction: column; }
+  .sidebar h2 { font-size: 15px; padding: 14px 16px; border-bottom: 1px solid #eee; }
+  .progress { padding: 10px 16px; font-size: 12px; color: #666; border-bottom: 1px solid #f0f0f0; display: flex; justify-content: space-between; }
+  .list { flex: 1; overflow-y: auto; }
+  .item { padding: 10px 16px; border-bottom: 1px solid #f3f4f6; cursor: pointer; }
+  .item:hover { background: #f9fafb; }
+  .item.active { background: #eef4ff; border-left: 3px solid #2563eb; }
+  .item .name { font-size: 13px; word-break: break-all; }
+  .item .meta { font-size: 11px; color: #999; margin-top: 4px; display: flex; gap: 6px; align-items: center; }
+  .badge { font-size: 11px; padding: 1px 7px; border-radius: 9px; color: #fff; }
+  .b-ocr { background: #f59e0b; }
+  .b-pending { background: #3b82f6; }
+  .b-done { background: #10b981; }
+  .b-err { background: #ef4444; }
+  /* 主区 */
+  .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .toolbar { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #fff; border-bottom: 1px solid #e5e7eb; flex-wrap: wrap; }
+  .toolbar label { font-size: 13px; color: #444; }
+  .toolbar input, .toolbar select { padding: 5px 8px; border: 1px solid #d1d5db; border-radius: 5px; font-size: 13px; }
+  .toolbar button { padding: 6px 16px; border: none; border-radius: 5px; background: #2563eb; color: #fff; font-size: 13px; cursor: pointer; }
+  .toolbar button.green { background: #10b981; }
+  .toolbar button.gray { background: #6b7280; }
+  .toolbar button:disabled { opacity: .5; cursor: not-allowed; }
+  .content { flex: 1; display: flex; overflow: hidden; }
+  .img-panel { flex: 1; min-width: 0; display: flex; align-items: center; justify-content: center; background: #e9eaee; overflow: auto; padding: 12px; }
+  .img-panel img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 4px; box-shadow: 0 2px 8px rgba(0,0,0,.15); cursor: zoom-in; }
+  .table-panel { width: 460px; border-left: 1px solid #e5e7eb; background: #fff; display: flex; flex-direction: column; }
+  .table-panel .head { padding: 10px 14px; font-size: 13px; font-weight: 600; border-bottom: 1px solid #eee; }
+  .table-wrap { flex: 1; overflow: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { border-bottom: 1px solid #f0f0f0; padding: 4px 6px; text-align: left; }
+  th { background: #f9fafb; color: #555; font-weight: 600; position: sticky; top: 0; }
+  td input { width: 100%; border: 1px solid transparent; padding: 4px; font-size: 13px; border-radius: 3px; }
+  td input:hover { border-color: #d1d5db; }
+  td input:focus { border-color: #2563eb; outline: none; background: #fff; }
+  td input.ro { background: #f3f4f6; }
+  .empty { padding: 30px; text-align: center; color: #999; font-size: 13px; }
+  .hint { padding: 8px 14px; font-size: 12px; color: #999; border-top: 1px solid #eee; }
+  .toast { position: fixed; left: 50%; bottom: 30px; transform: translateX(-50%); background: #111; color: #fff; padding: 9px 18px; border-radius: 6px; font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .25s; z-index: 999; }
+  .toast.show { opacity: 1; }
+  .toast.err { background: #dc2626; }
+</style>
+</head>
+<body>
+  <div class="sidebar">
+    <h2>采购单列表</h2>
+    <div class="progress"><span>进度</span><span id="summary"></span></div>
+    <div class="list" id="list"></div>
+  </div>
+
+  <div class="main">
+    <div class="toolbar">
+      <button type="button" class="gray" id="btn-prev">上一张</button>
+      <button type="button" class="gray" id="btn-next">下一张</button>
+      <label>日期 <input type="text" id="fld-date" placeholder="YYYY-MM-DD"></label>
+      <label>类别 <select id="fld-category"><option value="蔬菜">蔬菜</option><option value="肉类">肉类</option></select></label>
+      <button type="button" class="green" id="btn-confirm">确认落地</button>
+      <button type="button" class="gray" id="btn-rescan">重新扫描</button>
+    </div>
+    <div class="content">
+      <div class="img-panel" id="img-panel"><div class="empty">加载中…</div></div>
+      <div class="table-panel">
+        <div class="head" id="tbl-title">明细</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th style="width:32%">品名</th><th style="width:22%">数量</th><th style="width:22%">单价</th><th style="width:24%">金额</th></tr></thead>
+            <tbody id="tbody"></tbody>
+          </table>
+        </div>
+        <div class="hint">修改数量或金额时，单价自动 = 金额 ÷ 数量；也可直接改单价。</div>
+      </div>
+    </div>
+  </div>
+  <div class="toast" id="toast"></div>
+
+<script>
+let state = { invoices: [] };
+let cur = -1;
+let lastJson = '';
+let dirty = false;   // 有未提交的编辑时置 true，暂停自动刷新以免覆盖用户修改
+
+async function refresh() {
+  // 有未提交编辑时直接跳过，避免把用户改的内容还原成 OCR 原值
+  if (dirty) return;
+  const ae = document.activeElement;
+  if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'SELECT')) return;
+  const r = await fetch('/api/state');
+  const data = await r.json();
+  // 数据无变化则跳过重渲染，消除图片闪烁
+  const j = JSON.stringify(data);
+  if (j === lastJson) return;
+  lastJson = j;
+  state = data;
+  if (cur < 0 && state.invoices.length > 0) cur = 0;
+  renderSummary();
+  renderList();
+  renderCurrent();
+}
+
+function selectInvoice(i) {
+  dirty = false;   // 切换票据时放弃当前未保存的刷新保护
+  cur = i;
+  renderList();
+  renderCurrent();
+}
+
+function renderSummary() {
+  const s = state.summary || {};
+  document.getElementById('summary').textContent =
+    `识别 ${s.ocr_done||0}/${s.total||0} · 已确认 ${s.confirmed||0}`;
+}
+
+function renderList() {
+  const el = document.getElementById('list');
+  el.innerHTML = '';
+  state.invoices.forEach((inv, i) => {
+    const d = document.createElement('div');
+    d.className = 'item' + (i === cur ? ' active' : '');
+    let badge, bt;
+    if (inv.error) { badge = '失败'; bt = 'b-err'; }
+    else if (inv.status === 'confirmed') { badge = '已确认'; bt = 'b-done'; }
+    else if (inv.ocr_done) { badge = '待确认'; bt = 'b-pending'; }
+    else { badge = '识别中'; bt = 'b-ocr'; }
+    d.innerHTML = `<div class="name">${inv.filename}</div>
+      <div class="meta"><span class="badge ${bt}">${badge}</span>
+      <span>${inv.date || '未取日期'}</span></div>`;
+    d.onclick = () => selectInvoice(i);
+    el.appendChild(d);
+  });
+}
+
+function renderCurrent() {
+  if (cur < 0 || cur >= state.invoices.length) {
+    document.getElementById('img-panel').innerHTML = '<div class="empty">暂无票据</div>';
+    document.getElementById('tbody').innerHTML = '';
+    return;
+  }
+  const inv = state.invoices[cur];
+  document.getElementById('fld-date').value = inv.date || '';
+  document.getElementById('fld-category').value = inv.category || (inv.items[0] && inv.items[0]['类别']) || '蔬菜';
+  document.getElementById('tbl-title').textContent = inv.filename;
+  document.getElementById('btn-confirm').disabled = !inv.ocr_done;
+
+  const panel = document.getElementById('img-panel');
+  panel.innerHTML = `<img src="/images/${encodeURIComponent(inv.filename)}" onclick="this.style.cursor='zoom-out';this.style.maxWidth='none';this.style.maxHeight='none'" title="点击放大/还原">`;
+
+  const tb = document.getElementById('tbody');
+  tb.innerHTML = '';
+  if (!inv.items || inv.items.length === 0) {
+    let msg;
+    if (inv.error) msg = inv.error;
+    else if (inv.ocr_done) msg = '未识别到内容';
+    else msg = '识别中…';
+    tb.innerHTML = `<tr><td colspan="4" class="empty" style="text-align:center">${msg}</td></tr>`;
+    return;
+  }
+  inv.items.forEach((it, idx) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><input data-k="品名" data-row="${idx}" value="${esc(it['品名'] || '')}"></td>
+      <td><input data-k="数量" data-row="${idx}" data-trigger="true" value="${esc(it['数量'] != null ? it['数量'] : '')}"></td>
+      <td><input data-k="单价" data-row="${idx}" value="${esc(it['单价'] != null ? it['单价'] : '')}"></td>
+      <td><input data-k="金额" data-row="${idx}" data-trigger="true" value="${esc(it['金额'] != null ? it['金额'] : '')}"></td>`;
+    tr.querySelectorAll('input').forEach(inp => {
+      inp.addEventListener('input', () => {
+        dirty = true;
+        const row = +inp.dataset.row;
+        if (inp.dataset.k === '品名') inv.items[row]['品名'] = inp.value;
+        else if (inp.dataset.k === '数量') inv.items[row]['数量'] = toNum(inp.value);
+        else if (inp.dataset.k === '单价') inv.items[row]['单价'] = toNum(inp.value);
+        else if (inp.dataset.k === '金额') inv.items[row]['金额'] = toNum(inp.value);
+        if (inp.dataset.trigger) recompute(row);
+      });
+    });
+    tb.appendChild(tr);
+  });
+}
+
+document.getElementById('fld-date').addEventListener('input', () => { dirty = true; });
+document.getElementById('fld-category').addEventListener('change', () => { dirty = true; });
+
+function recompute(row) {
+  const it = state.invoices[cur].items[row];
+  const q = it['数量'], a = it['金额'];
+  if (q && a) {
+    it['单价'] = Math.round((a / q) * 100) / 100;
+    const inp = document.querySelector(`input[data-k="单价"][data-row="${row}"]`);
+    if (inp) inp.value = it['单价'];
+  }
+}
+
+function toNum(v) {
+  if (v === '' || v == null) return null;
+  const n = parseFloat(v);
+  return isNaN(n) ? v : n;
+}
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function prev() { if (cur > 0) selectInvoice(cur - 1); }
+function next() { if (cur < state.invoices.length - 1) selectInvoice(cur + 1); }
+
+let toastTimer = null;
+function toast(msg, isErr) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show' + (isErr ? ' err' : '');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.className = 'toast'; }, 2200);
+}
+
+async function submitConfirm() {
+  const inv = state.invoices[cur];
+  if (!inv) return;
+  const payload = {
+    date: document.getElementById('fld-date').value.trim(),
+    category: document.getElementById('fld-category').value,
+    items: inv.items.map(it => ({ '品名': it['品名'], '数量': it['数量'], '单价': it['单价'], '金额': it['金额'] }))
+  };
+  try {
+    const r = await fetch(`/api/invoice/${encodeURIComponent(inv.filename)}/confirm`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+    });
+    if (r.ok) { dirty = false; toast('已落地'); await refresh(); }
+    else { const e = await r.json(); toast('落地失败：' + (e.detail || '未知错误'), true); }
+  } catch (err) {
+    toast('请求失败：' + err.message, true);
+  }
+}
+
+async function rescan() {
+  await fetch('/api/rescan', { method: 'POST' });
+  dirty = false;
+  lastJson = '';
+  toast('已触发重新扫描，等待 OCR 完成');
+  refresh();
+}
+
+document.getElementById('btn-prev').addEventListener('click', prev);
+document.getElementById('btn-next').addEventListener('click', next);
+document.getElementById('btn-confirm').addEventListener('click', submitConfirm);
+document.getElementById('btn-rescan').addEventListener('click', rescan);
+
+// 每次加载/刷新页面：重置状态并重新扫描文件夹
+async function init() {
+  await fetch('/api/reset', { method: 'POST' });
+  lastJson = '';
+  dirty = false;
+  await refresh();
+}
+init();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
