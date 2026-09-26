@@ -12,6 +12,10 @@
   .sidebar h2 { font-size: 15px; padding: 14px 16px; border-bottom: 1px solid #eee; }
   .progress { padding: 10px 16px; font-size: 12px; color: #666; border-bottom: 1px solid #f0f0f0; display: flex; justify-content: space-between; }
   .list { flex: 1; overflow-y: auto; }
+  .paths { padding: 10px 16px; border-bottom: 1px solid #eee; font-size: 12px; }
+  .paths label { display: block; margin-bottom: 6px; color: #555; }
+  .paths input { width: 100%; padding: 5px 7px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 12px; box-sizing: border-box; }
+  .paths button { margin-top: 6px; width: 100%; padding: 5px 0; border: none; border-radius: 5px; background: #6b7280; color: #fff; font-size: 12px; cursor: pointer; }
   .item { padding: 10px 16px; border-bottom: 1px solid #f3f4f6; cursor: pointer; }
   .item:hover { background: #f9fafb; }
   .item.active { background: #eef4ff; border-left: 3px solid #2563eb; }
@@ -56,6 +60,11 @@
 <body>
   <div class="sidebar">
     <h2>采购单列表</h2>
+    <div class="paths">
+      <label>采购单文件夹 <input type="text" id="fld-input-dir" placeholder="D:\采购单"></label>
+      <label>财务表文件夹 <input type="text" id="fld-output-dir" placeholder="D:\财务表"></label>
+      <button type="button" class="gray" id="btn-apply-paths">应用路径</button>
+    </div>
     <div class="progress"><span>进度</span><span id="summary"></span></div>
     <div class="list" id="list"></div>
   </div>
@@ -105,9 +114,16 @@ async function refresh() {
   lastJson = j;
   state = data;
   if (cur < 0 && state.invoices.length > 0) cur = 0;
+  renderPaths(data.paths);
   renderSummary();
   renderList();
   renderCurrent();
+}
+
+function renderPaths(p) {
+  if (!p) return;
+  document.getElementById('fld-input-dir').value = p.input_dir || '';
+  document.getElementById('fld-output-dir').value = p.output_dir || '';
 }
 
 function selectInvoice(i) {
@@ -267,10 +283,33 @@ async function rescan() {
   refresh();
 }
 
+async function applyPaths() {
+  const payload = {
+    input_dir: document.getElementById('fld-input-dir').value.trim(),
+    output_dir: document.getElementById('fld-output-dir').value.trim(),
+  };
+  try {
+    const r = await fetch('/api/paths', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+    });
+    if (r.ok) {
+      dirty = false; cur = -1; lastJson = '';
+      toast('路径已应用，正在重新扫描');
+      await refresh();
+    } else {
+      const e = await r.json();
+      toast('应用失败：' + (e.detail || '未知错误'), true);
+    }
+  } catch (err) {
+    toast('请求失败：' + err.message, true);
+  }
+}
+
 document.getElementById('btn-prev').addEventListener('click', prev);
 document.getElementById('btn-next').addEventListener('click', next);
 document.getElementById('btn-confirm').addEventListener('click', submitConfirm);
 document.getElementById('btn-rescan').addEventListener('click', rescan);
+document.getElementById('btn-apply-paths').addEventListener('click', applyPaths);
 
 // 每次加载/刷新页面：重置状态并重新扫描文件夹
 async function init() {

@@ -23,11 +23,37 @@ from typing import List
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
-LAND_FILE = os.path.join(core.OUTPUT_DIR, "采购入库_落地.xlsx")
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+LAND_FILENAME = "采购入库_落地.xlsx"
 
 _lock = threading.Lock()
 _land_lock = threading.Lock()
 _state = {"invoices": []}
+# 可配置的输入/输出目录，默认取 pipeline_min 的常量
+_paths = {"input_dir": core.INPUT_DIR, "output_dir": core.OUTPUT_DIR}
+
+
+def land_file():
+    return os.path.join(_paths["output_dir"], LAND_FILENAME)
+
+
+# ===== 路径配置读写 =====
+def load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, encoding="utf-8") as f:
+                s = json.load(f)
+            if s.get("input_dir"):
+                _paths["input_dir"] = s["input_dir"]
+            if s.get("output_dir"):
+                _paths["output_dir"] = s["output_dir"]
+        except (OSError, ValueError):
+            pass
+
+
+def save_settings():
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(_paths, f, ensure_ascii=False, indent=2)
 
 
 # ===== 状态读写 =====
@@ -45,15 +71,18 @@ def load_state():
 
 
 def image_files():
+    d = _paths["input_dir"]
+    if not os.path.isdir(d):
+        return []
     return sorted(
-        f for f in os.listdir(core.INPUT_DIR)
+        f for f in os.listdir(d)
         if f.lower().endswith((".jpg", ".jpeg", ".png"))
     )
 
 
 # ===== 复用 pipeline_min 做单张 OCR =====
 def ocr_one(filename):
-    path = os.path.join(core.INPUT_DIR, filename)
+    path = os.path.join(_paths["input_dir"], filename)
     text = core.call_ocr(path)
     date = core.extract_date(text, filename)
     rows = core.parse_table(text)
@@ -158,12 +187,13 @@ def _merge_by_source(ws):
 
 
 def append_land(filename, date, category, total, items):
-    os.makedirs(core.OUTPUT_DIR, exist_ok=True)
+    os.makedirs(_paths["output_dir"], exist_ok=True)
     HEADERS = ["日期", "类别", "品名", "数量", "单价", "金额", "来源图片", "合计"]
+    land = land_file()
     with _land_lock:
-        if os.path.exists(LAND_FILE):
+        if os.path.exists(land):
             from openpyxl import load_workbook
-            wb = load_workbook(LAND_FILE)
+            wb = load_workbook(land)
             ws = wb.active
             # 兼容旧表头：确保「合计」列存在（合计追加在第 8 列，第 7 列仍为来源图片）
             if ws.cell(1, 8).value != "合计":
@@ -184,12 +214,13 @@ def append_land(filename, date, category, total, items):
                 it.get("单价"), it.get("金额"), filename, total,
             ])
         _merge_by_source(ws)
-        wb.save(LAND_FILE)
+        wb.save(land)
 
 
 # ===== FastAPI 应用 =====
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    load_settings()
     load_state()
     build_invoice_index()
     threading.Thread(target=ocr_worker, daemon=True).start()
@@ -203,6 +234,11 @@ class ConfirmPayload(BaseModel):
     date: str = ""
     category: str = ""
     items: List[dict] = Field(default_factory=list)
+
+
+class PathsPayload(BaseModel):
+    input_dir: str = ""
+    output_dir: str = ""
 
 
 @app.get("/")
@@ -219,12 +255,13 @@ def get_state():
     return {
         "invoices": invoices,
         "summary": {"total": total, "ocr_done": ocr_done, "confirmed": confirmed},
+        "paths": {"input_dir": _paths["input_dir"], "output_dir": _paths["output_dir"]},
     }
 
 
 @app.get("/images/{filename}")
 def get_image(filename: str):
-    p = os.path.join(core.INPUT_DIR, filename)
+    p = os.path.join(_paths["input_dir"], filename)
     if not os.path.exists(p):
         raise HTTPException(404, "图片不存在")
     return FileResponse(p)
@@ -247,6 +284,36 @@ def confirm(filename: str, payload: ConfirmPayload):
                 raise HTTPException(500, "落地文件被占用，请先关闭 WPS 后重试")
             return {"ok": True}
     raise HTTPException(404, "未找到该票据")
+
+
+@app.post("/api/paths")
+def set_paths(payload: PathsPayload):
+    global _state
+    in_dir = (payload.input_dir or "").strip().strip('"')
+    out_dir = (payload.output_dir or "").strip().strip('"')
+    # 输入目录必须真实存在
+    if not in_dir or not os.path.isdir(in_dir):
+        raise HTTPException(400, f"采购单目录不存在或不是文件夹：{in_dir}")
+    # 输出目录不存在则创建；存在但不是目录则报错
+    if not out_dir:
+        raise HTTPException(400, "请填写财务表输出目录")
+    if os.path.exists(out_dir) and not os.path.isdir(out_dir):
+        raise HTTPException(400, f"输出路径不是文件夹：{out_dir}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    with _lock:
+        _paths["input_dir"] = os.path.normpath(in_dir)
+        _paths["output_dir"] = os.path.normpath(out_dir)
+        _state = {"invoices": []}
+    save_settings()
+    try:
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+    except OSError:
+        pass
+    build_invoice_index()
+    threading.Thread(target=ocr_worker, daemon=True).start()
+    return {"ok": True, "paths": dict(_paths)}
 
 
 @app.post("/api/rescan")

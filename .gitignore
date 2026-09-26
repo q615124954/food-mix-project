@@ -10,6 +10,8 @@ venv/
 
 # 运行时状态（自动生成，可删）
 webapp/state.json
+# 本地路径配置（机器相关，勿提交）
+webapp/settings.json
 
 # Dify 官方源码子仓库（不属于本采购单工作台项目）
 dify/
