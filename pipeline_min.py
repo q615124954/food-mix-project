@@ -31,6 +31,7 @@ _load_env()
 
 # ===== 配置 =====
 API_URL = "https://ai.gitee.com/v1/images/ocr"
+CHAT_URL = "https://ai.gitee.com/v1/chat/completions"
 API_KEY = os.environ.get("HUNYUAN_API_KEY", "")
 MODEL = "HunyuanOCR"
 MAX_SIZE = 2048          # 图片最长边上限
@@ -69,6 +70,24 @@ def call_ocr(image_path):
     if r.status_code != 200:
         raise RuntimeError(f"OCR失败 {r.status_code}: {r.text[:200]}")
     return r.json().get("text_result") or r.json().get("text") or ""
+
+
+# ===== 2.5 文本 LLM 调用（品名归并等） =====
+def call_chat(messages, model="DeepSeek-V4-Pro", temperature=0.0, max_tokens=512):
+    """调用模力方舟 OpenAI 兼容 chat/completions，返回回复文本"""
+    r = requests.post(
+        CHAT_URL,
+        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+        json={"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens},
+        timeout=120,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"LLM失败 {r.status_code}: {r.text[:200]}")
+    data = r.json()
+    try:
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return ""
 
 
 # ===== 3. 解析 HTML 表格 =====

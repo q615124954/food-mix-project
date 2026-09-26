@@ -14,6 +14,8 @@ webapp/state.json
 webapp/settings.json
 # 品名纠错字典（回流学习累积的运行时数据，随使用持续变化）
 webapp/product_dict.json
+# 品名归并映射表（同步映射，随人工确认持续累积）
+webapp/name_map.json
 
 # Dify 官方源码子仓库（不属于本采购单工作台项目）
 dify/

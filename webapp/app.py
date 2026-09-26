@@ -7,7 +7,10 @@
 import os
 import sys
 import json
+import re
+import shutil
 import threading
+from datetime import datetime
 from contextlib import asynccontextmanager
 
 # 让 webapp 能 import 到上级目录的 pipeline_min
@@ -27,12 +30,18 @@ SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 LAND_FILENAME = "采购入库_落地.xlsx"
 NAME_DICT_FILE = os.path.join(BASE_DIR, "product_dict.json")
 _name_dict = {"蔬菜": {}, "肉类": {}}
+# 品名归并映射表（物料明细同步用，别名→目标品名，按类别隔离）
+NAME_MAP_FILE = os.path.join(BASE_DIR, "name_map.json")
+_name_map = {"肉类": {}, "蔬菜": {}}
+
+# 类别 -> 目标表 sheet 名
+CATEGORY_SHEET = {"肉类": "肉类采购", "蔬菜": "日物料采购"}
 
 _lock = threading.Lock()
 _land_lock = threading.Lock()
 _state = {"invoices": []}
-# 可配置的输入/输出目录，默认取 pipeline_min 的常量
-_paths = {"input_dir": core.INPUT_DIR, "output_dir": core.OUTPUT_DIR}
+# 可配置的输入/输出目录与物料明细表路径
+_paths = {"input_dir": core.INPUT_DIR, "output_dir": core.OUTPUT_DIR, "material_file": ""}
 
 
 def land_file():
@@ -49,6 +58,8 @@ def load_settings():
                 _paths["input_dir"] = s["input_dir"]
             if s.get("output_dir"):
                 _paths["output_dir"] = s["output_dir"]
+            if s.get("material_file"):
+                _paths["material_file"] = s["material_file"]
         except (OSError, ValueError):
             pass
 
@@ -56,6 +67,22 @@ def load_settings():
 def save_settings():
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(_paths, f, ensure_ascii=False, indent=2)
+
+
+# ===== 品名归并映射表：持久化 =====
+def load_name_map():
+    global _name_map
+    if os.path.exists(NAME_MAP_FILE):
+        try:
+            with open(NAME_MAP_FILE, encoding="utf-8") as f:
+                _name_map = json.load(f)
+        except (OSError, ValueError):
+            _name_map = {"肉类": {}, "蔬菜": {}}
+
+
+def save_name_map():
+    with open(NAME_MAP_FILE, "w", encoding="utf-8") as f:
+        json.dump(_name_map, f, ensure_ascii=False, indent=2)
 
 
 # ===== 品名纠错字典：持久化 + 回流学习 =====
@@ -189,6 +216,213 @@ def normalize_item(it):
     }
 
 
+# ===== 物料明细同步 =====
+def _excel_serial(date_str):
+    """'2026-08-27' -> Excel 日期序列号"""
+    dt = datetime.strptime(str(date_str)[:10], "%Y-%m-%d")
+    return (dt - datetime(1899, 12, 30)).days
+
+
+def _extract_json(text):
+    """从模型回复中提取 JSON 对象文本"""
+    if not text:
+        return ""
+    m = re.search(r"\{.*\}", text, flags=re.S)
+    return m.group(0) if m else text
+
+
+def map_product_name(raw_name, category, candidates, model, qty=None, price=None, amt=None, candidate_units=None):
+    """
+    品名归并：先查映射表（按类别隔离），未命中再调 LLM。
+    候选集带单位注解 + few-shot + 价格分品类提示，提升归并准确率。
+    返回 dict：目标品名 / 置信度 / 理由 / 来源(mapping|ai|ai_error|ai_invalid)
+    """
+    mapping = _name_map.get(category, {})
+    if raw_name in mapping:
+        return {"目标品名": mapping[raw_name], "置信度": 1.0, "理由": "映射表命中", "来源": "mapping"}
+    # 候选集名称（带单位注解，帮助模型区分相似品名）
+    if candidate_units:
+        cand_str = "、".join(
+            f"{n}({candidate_units.get(n)})" if candidate_units.get(n) else n
+            for n in candidates
+        )
+    else:
+        cand_str = "、".join(candidates)
+    system = (
+        "你是餐饮采购品名归并助手。把采购单上的品名归并到给定的标准品名之一。"
+        "判断要点：1) 结合单价区分品类：单价约2~3元/斤的多为骨头，30元以上的多为肉；"
+        "2) 优先看品名字面含义，再结合单价佐证；3) 目标品名必须从候选集原样选取，一字不差。"
+        "只输出 JSON，不要解释、不要多余文字。"
+    )
+    ctx = []
+    if qty is not None:
+        ctx.append(f"数量={qty}")
+    if price is not None:
+        ctx.append(f"单价={price}")
+    if amt is not None:
+        ctx.append(f"金额={amt}")
+    ctx_str = ("，".join(ctx)) if ctx else "无"
+    user = (
+        f"标准品名候选集：{cand_str}\n"
+        f"待归并品名：{raw_name}\n"
+        f"类别：{category}\n"
+        f"参考信息：{ctx_str}\n"
+        f'输出格式示例：{{"目标品名":"牛大骨","置信度":0.9,"理由":"单价2.48为骨类"}}\n'
+        f'注意：目标品名只输出品名本身，不要带括号或单位。\n'
+        f'只输出 JSON：{{"目标品名":"候选集之一","置信度":0到1,"理由":"简短说明"}}'
+    )
+    try:
+        text = core.call_chat(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            model=model,
+        )
+    except Exception as e:
+        return {"目标品名": raw_name, "置信度": 0.0, "理由": f"AI调用失败: {e}", "来源": "ai_error"}
+    try:
+        obj = json.loads(_extract_json(text))
+    except Exception:
+        return {"目标品名": raw_name, "置信度": 0.0, "理由": "AI返回无法解析", "来源": "ai_error"}
+    target = str(obj.get("目标品名", "")).strip()
+    # 容错：模型可能把单位"(斤)"带进品名，剥离括号后再匹配
+    target_plain = re.sub(r"[（(].*?[)）]", "", target).strip()
+    if target_plain in candidates:
+        target = target_plain
+    elif target not in candidates:
+        return {"目标品名": raw_name, "置信度": 0.0, "理由": f"目标不在候选集: {target}", "来源": "ai_invalid"}
+    try:
+        conf = float(obj.get("置信度", 0))
+    except (TypeError, ValueError):
+        conf = 0.0
+    return {"目标品名": target, "置信度": conf, "理由": str(obj.get("理由", "")), "来源": "ai"}
+
+
+def _parse_target(ws):
+    """解析矩阵式目标表：返回 (日期序列号->数量列号, 品名->行号, 品名->单位)"""
+    header_row = None
+    for r in range(1, min(ws.max_row, 60) + 1):
+        cells = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+        has_pin = any(str(c).strip() == "品名" for c in cells[:6])
+        has_date = any(isinstance(c, (int, float)) and 40000 < c < 60000 for c in cells)
+        if has_pin and has_date:
+            header_row = r
+            break
+    if header_row is None:
+        raise ValueError("未找到目标表表头行")
+    date_cols = {}
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(header_row, c).value
+        if isinstance(v, (int, float)) and 40000 < v < 60000:
+            date_cols[int(v)] = c
+    name_rows = {}
+    name_units = {}
+    for r in range(header_row + 2, ws.max_row + 1):
+        name = ws.cell(r, 4).value
+        if name and str(name).strip() and "合计" not in str(name):
+            nm = str(name).strip()
+            name_rows[nm] = r
+            name_units[nm] = str(ws.cell(r, 5).value or "").strip()
+    return date_cols, name_rows, name_units
+
+
+def sync_to_material(model):
+    """把落地表数据同步到物料明细表（写前自动备份，只写数量+金额，单价/合计靠公式）"""
+    land = land_file()
+    if not os.path.exists(land):
+        raise HTTPException(400, f"落地表不存在：{land}")
+    material = _paths.get("material_file", "")
+    if not material or not os.path.exists(material):
+        raise HTTPException(400, "物料明细表路径无效，请先在页面配置")
+    if not material.lower().endswith(".xlsx"):
+        raise HTTPException(400, "物料明细表必须是 .xlsx 文件")
+
+    from openpyxl import load_workbook
+    lwb = load_workbook(land, data_only=True)
+    lws = lwb["已落地"] if "已落地" in lwb.sheetnames else lwb.active
+    # 动态解析表头，兼容有无「原品名」列；归并优先用「原品名」（OCR 原始值，隔离纠错字典污染）
+    header = [c.value for c in lws[1]]
+    col = {str(h).strip(): i for i, h in enumerate(header) if h}
+    raw_col = col.get("原品名")
+    rows = []
+    cur_date = ""
+    cur_cat = ""
+    for r in lws.iter_rows(min_row=2, values_only=True):
+        name = r[col["品名"]] if "品名" in col else None
+        if name is None:
+            continue
+        date = r[col["日期"]] if "日期" in col else ""
+        if date:
+            cur_date = date
+        cat = r[col["类别"]] if "类别" in col else ""
+        if cat:
+            cur_cat = cat
+        qty = r[col["数量"]] if "数量" in col else None
+        amt = r[col["金额"]] if "金额" in col else None
+        price = r[col["单价"]] if "单价" in col else None
+        raw = r[raw_col] if raw_col is not None else None
+        merge_name = str(raw).strip() if raw else str(name).strip()
+        rows.append({"date": str(cur_date)[:10], "cat": cur_cat, "name": merge_name,
+                     "qty": qty, "price": price, "amt": amt})
+    if not rows:
+        raise HTTPException(400, "落地表没有可同步的数据")
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup = material + f".bak_{ts}.xlsx"
+    shutil.copy2(material, backup)
+
+    twb = load_workbook(material)
+    sheet_cache = {}
+    map_cache = {}
+    results = []
+
+    for row in rows:
+        primary = CATEGORY_SHEET.get(row["cat"])
+        alt = "日物料采购" if primary == "肉类采购" else ("肉类采购" if primary == "日物料采购" else None)
+        sheets_to_try = [s for s in (primary, alt) if s and s in twb.sheetnames]
+        if not sheets_to_try:
+            results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": "", "置信度": 0,
+                            "理由": f"未识别类别或缺少sheet：{row['cat']}", "来源": "error"})
+            continue
+        placed = False
+        for sheet_name in sheets_to_try:
+            if sheet_name not in sheet_cache:
+                ws = twb[sheet_name]
+                date_cols, name_rows, name_units = _parse_target(ws)
+                sheet_cache[sheet_name] = (ws, date_cols, name_rows, name_units)
+            ws, date_cols, name_rows, name_units = sheet_cache[sheet_name]
+            candidates = list(name_rows.keys())
+            key = (sheet_name, row["name"])
+            mp = map_cache.get(key)
+            if mp is None:
+                mp = map_product_name(row["name"], row["cat"], candidates, model,
+                                      qty=row.get("qty"), price=row.get("price"), amt=row.get("amt"),
+                                      candidate_units=name_units)
+                map_cache[key] = mp
+            if mp["目标品名"] not in name_rows:
+                continue  # 该 sheet 匹配不上，试备选
+            tr = name_rows[mp["目标品名"]]
+            col_qty = date_cols.get(_excel_serial(row["date"]))
+            if col_qty is None:
+                results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": mp["目标品名"],
+                                "置信度": mp["置信度"], "理由": f"目标表无该日期列：{row['date']}", "来源": mp["来源"]})
+                placed = True
+                break
+            if row["qty"] is not None:
+                ws.cell(tr, col_qty).value = row["qty"]
+            if row["amt"] is not None:
+                ws.cell(tr, col_qty + 2).value = row["amt"]
+            results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": mp["目标品名"],
+                            "置信度": mp["置信度"], "理由": mp["理由"], "来源": mp["来源"],
+                            "数量": row["qty"], "金额": row["amt"]})
+            placed = True
+            break
+        if not placed:
+            results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": "", "置信度": 0,
+                            "理由": "品名在肉类/日物料表中均无法归并", "来源": "error"})
+
+    twb.save(material)
+    return results, backup
+
+
 # ===== 落地写 xlsx =====
 def _merge_by_source(ws):
     """按「来源图片」分组合并：日期/类别/合计三列纵向合并并居中"""
@@ -221,16 +455,18 @@ def _merge_by_source(ws):
 
 def append_land(filename, date, category, total, items):
     os.makedirs(_paths["output_dir"], exist_ok=True)
-    HEADERS = ["日期", "类别", "品名", "数量", "单价", "金额", "来源图片", "合计"]
+    HEADERS = ["日期", "类别", "品名", "数量", "单价", "金额", "来源图片", "合计", "原品名"]
     land = land_file()
     with _land_lock:
         if os.path.exists(land):
             from openpyxl import load_workbook
             wb = load_workbook(land)
             ws = wb.active
-            # 兼容旧表头：确保「合计」列存在（合计追加在第 8 列，第 7 列仍为来源图片）
+            # 兼容旧表头：确保「合计」「原品名」列存在
             if ws.cell(1, 8).value != "合计":
                 ws.cell(1, 8).value = "合计"
+            if ws.cell(1, 9).value != "原品名":
+                ws.cell(1, 9).value = "原品名"
             # 按来源图片去重：先删掉该图片已有的旧行，再覆盖式写入
             for r in range(ws.max_row, 1, -1):
                 if ws.cell(r, 7).value == filename:
@@ -244,7 +480,7 @@ def append_land(filename, date, category, total, items):
         for it in items:
             ws.append([
                 date, category, it.get("品名"), it.get("数量"),
-                it.get("单价"), it.get("金额"), filename, total,
+                it.get("单价"), it.get("金额"), filename, total, it.get("原品名", ""),
             ])
         _merge_by_source(ws)
         wb.save(land)
@@ -255,6 +491,7 @@ def append_land(filename, date, category, total, items):
 async def lifespan(app: FastAPI):
     load_settings()
     load_name_dict()
+    load_name_map()
     load_state()
     build_invoice_index()
     threading.Thread(target=ocr_worker, daemon=True).start()
@@ -273,6 +510,11 @@ class ConfirmPayload(BaseModel):
 class PathsPayload(BaseModel):
     input_dir: str = ""
     output_dir: str = ""
+    material_file: str = ""
+
+
+class SyncPayload(BaseModel):
+    model: str = "DeepSeek-V4-Pro"
 
 
 @app.get("/")
@@ -289,7 +531,8 @@ def get_state():
     return {
         "invoices": invoices,
         "summary": {"total": total, "ocr_done": ocr_done, "confirmed": confirmed},
-        "paths": {"input_dir": _paths["input_dir"], "output_dir": _paths["output_dir"]},
+        "paths": {"input_dir": _paths["input_dir"], "output_dir": _paths["output_dir"],
+                  "material_file": _paths["material_file"]},
     }
 
 
@@ -329,6 +572,7 @@ def set_paths(payload: PathsPayload):
     global _state
     in_dir = (payload.input_dir or "").strip().strip('"')
     out_dir = (payload.output_dir or "").strip().strip('"')
+    mat_file = (payload.material_file or "").strip().strip('"')
     # 输入目录必须真实存在
     if not in_dir or not os.path.isdir(in_dir):
         raise HTTPException(400, f"采购单目录不存在或不是文件夹：{in_dir}")
@@ -338,10 +582,16 @@ def set_paths(payload: PathsPayload):
     if os.path.exists(out_dir) and not os.path.isdir(out_dir):
         raise HTTPException(400, f"输出路径不是文件夹：{out_dir}")
     os.makedirs(out_dir, exist_ok=True)
+    # 物料明细表：可选，填了则校验是存在的 .xlsx 文件
+    if mat_file and not mat_file.lower().endswith(".xlsx"):
+        raise HTTPException(400, "物料明细表必须是 .xlsx 文件")
+    if mat_file and not os.path.exists(mat_file):
+        raise HTTPException(400, f"物料明细表文件不存在：{mat_file}")
 
     with _lock:
         _paths["input_dir"] = os.path.normpath(in_dir)
         _paths["output_dir"] = os.path.normpath(out_dir)
+        _paths["material_file"] = os.path.normpath(mat_file) if mat_file else ""
         _state = {"invoices": []}
     save_settings()
     try:
@@ -375,6 +625,20 @@ def reset():
     build_invoice_index()
     threading.Thread(target=ocr_worker, daemon=True).start()
     return {"ok": True}
+
+
+@app.post("/api/sync")
+def sync(payload: SyncPayload):
+    """执行落地表 → 物料明细表的同步映射（全自动，写前自动备份）"""
+    try:
+        results, backup = sync_to_material(payload.model)
+    except PermissionError:
+        raise HTTPException(500, "物料明细表被占用，请先关闭 WPS/Excel 后重试")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"同步失败：{e}")
+    return {"ok": True, "count": len(results), "backup": backup, "results": results}
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
