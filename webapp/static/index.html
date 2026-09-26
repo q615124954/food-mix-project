@@ -45,6 +45,8 @@
   td input:focus { border-color: #2563eb; outline: none; background: #fff; }
   td input.ro { background: #f3f4f6; }
   .empty { padding: 30px; text-align: center; color: #999; font-size: 13px; }
+  .totalbar { padding: 10px 14px; font-size: 15px; font-weight: 600; border-top: 1px solid #eee; }
+  .totalbar .val { color: #2563eb; }
   .hint { padding: 8px 14px; font-size: 12px; color: #999; border-top: 1px solid #eee; }
   .toast { position: fixed; left: 50%; bottom: 30px; transform: translateX(-50%); background: #111; color: #fff; padding: 9px 18px; border-radius: 6px; font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .25s; z-index: 999; }
   .toast.show { opacity: 1; }
@@ -77,6 +79,7 @@
             <tbody id="tbody"></tbody>
           </table>
         </div>
+        <div class="totalbar">合计：¥<span class="val" id="total-val">0.00</span></div>
         <div class="hint">修改数量或金额时，单价自动 = 金额 ÷ 数量；也可直接改单价。</div>
       </div>
     </div>
@@ -148,6 +151,7 @@ function renderCurrent() {
   const inv = state.invoices[cur];
   document.getElementById('fld-date').value = inv.date || '';
   document.getElementById('fld-category').value = inv.category || (inv.items[0] && inv.items[0]['类别']) || '蔬菜';
+  recomputeTotal();
   document.getElementById('tbl-title').textContent = inv.filename;
   document.getElementById('btn-confirm').disabled = !inv.ocr_done;
 
@@ -197,6 +201,21 @@ function recompute(row) {
     const inp = document.querySelector(`input[data-k="单价"][data-row="${row}"]`);
     if (inp) inp.value = it['单价'];
   }
+  recomputeTotal();
+}
+
+function recomputeTotal() {
+  const inv = state.invoices[cur];
+  const el = document.getElementById('total-val');
+  if (!el) return;
+  let sum = 0;
+  if (inv && inv.items && inv.items.length > 0) {
+    inv.items.forEach(it => {
+      const v = typeof it['金额'] === 'number' ? it['金额'] : parseFloat(it['金额']);
+      if (!isNaN(v)) sum += v;
+    });
+  }
+  el.textContent = (Math.round(sum * 100) / 100).toFixed(2);
 }
 
 function toNum(v) {

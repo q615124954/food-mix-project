@@ -170,6 +170,24 @@ def parse_line_items(rows):
 CENT = Decimal("0.01")
 
 
+def sum_amount(items):
+    """对明细「金额」列求和（Decimal，缺失按 0 跳过），返回 float；无任何有效金额时返回 None"""
+    total = Decimal("0")
+    has_value = False
+    for it in items:
+        v = it.get("金额")
+        if v is None or v == "":
+            continue
+        try:
+            total += Decimal(str(v))
+            has_value = True
+        except (ValueError, TypeError):
+            continue
+    if not has_value:
+        return None
+    return float(total.quantize(CENT, rounding=ROUND_HALF_UP))
+
+
 def derive_price(items):
     """
     单价 = 金额 ÷ 数量，精确到分（ROUND_HALF_UP）。
