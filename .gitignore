@@ -12,6 +12,8 @@ venv/
 webapp/state.json
 # 本地路径配置（机器相关，勿提交）
 webapp/settings.json
+# 品名纠错字典（回流学习累积的运行时数据，随使用持续变化）
+webapp/product_dict.json
 
 # Dify 官方源码子仓库（不属于本采购单工作台项目）
 dify/

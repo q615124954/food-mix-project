@@ -216,6 +216,21 @@ def derive_price(items):
     return items, stat
 
 
+# ===== 4.5 品名纠错 =====
+def correct_name(name, category, dictionary):
+    """
+    品名纠错：仅精确匹配（错名 → 正确名）。
+    dictionary 形如 {"蔬菜": {错误名: 正确名}, "肉类": {...}}，按类别隔离避免跨类误纠。
+    未命中则原样返回，不做改动。
+    """
+    if not name or not dictionary:
+        return name, False
+    table = dictionary.get(category) or {}
+    if name in table:
+        return table[name], True
+    return name, False
+
+
 # ===== 5. 写入暂存表 =====
 def write_staging(records):
     os.makedirs(OUTPUT_DIR, exist_ok=True)

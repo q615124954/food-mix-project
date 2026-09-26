@@ -25,6 +25,8 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 LAND_FILENAME = "采购入库_落地.xlsx"
+NAME_DICT_FILE = os.path.join(BASE_DIR, "product_dict.json")
+_name_dict = {"蔬菜": {}, "肉类": {}}
 
 _lock = threading.Lock()
 _land_lock = threading.Lock()
@@ -54,6 +56,31 @@ def load_settings():
 def save_settings():
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(_paths, f, ensure_ascii=False, indent=2)
+
+
+# ===== 品名纠错字典：持久化 + 回流学习 =====
+def load_name_dict():
+    global _name_dict
+    if os.path.exists(NAME_DICT_FILE):
+        try:
+            with open(NAME_DICT_FILE, encoding="utf-8") as f:
+                _name_dict = json.load(f)
+        except (OSError, ValueError):
+            _name_dict = {"蔬菜": {}, "肉类": {}}
+
+
+def save_name_dict():
+    with open(NAME_DICT_FILE, "w", encoding="utf-8") as f:
+        json.dump(_name_dict, f, ensure_ascii=False, indent=2)
+
+
+def learn_name(category, wrong, right):
+    """回流学习：把「OCR 原品名 → 确认后品名」写入纠错字典（幂等，同值跳过）"""
+    if not wrong or not right or wrong == right:
+        return
+    table = _name_dict.setdefault(category, {})
+    table[wrong] = right
+    save_name_dict()
 
 
 # ===== 状态读写 =====
@@ -91,6 +118,10 @@ def ocr_one(filename):
     total = core.sum_amount(items)
     for it in items:
         it["日期"] = date
+        raw = it.get("品名", "")
+        corrected, _ = core.correct_name(raw, it.get("类别", "蔬菜"), _name_dict)
+        it["原品名"] = raw
+        it["品名"] = corrected
     return {"date": date, "total": total, "items": items}
 
 
@@ -150,6 +181,8 @@ def _num(v):
 def normalize_item(it):
     return {
         "品名": it.get("品名", ""),
+        "原品名": it.get("原品名", ""),
+        "品名编辑": bool(it.get("品名编辑")),
         "数量": _num(it.get("数量")),
         "单价": _num(it.get("单价")),
         "金额": _num(it.get("金额")),
@@ -221,6 +254,7 @@ def append_land(filename, date, category, total, items):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_settings()
+    load_name_dict()
     load_state()
     build_invoice_index()
     threading.Thread(target=ocr_worker, daemon=True).start()
@@ -270,6 +304,10 @@ def get_image(filename: str):
 @app.post("/api/invoice/{filename}/confirm")
 def confirm(filename: str, payload: ConfirmPayload):
     items = [normalize_item(it) for it in payload.items]
+    # 回流学习：仅当用户手动编辑过品名时，才把「OCR 原品名 → 确认后品名」写入纠错字典
+    for it in items:
+        if it.get("品名编辑"):
+            learn_name(payload.category, it.get("原品名", ""), it.get("品名", ""))
     for inv in _state["invoices"]:
         if inv["filename"] == filename:
             total = core.sum_amount(items)

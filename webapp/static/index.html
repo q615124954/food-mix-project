@@ -195,7 +195,7 @@ function renderCurrent() {
       inp.addEventListener('input', () => {
         dirty = true;
         const row = +inp.dataset.row;
-        if (inp.dataset.k === '品名') inv.items[row]['品名'] = inp.value;
+        if (inp.dataset.k === '品名') { inv.items[row]['品名'] = inp.value; inv.items[row]['品名编辑'] = true; }
         else if (inp.dataset.k === '数量') inv.items[row]['数量'] = toNum(inp.value);
         else if (inp.dataset.k === '单价') inv.items[row]['单价'] = toNum(inp.value);
         else if (inp.dataset.k === '金额') inv.items[row]['金额'] = toNum(inp.value);
@@ -262,7 +262,7 @@ async function submitConfirm() {
   const payload = {
     date: document.getElementById('fld-date').value.trim(),
     category: document.getElementById('fld-category').value,
-    items: inv.items.map(it => ({ '品名': it['品名'], '数量': it['数量'], '单价': it['单价'], '金额': it['金额'] }))
+    items: inv.items.map(it => ({ '品名': it['品名'], '原品名': it['原品名'], '品名编辑': it['品名编辑'], '数量': it['数量'], '单价': it['单价'], '金额': it['金额'] }))
   };
   try {
     const r = await fetch(`/api/invoice/${encodeURIComponent(inv.filename)}/confirm`, {
