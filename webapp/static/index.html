@@ -34,6 +34,7 @@
   .toolbar button { padding: 6px 16px; border: none; border-radius: 5px; background: #2563eb; color: #fff; font-size: 13px; cursor: pointer; }
   .toolbar button.green { background: #10b981; }
   .toolbar button.gray { background: #6b7280; }
+  .toolbar button.red { background: #ef4444; }
   .toolbar button:disabled { opacity: .5; cursor: not-allowed; }
   .content { flex: 1; display: flex; overflow: hidden; }
   .img-panel { flex: 1; min-width: 0; display: flex; align-items: center; justify-content: center; background: #e9eaee; overflow: auto; padding: 12px; }
@@ -91,6 +92,7 @@
       <button type="button" class="green" id="btn-confirm">确认落地</button>
       <button type="button" class="green" id="btn-sync">同步到物料明细</button>
       <button type="button" class="gray" id="btn-rescan">重新扫描</button>
+      <button type="button" class="gray" id="btn-reset">重置</button>
     </div>
     <div class="content">
       <div class="img-panel" id="img-panel"><div class="empty">加载中…</div></div>
@@ -303,6 +305,30 @@ async function rescan() {
   refresh();
 }
 
+let resetArmed = false;
+async function doReset() {
+  const btn = document.getElementById('btn-reset');
+  if (!resetArmed) {
+    resetArmed = true;
+    btn.textContent = '再次点击确认';
+    btn.classList.remove('gray');
+    btn.classList.add('red');
+    setTimeout(() => { resetArmed = false; btn.textContent = '重置'; btn.classList.remove('red'); btn.classList.add('gray'); }, 3000);
+    toast('重置会清空已确认状态并重新识别（落地文件保留），再次点击确认');
+    return;
+  }
+  resetArmed = false;
+  btn.textContent = '重置';
+  btn.classList.remove('red');
+  btn.classList.add('gray');
+  await fetch('/api/reset', { method: 'POST' });
+  dirty = false;
+  cur = -1;
+  lastJson = '';
+  toast('已重置，重新识别中');
+  await refresh();
+}
+
 async function applyPaths() {
   const payload = {
     input_dir: document.getElementById('fld-input-dir').value.trim(),
@@ -371,15 +397,16 @@ document.getElementById('btn-prev').addEventListener('click', prev);
 document.getElementById('btn-next').addEventListener('click', next);
 document.getElementById('btn-confirm').addEventListener('click', submitConfirm);
 document.getElementById('btn-rescan').addEventListener('click', rescan);
+document.getElementById('btn-reset').addEventListener('click', doReset);
 document.getElementById('btn-apply-paths').addEventListener('click', applyPaths);
 document.getElementById('btn-sync').addEventListener('click', doSync);
 document.getElementById('btn-close-sync').addEventListener('click', () => {
   document.getElementById('sync-panel').classList.remove('show');
 });
 
-// 每次加载/刷新页面：重置状态并重新扫描文件夹
+// 每次加载/刷新页面：扫描文件夹（保留已确认状态，仅补 OCR 新图片/未识别项）
 async function init() {
-  await fetch('/api/reset', { method: 'POST' });
+  await fetch('/api/rescan', { method: 'POST' });
   lastJson = '';
   dirty = false;
   await refresh();

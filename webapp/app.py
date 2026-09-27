@@ -101,11 +101,43 @@ def save_name_dict():
         json.dump(_name_dict, f, ensure_ascii=False, indent=2)
 
 
+def collect_valid_names():
+    """合法品名集合：纠错字典所有 value ∪ 已确认单的「品名」。
+    用于回流学习安全网——判断一个 OCR 原品名是否本身已是合法品名，避免把
+    合法品名之间的串位（如 牛肉↔牛骨）学成全局映射、反向污染字典。"""
+    names = set()
+    for table in _name_dict.values():
+        for v in table.values():
+            if v:
+                names.add(str(v).strip())
+    for inv in _state.get("invoices", []):
+        if inv.get("status") != "confirmed":
+            continue
+        for it in inv.get("items", []):
+            v = it.get("品名")
+            if v:
+                names.add(str(v).strip())
+    names.discard("")
+    return names
+
+
 def learn_name(category, wrong, right):
-    """回流学习：把「OCR 原品名 → 确认后品名」写入纠错字典（幂等，同值跳过）"""
+    """回流学习：把「OCR 原品名 → 确认后品名」写入纠错字典（幂等，同值跳过）。
+    安全网：
+    1) 若 wrong（原品名）本身是合法品名，说明是合法名之间的串位歧义而非 OCR
+       垃圾串，拒绝学习，避免下次把真正品名反向纠正；
+    2) 成环检测：right 已是 key 且映射回 wrong（A→B 与 B→A 同存），拒绝。"""
     if not wrong or not right or wrong == right:
         return
+    wrong = str(wrong).strip()
+    right = str(right).strip()
+    if not wrong or not right or wrong == right:
+        return
+    if wrong in collect_valid_names():
+        return
     table = _name_dict.setdefault(category, {})
+    if table.get(right) == wrong:
+        return
     table[wrong] = right
     save_name_dict()
 
@@ -338,7 +370,7 @@ def sync_to_material(model):
     from openpyxl import load_workbook
     lwb = load_workbook(land, data_only=True)
     lws = lwb["已落地"] if "已落地" in lwb.sheetnames else lwb.active
-    # 动态解析表头，兼容有无「原品名」列；归并优先用「原品名」（OCR 原始值，隔离纠错字典污染）
+    # 动态解析表头，兼容有无「原品名」列；归并以「品名」为准（OCR→纠错→人工确认后的最终值）
     header = [c.value for c in lws[1]]
     col = {str(h).strip(): i for i, h in enumerate(header) if h}
     raw_col = col.get("原品名")
@@ -359,7 +391,9 @@ def sync_to_material(model):
         amt = r[col["金额"]] if "金额" in col else None
         price = r[col["单价"]] if "单价" in col else None
         raw = r[raw_col] if raw_col is not None else None
-        merge_name = str(raw).strip() if raw else str(name).strip()
+        # 归并以「品名」（用户确认后的最终值）为准，「原品名」仅作追溯/回流学习，
+        # 不再作为归并输入，否则会忽略用户手动修正的品名（如把「牛肉」误归成「牛骨」）
+        merge_name = str(name).strip() if name else (str(raw).strip() if raw else "")
         rows.append({"date": str(cur_date)[:10], "cat": cur_cat, "name": merge_name,
                      "qty": qty, "price": price, "amt": amt})
     if not rows:

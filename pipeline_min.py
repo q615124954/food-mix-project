@@ -55,8 +55,8 @@ def prepare_image(path):
     return buf, os.path.basename(path)
 
 
-# ===== 2. 调用 OCR =====
 def call_ocr(image_path):
+    """调用 HunyuanOCR 专用接口识别图片，返回 HTML 表格文本"""
     buf, name = prepare_image(image_path)
     files = {"image": (name, buf, "image/jpeg")}
     data = {"model": MODEL}
@@ -93,9 +93,8 @@ def call_chat(messages, model="DeepSeek-V4-Pro", temperature=0.0, max_tokens=512
 # ===== 3. 解析 HTML 表格 =====
 def parse_table(text):
     """
-    从 OCR 输出中提取 <table> 的所有行，返回 [[cell, ...], ...]
+    从 HunyuanOCR 输出的 HTML 中提取 <table> 的所有行，返回 [[cell, ...], ...]
     """
-    rows = {}
     # OCR 输出的表格用 <tr>...<td> 组织，逐行切分
     trs = re.findall(r"<tr>(.*?)</tr>", text, flags=re.S)
     parsed = []
@@ -135,9 +134,8 @@ def extract_date(text, filename):
         if ym:
             year = ym.group(1)
         return f"{year}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
-    fm = re.search(r"(20\d{2})(\d{2})(\d{2})", filename)
-    if fm:
-        return f"{fm.group(1)}-{fm.group(2)}-{fm.group(3)}"
+    # 注意：文件名里的日期是微信保存时间（如 20260902），并非单据日期，
+    # 回退到文件名会得到错误日期（如把 8 月的单记成 9 月），故识别失败时留空，交人工在前端填写。
     return ""
 
 
@@ -167,12 +165,19 @@ def parse_line_items(rows):
             if not name:
                 continue
             amount = extract_num(cells[4]) if len(cells) > 4 else None
-            # 数量：复合数量在 cells[3]（"n×p"），分开列则数量在 cells[2]
-            if len(cells) > 3 and re.search(r"[×xX]", cells[3]):
-                m = re.search(r"(\d+(?:\.\d+)?)\s*[×xX]", cells[3])
-                qty = float(m.group(1)) if m else None
-            else:
-                qty = extract_num(cells[2]) if len(cells) > 2 else None
+            # 数量：优先识别「复合数量」(数字×数字，如 11.9×33 / 20×44)，可能落在
+            # 数量列或品名列后一列；否则按「分开列」取数量列。
+            # 注意：单价列偶被 OCR 成「×25」(乘号在数字前)，不能误判为复合数量。
+            comp = re.compile(r"(\d+(?:\.\d+)?)\s*[×xX]\s*\d")
+            qty = None
+            for idx in (3, 2):
+                if len(cells) > idx:
+                    m = comp.search(cells[idx])
+                    if m:
+                        qty = float(m.group(1))
+                        break
+            if qty is None and len(cells) > 2:
+                qty = extract_num(cells[2])
             items.append({"品名": name, "数量": qty, "金额": amount, "类别": "肉类"})
             continue
         # 品名开头的单据（蔬菜单）：4 列，品名在 cells[0]，数量 cells[1]，金额 cells[3]

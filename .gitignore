@@ -20,6 +20,10 @@ webapp/name_map.json
 # Dify 官方源码子仓库（不属于本采购单工作台项目）
 dify/
 
+# 服务运行日志（临时诊断用）
+webapp/_uvicorn.log
+webapp/_uvicorn.err
+
 # IDE / 系统
 .vscode/
 .idea/
