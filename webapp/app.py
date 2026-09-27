@@ -675,4 +675,48 @@ def sync(payload: SyncPayload):
     return {"ok": True, "count": len(results), "backup": backup, "results": results}
 
 
+# ===== 系统原生文件/文件夹选择器 =====
+def _pick_dialog(kind):
+    """弹系统选择器：kind='dir' 选文件夹，'file' 选 .xlsx 文件；取消返回空串。
+    用独立子进程弹 tkinter 对话框，避免 tkinter 在 web 服务线程里的线程/消息循环问题。"""
+    import subprocess
+    pick = (
+        "print(filedialog.askdirectory(title='选择文件夹') or '')"
+        if kind == "dir"
+        else "print(filedialog.askopenfilename(title='选择物料明细表',filetypes=[('Excel','*.xlsx')]) or '')"
+    )
+    code = (
+        "import tkinter as tk;from tkinter import filedialog;"
+        "r=tk.Tk();r.withdraw();r.attributes('-topmost',True);"
+        + pick + ";r.destroy()"
+    )
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    kwargs = {}
+    if os.name == "nt":  # Windows：隐藏子进程控制台窗口
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0
+        kwargs["startupinfo"] = si
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    r = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True, encoding="utf-8",
+        timeout=600, env=env, **kwargs,
+    )
+    if not r.stdout:
+        return ""
+    return r.stdout.strip().splitlines()[-1].strip()
+
+
+@app.get("/api/pick")
+def pick(kind: str = "dir"):
+    if kind not in ("dir", "file"):
+        raise HTTPException(400, "kind 必须是 dir 或 file")
+    try:
+        return {"path": _pick_dialog(kind)}
+    except Exception as e:
+        raise HTTPException(500, f"无法打开选择器：{e}")
+
+
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

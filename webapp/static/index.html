@@ -16,6 +16,9 @@
   .paths label { display: block; margin-bottom: 6px; color: #555; }
   .paths input { width: 100%; padding: 5px 7px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 12px; box-sizing: border-box; }
   .paths button { margin-top: 6px; width: 100%; padding: 5px 0; border: none; border-radius: 5px; background: #6b7280; color: #fff; font-size: 12px; cursor: pointer; }
+  .paths .pathrow { display: flex; gap: 6px; margin-bottom: 8px; align-items: center; }
+  .paths .pathrow input { flex: 1; margin: 0; }
+  .paths .pathrow .pick { margin: 0; width: auto; flex-shrink: 0; padding: 5px 10px; border-radius: 4px; }
   .item { padding: 10px 16px; border-bottom: 1px solid #f3f4f6; cursor: pointer; }
   .item:hover { background: #f9fafb; }
   .item.active { background: #eef4ff; border-left: 3px solid #2563eb; }
@@ -74,9 +77,21 @@
   <div class="sidebar">
     <h2>采购单列表</h2>
     <div class="paths">
-      <label>采购单文件夹 <input type="text" id="fld-input-dir" placeholder="D:\采购单"></label>
-      <label>财务表文件夹 <input type="text" id="fld-output-dir" placeholder="D:\财务表"></label>
-      <label>物料明细表 <input type="text" id="fld-material-file" placeholder="D:\物料明细\2026年8月物料采购明细(金茂).xlsx"></label>
+      <label>采购单文件夹</label>
+      <div class="pathrow">
+        <input type="text" id="fld-input-dir" placeholder="D:\采购单">
+        <button type="button" class="gray pick" data-target="fld-input-dir" data-kind="dir">浏览</button>
+      </div>
+      <label>财务表文件夹</label>
+      <div class="pathrow">
+        <input type="text" id="fld-output-dir" placeholder="D:\财务表">
+        <button type="button" class="gray pick" data-target="fld-output-dir" data-kind="dir">浏览</button>
+      </div>
+      <label>物料明细表</label>
+      <div class="pathrow">
+        <input type="text" id="fld-material-file" placeholder="D:\物料明细\2026年8月物料采购明细(金茂).xlsx">
+        <button type="button" class="gray pick" data-target="fld-material-file" data-kind="file">浏览</button>
+      </div>
       <button type="button" class="gray" id="btn-apply-paths">应用路径</button>
     </div>
     <div class="progress"><span>进度</span><span id="summary"></span></div>
@@ -87,7 +102,7 @@
     <div class="toolbar">
       <button type="button" class="gray" id="btn-prev">上一张</button>
       <button type="button" class="gray" id="btn-next">下一张</button>
-      <label>日期 <input type="text" id="fld-date" placeholder="YYYY-MM-DD"></label>
+      <label>日期 <input type="date" id="fld-date"></label>
       <label>类别 <select id="fld-category"><option value="蔬菜">蔬菜</option><option value="肉类">肉类</option></select></label>
       <button type="button" class="green" id="btn-confirm">确认落地</button>
       <button type="button" class="green" id="btn-sync">同步到物料明细</button>
@@ -398,6 +413,18 @@ document.getElementById('btn-next').addEventListener('click', next);
 document.getElementById('btn-confirm').addEventListener('click', submitConfirm);
 document.getElementById('btn-rescan').addEventListener('click', rescan);
 document.getElementById('btn-reset').addEventListener('click', doReset);
+
+document.querySelectorAll('.pick').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    try {
+      const r = await fetch('/api/pick?kind=' + btn.dataset.kind);
+      const data = await r.json();
+      if (r.ok && data.path) document.getElementById(btn.dataset.target).value = data.path;
+    } catch (err) {
+      toast('打开选择器失败：' + err.message, true);
+    }
+  });
+});
 document.getElementById('btn-apply-paths').addEventListener('click', applyPaths);
 document.getElementById('btn-sync').addEventListener('click', doSync);
 document.getElementById('btn-close-sync').addEventListener('click', () => {
