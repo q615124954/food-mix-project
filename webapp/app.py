@@ -102,14 +102,18 @@ def save_name_dict():
 
 
 def collect_valid_names():
-    """合法品名集合：纠错字典所有 value ∪ 已确认单的「品名」。
-    用于回流学习安全网——判断一个 OCR 原品名是否本身已是合法品名，避免把
-    合法品名之间的串位（如 牛肉↔牛骨）学成全局映射、反向污染字典。"""
+    """合法品名集合：纠错字典 value ∪ 归并映射表 key ∪ 已确认单的「品名」。
+    用于回流学习安全网（判断 OCR 原品名是否本身已是合法品名，避免把合法品名
+    之间的串位如 牛肉↔牛骨 学成全局映射），也用作存疑判定的「认定品名」白名单。"""
     names = set()
     for table in _name_dict.values():
         for v in table.values():
             if v:
                 names.add(str(v).strip())
+    for table in _name_map.values():
+        for k in table.keys():
+            if k:
+                names.add(str(k).strip())
     for inv in _state.get("invoices", []):
         if inv.get("status") != "confirmed":
             continue
@@ -167,6 +171,54 @@ def image_files():
 
 
 # ===== 复用 pipeline_min 做单张 OCR =====
+def compute_suspects(date, items):
+    """OCR 后规则式存疑判定（零成本，不调 LLM），返回存疑原因列表（空=正常）。
+    覆盖：日期未识别 / 未识别到内容 / 缺数量 / 缺金额 / 数量为0 /
+    品名存疑（残留数字或单字、或不在「认定品名」集合）/ 品名重复。
+    供前端在待确认单旁加「存疑」标记，提示人工优先核对。"""
+    suspects = []
+    if not date:
+        suspects.append("日期未识别")
+    if not items:
+        suspects.append("未识别到内容")
+        return suspects
+    cnt_q = sum(1 for it in items if it.get("勾稽") == "缺数量")
+    cnt_a = sum(1 for it in items if it.get("勾稽") == "缺金额")
+    cnt_z = sum(1 for it in items if it.get("勾稽") == "数量为0")
+    if cnt_q:
+        suspects.append(f"{cnt_q} 行缺数量")
+    if cnt_a:
+        suspects.append(f"{cnt_a} 行缺金额")
+    if cnt_z:
+        suspects.append(f"{cnt_z} 行数量为0")
+    # 品名存疑：残留数字/单字，或不在「认定品名」集合（纠错字典value ∪ 已确认品名）。
+    # 认定品名动态收集，冷启动可能为空/不完整：集合为空时跳过"不在认定品名"判定，避免误报。
+    valid = collect_valid_names()
+    bad_names = []
+    for it in items:
+        nm = str(it.get("品名", "")).strip()
+        if not nm:
+            continue
+        fmt_bad = len(nm) == 1 or re.search(r"\d", nm)
+        unknown = bool(valid) and nm not in valid
+        if fmt_bad or unknown:
+            bad_names.append(nm)
+    if bad_names:
+        shown = "、".join(bad_names[:3]) + ("…" if len(bad_names) > 3 else "")
+        suspects.append(f"{len(bad_names)} 行品名存疑（{shown}）")
+    # 重复品名存疑：同一单内出现重复品名（如 牛肉 误识别成 牛骨 导致两行都叫牛骨）。
+    # 手写单通常一品名一行，重复多为误识别，提示人工核对。
+    name_counts = {}
+    for it in items:
+        nm = str(it.get("品名", "")).strip()
+        if nm:
+            name_counts[nm] = name_counts.get(nm, 0) + 1
+    dups = [nm for nm, c in name_counts.items() if c > 1]
+    if dups:
+        suspects.append(f"品名重复（{'、'.join(dups)}）")
+    return suspects
+
+
 def ocr_one(filename):
     path = os.path.join(_paths["input_dir"], filename)
     text = core.call_ocr(path)
@@ -181,7 +233,8 @@ def ocr_one(filename):
         corrected, _ = core.correct_name(raw, it.get("类别", "蔬菜"), _name_dict)
         it["原品名"] = raw
         it["品名"] = corrected
-    return {"date": date, "total": total, "items": items}
+    return {"date": date, "total": total, "items": items,
+            "suspects": compute_suspects(date, items)}
 
 
 def build_invoice_index():
@@ -194,6 +247,11 @@ def build_invoice_index():
             # 旧状态可能没有 total，用明细金额补算
             if inv.get("total") in (None, ""):
                 inv["total"] = core.sum_amount(inv.get("items", []))
+            # 每次重算 suspects（基于现有明细），保证规则更新后重启即生效
+            if inv.get("ocr_done") and inv.get("items"):
+                inv["suspects"] = compute_suspects(inv.get("date", ""), inv.get("items", []))
+            elif "suspects" not in inv:
+                inv["suspects"] = []
             invoices.append(inv)
         else:
             invoices.append({
@@ -204,6 +262,7 @@ def build_invoice_index():
                 "total": "",
                 "items": [],
                 "error": "",
+                "suspects": [],
             })
     with _lock:
         _state["invoices"] = invoices
@@ -220,6 +279,7 @@ def ocr_worker():
             inv["date"] = res["date"]
             inv["total"] = res.get("total")
             inv["items"] = res["items"]
+            inv["suspects"] = res.get("suspects", [])
             inv["ocr_done"] = True
             inv["error"] = ""
         except Exception as e:
@@ -553,7 +613,9 @@ class SyncPayload(BaseModel):
 
 @app.get("/")
 def index():
-    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+    # no-cache：强制浏览器每次取最新 index.html，避免旧缓存页（旧 init 调 reset）清空确认状态
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"),
+                        headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
 
 @app.get("/api/state")
@@ -591,6 +653,7 @@ def confirm(filename: str, payload: ConfirmPayload):
             inv["date"] = payload.date
             inv["total"] = total
             inv["items"] = items
+            inv["suspects"] = []   # 已确认，清除存疑标记
             inv["status"] = "confirmed"
             save_state()
             try:

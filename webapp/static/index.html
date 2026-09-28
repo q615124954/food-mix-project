@@ -29,6 +29,7 @@
   .b-pending { background: #3b82f6; }
   .b-done { background: #10b981; }
   .b-err { background: #ef4444; }
+  .b-suspect { background: #f97316; }
   /* 主区 */
   .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
   .toolbar { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #fff; border-bottom: 1px solid #e5e7eb; flex-wrap: wrap; }
@@ -176,6 +177,12 @@ function renderSummary() {
     `识别 ${s.ocr_done||0}/${s.total||0} · 已确认 ${s.confirmed||0}`;
 }
 
+function suspectBadge(inv) {
+  const s = inv.suspects || [];
+  if (!s.length) return '';
+  return `<span class="badge b-suspect" title="${esc(s.join('；'))}">存疑</span>`;
+}
+
 function renderList() {
   const el = document.getElementById('list');
   el.innerHTML = '';
@@ -188,7 +195,7 @@ function renderList() {
     else if (inv.ocr_done) { badge = '待确认'; bt = 'b-pending'; }
     else { badge = '识别中'; bt = 'b-ocr'; }
     d.innerHTML = `<div class="name">${inv.filename}</div>
-      <div class="meta"><span class="badge ${bt}">${badge}</span>
+      <div class="meta"><span class="badge ${bt}">${badge}</span>${suspectBadge(inv)}
       <span>${inv.date || '未取日期'}</span></div>`;
     d.onclick = () => selectInvoice(i);
     el.appendChild(d);
