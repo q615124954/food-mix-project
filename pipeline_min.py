@@ -55,8 +55,9 @@ def prepare_image(path):
     return buf, os.path.basename(path)
 
 
-def call_ocr(image_path):
-    """调用 HunyuanOCR 专用接口识别图片，返回 HTML 表格文本"""
+def call_ocr(image_path, timeout=600):
+    """调用 HunyuanOCR 专用接口识别图片，返回 HTML 表格文本。
+    注：模力方舟 OCR 平台侧偶发极慢（实测 400+ 秒/张），超时须放宽到 10 分钟。"""
     buf, name = prepare_image(image_path)
     files = {"image": (name, buf, "image/jpeg")}
     data = {"model": MODEL}
@@ -65,7 +66,7 @@ def call_ocr(image_path):
         headers={"Authorization": f"Bearer {API_KEY}"},
         files=files,
         data=data,
-        timeout=180,
+        timeout=timeout,
     )
     if r.status_code != 200:
         raise RuntimeError(f"OCR失败 {r.status_code}: {r.text[:200]}")
@@ -157,6 +158,21 @@ def parse_line_items(rows):
         first = cells[0].strip() if cells else ""
         # 脏行：件数 / 合计 / 总计
         if first == "件数" or "合计" in first or "总计" in first:
+            continue
+        # 蔬菜单(7列)：序号|品名|单位|数量|单价|金额|备注。
+        # 序号列可为空（补货段重新编号），品名在 cells[1]，数量 cells[3]，金额 cells[5]。
+        # 数量列为空 → 小计/总计/签名等脏行，跳过（其金额落在金额列或备注列，非明细行）。
+        # 单位列 cells[2] 偶为「50斤」「1斤」数字+单位粘连，剥离数字只留单位字，供阶段2辅助匹配。
+        if len(cells) >= 7:
+            name = cells[1].strip() if len(cells) > 1 else ""
+            if not name:
+                continue
+            qty = extract_num(cells[3]) if len(cells) > 3 else None
+            if qty is None:
+                continue
+            unit = re.sub(r"[\d.\s×xX]", "", cells[2]) if len(cells) > 2 else ""
+            amount = extract_num(cells[5]) if len(cells) > 5 else None
+            items.append({"品名": name, "数量": qty, "金额": amount, "类别": "蔬菜", "单位": unit})
             continue
         # 序号开头的单据（肉类/销货清单）：5 列，品名在 cells[1]，金额在 cells[4]
         # 注：OCR 偶把数据行序号"1"识别成"序号"，故 first=="序号" 也按数据行处理

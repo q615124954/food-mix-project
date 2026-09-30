@@ -9,6 +9,7 @@ import sys
 import json
 import re
 import shutil
+import time
 import threading
 from datetime import datetime
 from contextlib import asynccontextmanager
@@ -17,6 +18,7 @@ from contextlib import asynccontextmanager
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pipeline_min as core
+import name_match
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -33,12 +35,20 @@ _name_dict = {"蔬菜": {}, "肉类": {}}
 # 品名归并映射表（物料明细同步用，别名→目标品名，按类别隔离）
 NAME_MAP_FILE = os.path.join(BASE_DIR, "name_map.json")
 _name_map = {"肉类": {}, "蔬菜": {}}
+# 合法品名集合（来自物料明细表「日物料采购」sheet 的品名列，归一化后）
+_legal_names = set()
+# 合法品名有序列表（原始品名，用于 name_match 模糊匹配候选集）
+_legal_name_list = []
+# 合法品名单位映射 {品名: 单位}，用于阶段2单位辅助匹配
+_legal_units = {}
 
 # 类别 -> 目标表 sheet 名
 CATEGORY_SHEET = {"肉类": "肉类采购", "蔬菜": "日物料采购"}
 
 _lock = threading.Lock()
 _land_lock = threading.Lock()
+_ocr_lock = threading.Lock()   # 防重入：同一时间只允许一个 ocr_worker 运行
+OCR_CONCURRENCY = 3            # 并发识别数（平台慢，别调太大以免触发限流）
 _state = {"invoices": []}
 # 可配置的输入/输出目录与物料明细表路径
 _paths = {"input_dir": core.INPUT_DIR, "output_dir": core.OUTPUT_DIR, "material_file": ""}
@@ -85,6 +95,50 @@ def save_name_map():
         json.dump(_name_map, f, ensure_ascii=False, indent=2)
 
 
+# ===== 合法品名表 + 员工餐归属判定 =====
+def normalize_pin(name):
+    """品名归一：去括号规格（如「枸杞 500g」「雨靴（39、41码）」）与空白，便于集合匹配"""
+    s = str(name).strip()
+    s = re.sub(r"[（(].*?[)）]", "", s)
+    return re.sub(r"\s+", "", s)
+
+
+def load_legal_names():
+    """从物料明细表的「日物料采购」sheet 读取合法品名（每次路径变更/启动时刷新）。
+    同时维护：归一化集合（归属判定）+ 原始品名有序列表（模糊匹配候选集）+ 单位映射。"""
+    global _legal_names, _legal_name_list, _legal_units
+    _legal_names = set()
+    _legal_name_list = []
+    _legal_units = {}
+    material = _paths.get("material_file", "")
+    if not material or not os.path.exists(material):
+        return
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(material, read_only=True, data_only=True)
+        if "日物料采购" in wb.sheetnames:
+            ws = wb["日物料采购"]
+            for r in range(3, ws.max_row + 1):
+                v = ws.cell(r, 4).value
+                if v and str(v).strip():
+                    raw = str(v).strip()
+                    _legal_name_list.append(raw)
+                    _legal_names.add(normalize_pin(raw))
+                    unit = str(ws.cell(r, 5).value or "").strip()
+                    if unit:
+                        _legal_units[raw] = unit
+        wb.close()
+    except Exception:
+        pass
+
+
+def classify_item(name, category):
+    """行级归属：蔬菜单按合法品名表判定（命中→物料，未命中→员工餐）；肉类单全部物料。"""
+    if category == "蔬菜":
+        return "员工餐" if (name and normalize_pin(name) not in _legal_names) else "物料"
+    return "物料"
+
+
 # ===== 品名纠错字典：持久化 + 回流学习 =====
 def load_name_dict():
     global _name_dict
@@ -121,6 +175,9 @@ def collect_valid_names():
             v = it.get("品名")
             if v:
                 names.add(str(v).strip())
+    # 加入物料明细表的合法品名（原始 + 归一化两种形式），避免合法品名被误判为「存疑」
+    names.update(_legal_name_list)
+    names.update(_legal_names)
     names.discard("")
     return names
 
@@ -144,6 +201,8 @@ def learn_name(category, wrong, right):
         return
     table[wrong] = right
     save_name_dict()
+    # 同步回流到变体表（标准名 -> 错名），让模糊匹配下次直接命中该错法
+    name_match.add_variant(category, right, wrong)
 
 
 # ===== 状态读写 =====
@@ -219,6 +278,28 @@ def compute_suspects(date, items):
     return suspects
 
 
+def _count_missing_rows(rows):
+    """统计「有序号、品名为空、且后续列(金额/备注)也全空」的表格行数。
+    这类行通常是补货段/下半部分手写内容 OCR 没识别出来（只认出了序号），
+    用于勾稽兜底：发现漏识别时提示人工核对补录。"""
+    cnt = 0
+    for cells in rows:
+        if not cells or all(c.strip() == "" for c in cells):
+            continue
+        if core.is_header_row(cells):
+            continue
+        first = (cells[0] or "").strip()
+        if not re.fullmatch(r"\d+", first):
+            continue
+        name = (cells[1] or "").strip() if len(cells) > 1 else ""
+        if name:
+            continue
+        tail = "".join((c or "") for c in cells[2:])
+        if not re.search(r"\d", tail):
+            cnt += 1
+    return cnt
+
+
 def ocr_one(filename):
     path = os.path.join(_paths["input_dir"], filename)
     text = core.call_ocr(path)
@@ -230,11 +311,33 @@ def ocr_one(filename):
     for it in items:
         it["日期"] = date
         raw = it.get("品名", "")
-        corrected, _ = core.correct_name(raw, it.get("类别", "蔬菜"), _name_dict)
+        cat = it.get("类别", "蔬菜")
+        corrected, _ = core.correct_name(raw, cat, _name_dict)
+        # 纠错字典未命中时，对蔬菜走「变体表+拼音+单位」模糊匹配（阶段1+2）
+        if corrected == raw and cat == "蔬菜" and _legal_name_list:
+            best, conf, _src, top = name_match.match(
+                raw, _legal_name_list, category=cat,
+                units=_legal_units, unit=it.get("单位"))
+            if best and conf >= name_match.AUTO_CONF:
+                corrected = best
+            elif best and conf >= name_match.SUGGEST_CONF:
+                # 中置信歧义：LLM 在 top 候选里定夺（带数量/金额/单位上下文）
+                try:
+                    mp = map_product_name(
+                        raw, cat, [t[0] for t in top], "DeepSeek-V4-Pro",
+                        qty=it.get("数量"), amt=it.get("金额"),
+                        candidate_units=_legal_units)
+                    if mp.get("来源") in ("mapping", "ai") and mp.get("目标品名") in _legal_name_list:
+                        corrected = mp["目标品名"]
+                except Exception:
+                    pass  # LLM 失败则保留 OCR 原值，交人工
         it["原品名"] = raw
         it["品名"] = corrected
-    return {"date": date, "total": total, "items": items,
-            "suspects": compute_suspects(date, items)}
+    suspects = compute_suspects(date, items)
+    missing = _count_missing_rows(rows)
+    if missing:
+        suspects.append(f"疑似漏识别 {missing} 行（有序号但内容为空，可能补货段未识别，请人工核对补录）")
+    return {"date": date, "total": total, "items": items, "suspects": suspects}
 
 
 def build_invoice_index():
@@ -269,11 +372,11 @@ def build_invoice_index():
     save_state()
 
 
-def ocr_worker():
-    """后台线程：逐个 OCR 尚未识别的单，边做边落状态"""
-    for inv in _state["invoices"]:
-        if inv.get("ocr_done"):
-            continue
+def _ocr_one_inv(inv):
+    """并发任务：OCR 单张票据（含 3 次重试），只更新该 inv 自己的字段。
+    每个 inv 由单个工作线程独占更新，线程间无共享写，故无需加锁。返回是否成功。"""
+    last_err = ""
+    for _attempt in range(3):
         try:
             res = ocr_one(inv["filename"])
             inv["date"] = res["date"]
@@ -282,9 +385,37 @@ def ocr_worker():
             inv["suspects"] = res.get("suspects", [])
             inv["ocr_done"] = True
             inv["error"] = ""
+            return True
         except Exception as e:
-            inv["error"] = str(e)
-        save_state()
+            last_err = str(e)
+            time.sleep(3)
+    inv["error"] = last_err
+    return False
+
+
+def ocr_worker():
+    """后台线程：线程池并发 OCR 尚未识别的单。
+    并发注意事项：
+    1) _ocr_lock 防重入，避免 rescan/reset/启动 多次触发导致多组 worker 重复识别同一张；
+    2) 各张单由独立工作线程处理（只写各自的 inv 字段），无共享写冲突；
+    3) save_state 只在主线程串行调用，避免并发写坏 state.json。"""
+    if not _ocr_lock.acquire(blocking=False):
+        return  # 已有 worker 在跑，直接退出
+    try:
+        pending = [inv for inv in _state["invoices"] if not inv.get("ocr_done")]
+        if not pending:
+            return
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=OCR_CONCURRENCY) as ex:
+            futures = [ex.submit(_ocr_one_inv, inv) for inv in pending]
+            for fut in futures:
+                try:
+                    fut.result()   # 按提交顺序等待（线程池内部并发执行）
+                except Exception:
+                    pass
+                save_state()       # 每完成一张即落一次状态，前端轮询可及时看到
+    finally:
+        _ocr_lock.release()
 
 
 # ===== 数值规范化：前端提交的数字可能是字符串 =====
@@ -493,6 +624,12 @@ def sync_to_material(model):
                 map_cache[key] = mp
             if mp["目标品名"] not in name_rows:
                 continue  # 该 sheet 匹配不上，试备选
+            # 置信度不足（<0.8）不落地，避免错误品名被放入错误位置
+            if mp["置信度"] < 0.8:
+                results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": mp["目标品名"],
+                                "置信度": mp["置信度"], "理由": f"置信度不足(低于0.8)，跳过不落地：{mp['理由']}", "来源": mp["来源"]})
+                placed = True
+                break
             tr = name_rows[mp["目标品名"]]
             col_qty = date_cols.get(_excel_serial(row["date"]))
             if col_qty is None:
@@ -549,18 +686,21 @@ def _merge_by_source(ws):
 
 def append_land(filename, date, category, total, items):
     os.makedirs(_paths["output_dir"], exist_ok=True)
-    HEADERS = ["日期", "类别", "品名", "数量", "单价", "金额", "来源图片", "合计", "原品名"]
+    HEADERS = ["日期", "类别", "品名", "数量", "单价", "金额", "来源图片", "合计"]
     land = land_file()
     with _land_lock:
         if os.path.exists(land):
             from openpyxl import load_workbook
             wb = load_workbook(land)
             ws = wb.active
-            # 兼容旧表头：确保「合计」「原品名」列存在
+            # 先取消所有合并，避免删除列/行时冲突
+            for mr in list(ws.merged_cells.ranges):
+                ws.unmerge_cells(str(mr))
+            # 兼容旧表头：删除「原品名」列（第9列），统一为8列
+            if ws.cell(1, 9).value == "原品名":
+                ws.delete_cols(9)
             if ws.cell(1, 8).value != "合计":
                 ws.cell(1, 8).value = "合计"
-            if ws.cell(1, 9).value != "原品名":
-                ws.cell(1, 9).value = "原品名"
             # 按来源图片去重：先删掉该图片已有的旧行，再覆盖式写入
             for r in range(ws.max_row, 1, -1):
                 if ws.cell(r, 7).value == filename:
@@ -574,7 +714,7 @@ def append_land(filename, date, category, total, items):
         for it in items:
             ws.append([
                 date, category, it.get("品名"), it.get("数量"),
-                it.get("单价"), it.get("金额"), filename, total, it.get("原品名", ""),
+                it.get("单价"), it.get("金额"), filename, total,
             ])
         _merge_by_source(ws)
         wb.save(land)
@@ -586,6 +726,7 @@ async def lifespan(app: FastAPI):
     load_settings()
     load_name_dict()
     load_name_map()
+    load_legal_names()
     load_state()
     build_invoice_index()
     threading.Thread(target=ocr_worker, daemon=True).start()
@@ -647,9 +788,10 @@ def confirm(filename: str, payload: ConfirmPayload):
     for it in items:
         if it.get("品名编辑"):
             learn_name(payload.category, it.get("原品名", ""), it.get("品名", ""))
+    # 合计 = 所有品名金额累加（不再区分员工餐/物料），所有明细行都落地
+    total = core.sum_amount(items)
     for inv in _state["invoices"]:
         if inv["filename"] == filename:
-            total = core.sum_amount(items)
             inv["date"] = payload.date
             inv["total"] = total
             inv["items"] = items
@@ -691,6 +833,7 @@ def set_paths(payload: PathsPayload):
         _paths["material_file"] = os.path.normpath(mat_file) if mat_file else ""
         _state = {"invoices": []}
     save_settings()
+    load_legal_names()
     try:
         if os.path.exists(STATE_FILE):
             os.remove(STATE_FILE)

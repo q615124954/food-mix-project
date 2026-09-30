@@ -16,6 +16,8 @@ webapp/settings.json
 webapp/product_dict.json
 # 品名归并映射表（同步映射，随人工确认持续累积）
 webapp/name_map.json
+# 品名变体表（初始由 name_match.py 的 DEFAULT_VARIANTS 生成，随回流学习累积）
+webapp/name_variants.json
 
 # Dify 官方源码子仓库（不属于本采购单工作台项目）
 dify/
