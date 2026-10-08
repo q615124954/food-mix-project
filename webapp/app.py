@@ -232,41 +232,33 @@ def image_files():
 # ===== 复用 pipeline_min 做单张 OCR =====
 def compute_suspects(date, items):
     """OCR 后规则式存疑判定（零成本，不调 LLM），返回存疑原因列表（空=正常）。
-    覆盖：日期未识别 / 未识别到内容 / 缺数量 / 缺金额 / 数量为0 /
-    品名存疑（残留数字或单字、或不在「认定品名」集合）/ 品名重复。
-    供前端在待确认单旁加「存疑」标记，提示人工优先核对。"""
+    同时给每个 item 打上字段级存疑标记「品名存疑 / 数量存疑 / 金额存疑」，
+    供前端在对应字段后显示红色感叹号，快速定位问题数据。"""
     suspects = []
     if not date:
         suspects.append("日期未识别")
     if not items:
         suspects.append("未识别到内容")
         return suspects
-    cnt_q = sum(1 for it in items if it.get("勾稽") == "缺数量")
-    cnt_a = sum(1 for it in items if it.get("勾稽") == "缺金额")
-    cnt_z = sum(1 for it in items if it.get("勾稽") == "数量为0")
-    if cnt_q:
-        suspects.append(f"{cnt_q} 行缺数量")
-    if cnt_a:
-        suspects.append(f"{cnt_a} 行缺金额")
-    if cnt_z:
-        suspects.append(f"{cnt_z} 行数量为0")
-    # 品名存疑：残留数字/单字，或不在「认定品名」集合（纠错字典value ∪ 已确认品名）。
-    # 认定品名动态收集，冷启动可能为空/不完整：集合为空时跳过"不在认定品名"判定，避免误报。
-    valid = collect_valid_names()
+    cnt_q = cnt_a = cnt_z = 0
     bad_names = []
+    # 第一遍：逐行打字段级标记 + 聚合计数
     for it in items:
+        g = it.get("勾稽")
+        it["数量存疑"] = g in ("缺数量", "数量为0")
+        it["金额存疑"] = g == "缺金额"
+        if g == "缺数量":
+            cnt_q += 1
+        elif g == "缺金额":
+            cnt_a += 1
+        elif g == "数量为0":
+            cnt_z += 1
         nm = str(it.get("品名", "")).strip()
-        if not nm:
-            continue
-        fmt_bad = len(nm) == 1 or re.search(r"\d", nm)
-        unknown = bool(valid) and nm not in valid
-        if fmt_bad or unknown:
+        fmt_bad = bool(nm) and (len(nm) == 1 or re.search(r"\d", nm) is not None)
+        it["品名存疑"] = fmt_bad
+        if it["品名存疑"]:
             bad_names.append(nm)
-    if bad_names:
-        shown = "、".join(bad_names[:3]) + ("…" if len(bad_names) > 3 else "")
-        suspects.append(f"{len(bad_names)} 行品名存疑（{shown}）")
-    # 重复品名存疑：同一单内出现重复品名（如 牛肉 误识别成 牛骨 导致两行都叫牛骨）。
-    # 手写单通常一品名一行，重复多为误识别，提示人工核对。
+    # 重复品名也标品名存疑（同一单内重复品名多为误识别）
     name_counts = {}
     for it in items:
         nm = str(it.get("品名", "")).strip()
@@ -274,7 +266,21 @@ def compute_suspects(date, items):
             name_counts[nm] = name_counts.get(nm, 0) + 1
     dups = [nm for nm, c in name_counts.items() if c > 1]
     if dups:
+        for it in items:
+            nm = str(it.get("品名", "")).strip()
+            if name_counts.get(nm, 0) > 1:
+                it["品名存疑"] = True
         suspects.append(f"品名重复（{'、'.join(dups)}）")
+    # 汇总单据级存疑原因
+    if cnt_q:
+        suspects.append(f"{cnt_q} 行缺数量")
+    if cnt_a:
+        suspects.append(f"{cnt_a} 行缺金额")
+    if cnt_z:
+        suspects.append(f"{cnt_z} 行数量为0")
+    if bad_names:
+        shown = "、".join(bad_names[:3]) + ("…" if len(bad_names) > 3 else "")
+        suspects.append(f"{len(bad_names)} 行品名存疑（{shown}）")
     return suspects
 
 

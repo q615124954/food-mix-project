@@ -56,6 +56,9 @@
   td select { width: 100%; border: 1px solid transparent; padding: 3px; font-size: 13px; border-radius: 3px; background: transparent; cursor: pointer; }
   td select:hover { border-color: #d1d5db; }
   td select:focus { border-color: #2563eb; outline: none; background: #fff; }
+  .cell { display: flex; align-items: center; }
+  .cell input { flex: 1; min-width: 0; }
+  .field-warn { color: #ef4444; font-weight: bold; margin-left: 3px; flex-shrink: 0; cursor: help; }
   .empty { padding: 30px; text-align: center; color: #999; font-size: 13px; }
   .totalbar { padding: 10px 14px; font-size: 15px; font-weight: 600; border-top: 1px solid #eee; }
   .totalbar .val { color: #2563eb; }
@@ -106,7 +109,7 @@
     <div class="toolbar">
       <button type="button" class="gray" id="btn-prev">上一张</button>
       <button type="button" class="gray" id="btn-next">下一张</button>
-      <label>日期 <input type="date" id="fld-date"></label>
+      <label>日期 <input type="date" id="fld-date"><span id="date-warn" class="field-warn" style="display:none" title="日期未识别">❗</span></label>
       <label>类别 <select id="fld-category"><option value="蔬菜">蔬菜</option><option value="肉类">肉类</option></select></label>
       <button type="button" class="green" id="btn-confirm">确认落地</button>
       <button type="button" class="green" id="btn-sync">同步到物料明细</button>
@@ -213,6 +216,8 @@ function renderCurrent() {
   }
   const inv = state.invoices[cur];
   document.getElementById('fld-date').value = inv.date || '';
+  const dw = document.getElementById('date-warn');
+  if (dw) dw.style.display = inv.date ? 'none' : 'inline';
   document.getElementById('fld-category').value = inv.category || (inv.items[0] && inv.items[0]['类别']) || '蔬菜';
   recomputeTotal();
   document.getElementById('tbl-title').textContent = inv.filename;
@@ -233,11 +238,12 @@ function renderCurrent() {
   }
   inv.items.forEach((it, idx) => {
     const tr = document.createElement('tr');
+    const warn = (flag, tip) => flag ? `<span class="field-warn" title="${tip}">❗</span>` : '';
     tr.innerHTML = `
-      <td><input data-k="品名" data-row="${idx}" value="${esc(it['品名'] || '')}"></td>
-      <td><input data-k="数量" data-row="${idx}" data-trigger="true" value="${esc(it['数量'] != null ? it['数量'] : '')}"></td>
-      <td><input data-k="单价" data-row="${idx}" value="${esc(it['单价'] != null ? it['单价'] : '')}"></td>
-      <td><input data-k="金额" data-row="${idx}" data-trigger="true" value="${esc(it['金额'] != null ? it['金额'] : '')}"></td>`;
+      <td><div class="cell"><input data-k="品名" data-row="${idx}" value="${esc(it['品名'] || '')}">${warn(it['品名存疑'], '品名可能不准确')}</div></td>
+      <td><div class="cell"><input data-k="数量" data-row="${idx}" data-trigger="true" value="${esc(it['数量'] != null ? it['数量'] : '')}">${warn(it['数量存疑'], '数量缺失或为0')}</div></td>
+      <td><div class="cell"><input data-k="单价" data-row="${idx}" value="${esc(it['单价'] != null ? it['单价'] : '')}"></div></td>
+      <td><div class="cell"><input data-k="金额" data-row="${idx}" data-trigger="true" value="${esc(it['金额'] != null ? it['金额'] : '')}">${warn(it['金额存疑'], '金额缺失')}</div></td>`;
     tr.querySelectorAll('input').forEach(inp => {
       inp.addEventListener('input', () => {
         dirty = true;
