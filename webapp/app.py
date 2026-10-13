@@ -1188,6 +1188,14 @@ def confirm(filename: str, payload: ConfirmPayload):
     paid = payload.paid_total if payload.paid_total not in (None, "") else total
     for inv in _state["invoices"]:
         if inv["filename"] == filename:
+            # 先写落地表，成功后再标已确认。WPS 占用导致写入失败时保持未确认，
+            # 避免网页显示已确认但 Excel 里没有这张单。
+            try:
+                append_land(filename, payload.date, category, total, paid, items)
+            except PermissionError:
+                raise HTTPException(500, "落地文件被占用，请先关闭 WPS 后重试")
+            except Exception as e:
+                raise HTTPException(500, f"落地文件写入失败：{e}")
             inv["date"] = payload.date
             inv["category"] = category
             inv["total"] = total
@@ -1196,10 +1204,6 @@ def confirm(filename: str, payload: ConfirmPayload):
             inv["suspects"] = []   # 已确认，清除存疑标记
             inv["status"] = "confirmed"
             save_state()
-            try:
-                append_land(filename, payload.date, category, total, paid, items)
-            except PermissionError:
-                raise HTTPException(500, "落地文件被占用，请先关闭 WPS 后重试")
             return {"ok": True}
     raise HTTPException(404, "未找到该票据")
 
