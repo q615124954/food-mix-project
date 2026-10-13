@@ -188,6 +188,63 @@ def _excel_items(sheets):
     return items
 
 
+def meal_rows(grid):
+    """员工餐表：B 列为日期，D 为员工餐金额，H 为日物料金额，I 为总计。"""
+    found = {}
+    for (col, row), text in grid.items():
+        day = _serial_date(text)
+        if day is None or col != 2:
+            continue
+        found[day] = {
+            "员工餐金额": float(grid[(4, row)]),
+            "日物料金额": float(grid[(8, row)]),
+            "总计": float(grid[(9, row)]),
+        }
+    return found
+
+
+def _amount_sum(rows):
+    return sum(float(row["amt"] or 0) for row in rows)
+
+
+def _print_meals(meals, daily_rows):
+    print("员工餐")
+    for day in TARGET_DATES:
+        row = meals[day]
+        detail = _amount_sum(daily_rows[day])
+        print(
+            "  %s  员工餐 %g  日物料 %g  总计 %g  日物料明细合计 %g"
+            % (
+                day.isoformat(),
+                row["员工餐金额"],
+                row["日物料金额"],
+                row["总计"],
+                detail,
+            )
+        )
+
+
+def _check_meals(meals, daily_rows):
+    expected = {
+        date(2026, 8, 11): (40, 100, 140),
+        date(2026, 8, 12): (64, 58, 122),
+        date(2026, 8, 13): (43, 167, 210),
+    }
+    for day, (staff, daily, total) in expected.items():
+        row = meals.get(day)
+        if row is None:
+            return _fail("员工餐表缺少 " + day.isoformat())
+        if not (
+            _close(row["员工餐金额"], staff)
+            and _close(row["日物料金额"], daily)
+            and _close(row["总计"], total)
+        ):
+            return _fail(day.isoformat() + " 员工餐金额与金标约定不一致")
+        if not _close(_amount_sum(daily_rows[day]), daily):
+            return _fail(day.isoformat() + " 日物料明细合计与员工餐表不一致")
+    return 0
+
+
 def _print_sheet(name, counts, rows):
     print(name)
     total = 0
@@ -228,7 +285,20 @@ def _check_baseline(excel_items):
     meals = baseline["员工餐"]
     if len(meals) != 3:
         return _fail("baseline 员工餐应有 3 天")
-    print("baseline_aug11_13.json 日物料/肉类数量与金额和金标表一致，员工餐 %d 天" % len(meals))
+    by_date = {row["date"]: row for row in meals}
+    aug11 = by_date.get("2026-08-11")
+    if aug11 is None or not (
+        _close(aug11.get("员工餐金额"), 40)
+        and _close(aug11.get("日物料金额"), 100)
+        and _close(aug11.get("总计"), 140)
+    ):
+        return _fail("baseline 8/11 应为员工餐 40、日物料 100、总计 140")
+    obsolete = aug11.get("作废") or {}
+    if obsolete.get("员工餐金额") != 29 or obsolete.get("日物料金额") != 110:
+        return _fail("baseline 应注明原表员工餐 29、日物料 110 已作废")
+    if "海底捞" not in (aug11.get("note") or "") or "已作废" not in (aug11.get("note") or ""):
+        return _fail("baseline 应写明海底捞约定以及原表 110/29 已作废")
+    print("baseline_aug11_13.json 与金标表一致；8/11 员工餐 40、日物料 100，原表 29/110 已作废")
     return 0
 
 
@@ -245,7 +315,26 @@ def _check_overrides():
     row = matched[0]
     if not _close(row.get("qty"), 5.8) or not _close(row.get("amt"), 28):
         return _fail("overrides 中鸡毛菜应为数量 5.8、金额 28")
-    print("baseline_overrides.json 鸡毛菜数量 5.8，金额 28")
+    meals = [
+        item
+        for item in (payload.get("员工餐") or [])
+        if item.get("date") == "2026-08-11"
+    ]
+    if len(meals) != 1:
+        return _fail("baseline_overrides.json 应有一条 8/11 员工餐")
+    meal = meals[0]
+    obsolete = meal.get("作废") or {}
+    if not (
+        _close(meal.get("员工餐金额"), 40)
+        and _close(meal.get("日物料金额"), 100)
+        and _close(meal.get("总计"), 140)
+        and obsolete.get("员工餐金额") == 29
+        and obsolete.get("日物料金额") == 110
+        and "海底捞" in (meal.get("note") or "")
+        and "已作废" in (meal.get("note") or "")
+    ):
+        return _fail("overrides 中 8/11 应为员工餐 40、日物料 100，并注明原表 29/110 已作废")
+    print("baseline_overrides.json 鸡毛菜数量 5.8、金额 28；8/11 员工餐 40、日物料 100，原表 29/110 已作废")
     return 0
 
 
@@ -265,9 +354,11 @@ def main():
         if not path.is_file():
             return _fail("缺少 " + path.name)
     sheets = load_sheets(XLSX)
-    for name in ("肉类采购", "日物料采购"):
+    for name in ("肉类采购", "日物料采购", "员工餐"):
         if name not in sheets:
             return _fail("金标表缺少工作表 " + name)
+    if any("海底捞" in str(text) for text in sheets["日物料采购"].values()):
+        return _fail("日物料采购含有海底捞行")
 
     print("金标 %s" % XLSX.name)
     grand = 0
@@ -285,8 +376,12 @@ def main():
     if len(chicken) != 1 or not _close(chicken[0]["qty"], 5.8) or not _close(chicken[0]["amt"], 28):
         return _fail("金标表 8/13 鸡毛菜应为数量 5.8、金额 28")
     print("8/13 鸡毛菜 数量 5.8  金额 28")
+    print("日物料采购不含海底捞")
 
-    status = _check_baseline(_excel_items(sheets))
+    meals = meal_rows(sheets["员工餐"])
+    _print_meals(meals, daily_rows)
+    status = _check_meals(meals, daily_rows)
+    status = _check_baseline(_excel_items(sheets)) or status
     status = _check_overrides() or status
     status = _check_receipts() or status
     if status:
