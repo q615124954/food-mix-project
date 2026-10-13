@@ -47,6 +47,8 @@ _legal_names = set()
 _legal_name_list = []
 # 合法品名单位映射 {品名: 单位}，用于阶段2单位辅助匹配
 _legal_units = {}
+# 品名历史单价 {品名: 中位单价}，来自物料表各日期 金额÷数量，用于数量/金额存疑判定
+_hist_prices = {}
 
 # 类别 -> 目标表 sheet 名
 CATEGORY_SHEET = {"肉类": "肉类采购", "蔬菜": "日物料采购"}
@@ -128,10 +130,11 @@ def normalize_pin(name):
 def load_legal_names():
     """从物料明细表的「日物料采购」sheet 读取合法品名（每次路径变更/启动时刷新）。
     同时维护：归一化集合（归属判定）+ 原始品名有序列表（模糊匹配候选集）+ 单位映射。"""
-    global _legal_names, _legal_name_list, _legal_units
+    global _legal_names, _legal_name_list, _legal_units, _hist_prices
     _legal_names = set()
     _legal_name_list = []
     _legal_units = {}
+    _hist_prices = {}
     material = _paths.get("material_file", "")
     if not material or not os.path.exists(material):
         return
@@ -140,6 +143,9 @@ def load_legal_names():
         wb = load_workbook(material, read_only=True, data_only=True)
         if "日物料采购" in wb.sheetnames:
             ws = wb["日物料采购"]
+            # read_only 模式下 ws.cell 逐格随机访问很慢，历史单价一次性按行读出
+            row_vals = {i: row for i, row in enumerate(
+                ws.iter_rows(min_row=3, values_only=True), start=3)}
             for r in range(3, ws.max_row + 1):
                 v = ws.cell(r, 4).value
                 if v and str(v).strip():
@@ -149,9 +155,31 @@ def load_legal_names():
                     unit = str(ws.cell(r, 5).value or "").strip()
                     if unit:
                         _legal_units[raw] = unit
+                    hp = _row_hist_price(row_vals.get(r, ()))
+                    if hp:
+                        _hist_prices[raw] = hp
         wb.close()
     except Exception:
         pass
+
+
+def _row_hist_price(row):
+    """物料表一行（values 元组）的历史单价：从第 9 列起每 3 列一组（数量/单价/金额），
+    取各日期 金额÷数量 的中位数；没有有效数据返回 None。"""
+    prices = []
+    for c in range(8, len(row) - 2, 3):
+        q, a = row[c], row[c + 2]
+        try:
+            q, a = float(q), float(a)
+        except (TypeError, ValueError):
+            continue
+        if q > 0 and a > 0:
+            prices.append(a / q)
+    if not prices:
+        return None
+    prices.sort()
+    n = len(prices)
+    return prices[n // 2] if n % 2 else (prices[n // 2 - 1] + prices[n // 2]) / 2
 
 
 def classify_item(name, category):
@@ -268,11 +296,19 @@ def compute_suspects(date, items):
         return suspects
     cnt_q = cnt_a = cnt_z = 0
     bad_names = []
+    price_bad = []
     # 第一遍：逐行打字段级标记 + 聚合计数
     for it in items:
         g = it.get("勾稽")
         it["数量存疑"] = g in ("缺数量", "数量为0")
         it["金额存疑"] = g == "缺金额"
+        it["存疑说明"] = ""
+        if g == "OK":
+            why = core.price_anomaly(it, _hist_prices.get(str(it.get("品名", "")).strip()))
+            if why:
+                it["数量存疑"] = it["金额存疑"] = True
+                it["存疑说明"] = why
+                price_bad.append(f"{it.get('品名', '')}：{why}")
         if g == "缺数量":
             cnt_q += 1
         elif g == "缺金额":
@@ -319,6 +355,8 @@ def compute_suspects(date, items):
         suspects.append(f"{cnt_a} 行缺金额")
     if cnt_z:
         suspects.append(f"{cnt_z} 行数量为0")
+    if price_bad:
+        suspects.append(f"{len(price_bad)} 行单价异常（{'；'.join(price_bad[:3])}）")
     if bad_names:
         shown = "、".join(bad_names[:3]) + ("…" if len(bad_names) > 3 else "")
         suspects.append(f"{len(bad_names)} 行品名存疑（{shown}）")
