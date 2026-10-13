@@ -1,0 +1,11 @@
+{
+  "日物料采购": [
+    {
+      "date": "2026-08-13",
+      "name": "鸡毛菜",
+      "qty": 5.8,
+      "amt": 28,
+      "note": "user corrected from gold excel typo 58"
+    }
+  ]
+}
