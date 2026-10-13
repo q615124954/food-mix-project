@@ -10,7 +10,10 @@
   6) 编辑相似度（difflib，兜底漏字/多字）
   7) 单位辅助（候选单位与 OCR 单位一致时小幅加分）
 返回 (best_name, confidence, source, top_candidates)。调用方按置信度分级：
-  >= AUTO_CONF 自动纠；SUGGEST_CONF~AUTO_CONF 交 LLM 定夺；< SUGGEST_CONF 不纠（交人工）。
+  >= AUTO_CONF 且 source 不是 needs_review：自动纠；
+  SUGGEST_CONF~AUTO_CONF：交 LLM 定夺；< SUGGEST_CONF：不纠（交人工）。
+  source==needs_review：弱相似已经摸到自动线（如拼音首字母 + 单位把「香菜」打成「香葱」），
+  调用方保留原名并提示人工，不得静默替换。
 """
 import os
 import re
@@ -24,6 +27,10 @@ VARIANTS_FILE = os.path.join(BASE_DIR, "webapp", "name_variants.json")
 # 高置信阈值 / 推荐阈值
 AUTO_CONF = 0.9
 SUGGEST_CONF = 0.6
+# 弱相似（拼音首字母、子串、一般编辑距离）即使用单位加分，也停在自动线以下。
+# 这类高分仍可能把「香菜」误改成「香葱」，调用方应标存疑而不是静默替换。
+REVIEW_SOURCE = "needs_review"
+WEAK_SCORE_CAP = 0.89
 
 # 默认变体表（首次运行时写入 JSON；seed 自 8 张菜类单实测 OCR 错例）
 DEFAULT_VARIANTS = {
@@ -117,7 +124,8 @@ def _strip_tail_num(s):
 def match(raw, candidates, category="蔬菜", units=None, unit=None):
     """匹配 OCR 品名到候选标准品名。
     candidates: 标准品名列表；units: {品名: 单位}（可选）；unit: OCR 识别的单位（可选）。
-    返回 (best, confidence, source, top)，未命中时 best=None。"""
+    返回 (best, confidence, source, top)，未命中时 best=None。
+    source 为 needs_review 时置信度已压到自动线以下，调用方应保留原名并提示人工。"""
     candidates = [c for c in candidates if c and str(c).strip()]
     n = normalize(raw)
     if not n:
@@ -146,10 +154,12 @@ def match(raw, candidates, category="蔬菜", units=None, unit=None):
 
     # 4) 多路打分
     scored = []
+    risky_high = set()
     for c in candidates:
         cn = normalize(c)
         score = 0.0
-        if _pinyin_full(n) == _pinyin_full(cn):
+        pinyin_exact_hit = _pinyin_full(n) == _pinyin_full(cn)
+        if pinyin_exact_hit:
             score = max(score, 0.9)
         if len(n) >= 2 and _pinyin_initials(n) == _pinyin_initials(cn):
             score = max(score, 0.85)
@@ -157,13 +167,37 @@ def match(raw, candidates, category="蔬菜", units=None, unit=None):
             score = max(score, 0.8)
         ratio = SequenceMatcher(None, n, cn).ratio()
         score = max(score, ratio)
-        # 单位辅助：一致小幅加分（弱信号，不惩罚，避免单位 OCR 错误导致漏召回）
+        # 全拼相同，或字符几乎相同，才算可以自动替换的强匹配。
+        # 仅首字母相同（香菜 / 香葱都是 xc）是高相似、语义不同的弱匹配。
+        strong = pinyin_exact_hit or ratio >= AUTO_CONF
+        # 单位辅助：一致小幅加分（弱信号，不惩罚，避免单位 OCR 错误导致漏召回）。
+        # 弱匹配加分后封顶在自动线以下，避免 0.85+0.05 变成 0.9 后静默替换。
         if unit and units and units.get(c) and units.get(c) == unit:
             score = min(score + 0.05, 1.0)
-        scored.append((c, round(min(score, 1.0), 3)))
+        rounded = round(min(score, 1.0), 3)
+        if not strong and rounded >= AUTO_CONF:
+            risky_high.add(c)
+            rounded = WEAK_SCORE_CAP
+        scored.append((c, rounded))
     scored.sort(key=lambda x: -x[1])
     if not scored:
         return None, 0.0, "none", []
     best, s = scored[0]
-    source = "pinyin_exact" if s >= 0.9 else "fuzzy"
+    if best in risky_high:
+        source = REVIEW_SOURCE
+    else:
+        source = "pinyin_exact" if s >= AUTO_CONF else "fuzzy"
     return best, s, source, scored[:5]
+
+
+def correction_action(raw, best, conf, source):
+    """决定这次匹配要不要改品名。
+
+    返回 (品名, 提示人工)。
+    needs_review：高分仍可能误改（香菜→香葱一类），保留原名并提示人工。
+    """
+    if source == REVIEW_SOURCE:
+        return raw, True
+    if best and conf >= AUTO_CONF:
+        return best, False
+    return raw, False
