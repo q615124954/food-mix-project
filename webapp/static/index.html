@@ -260,7 +260,7 @@ function renderCurrent() {
     const tr = document.createElement('tr');
     const warn = (flag, tip) => flag ? `<span class="field-warn" title="${tip}">❗</span>` : '';
     tr.innerHTML = `
-      <td><div class="cell"><input data-k="品名" data-row="${idx}" value="${esc(it['品名'] || '')}">${warn(it['品名存疑'], '品名可能不准确')}</div></td>
+      <td><div class="cell"><input data-k="品名" data-row="${idx}" value="${esc(it['品名'] || '')}">${warn(it['品名存疑'], it['建议品名'] ? esc('建议改为：' + it['建议品名'] + '（请人工确认）') : '品名可能不准确')}</div></td>
       <td><div class="cell"><input data-k="数量" data-row="${idx}" data-trigger="true" value="${esc(it['数量'] != null ? it['数量'] : '')}">${warn(it['数量存疑'], esc(it['存疑说明'] || '数量缺失或为0'))}</div></td>
       <td><div class="cell"><input data-k="单价" data-row="${idx}" value="${esc(it['单价'] != null ? it['单价'] : '')}"></div></td>
       <td><div class="cell"><input data-k="金额" data-row="${idx}" data-trigger="true" value="${esc(it['金额'] != null ? it['金额'] : '')}">${warn(it['金额存疑'], esc(it['存疑说明'] || '金额缺失'))}</div></td>`;

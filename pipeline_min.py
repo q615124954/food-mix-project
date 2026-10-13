@@ -204,11 +204,11 @@ def parse_line_items(rows):
         # 单位列 cells[2] 偶为「50斤」「1斤」数字+单位粘连，剥离数字只留单位字，供阶段2辅助匹配。
         if len(cells) >= 7:
             name = name_or_raw(cells[1]) if len(cells) > 1 else ""
-            if not name:
-                continue
             qty = extract_num(cells[3]) if len(cells) > 3 else None
             if qty is None:
                 continue
+            # 品名为空但数量、金额都有：手写品名没认出来，保留整行（品名留空），
+            # 由存疑规则标红交人工补，不能整行丢掉让金额漏账。
             unit = re.sub(r"[\d.\s×xX]", "", cells[2]) if len(cells) > 2 else ""
             amount = extract_num(cells[5]) if len(cells) > 5 else None
             items.append({"品名": name, "数量": qty, "金额": amount, "类别": "蔬菜", "单位": unit,
@@ -238,31 +238,54 @@ def parse_line_items(rows):
             continue
         # 品名开头的单据（蔬菜单）：4 列，品名在 cells[0]，数量 cells[1]，金额 cells[3]
         name = name_or_raw(cells[0])
-        if not name:
-            continue
         qty = extract_num(cells[1]) if len(cells) > 1 else None
         amount = extract_num(cells[3]) if len(cells) > 3 else None
+        if not name and (qty is None or amount is None):
+            continue
         items.append({"品名": name, "数量": qty, "金额": amount, "类别": "蔬菜",
                       "票面单价": extract_num(cells[2]) if len(cells) > 2 else None})
     return items
 
 
+_TOTAL_TAG = re.compile(r"^(?:合计|总计|小计|总额|计)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*$")
+
+
+def _is_total_label(s):
+    """合计行的标签：合计/总计/件数，或手写「总…」被 OCR 认歪（如 8/13「总没」）"""
+    s = (s or "").strip()
+    return s == "件数" or "合计" in s or "总计" in s or (s.startswith("总") and len(s) <= 3)
+
+
 def extract_order_total(rows):
-    """从解析后的表格行中找「合计/总计/件数」行，提取单据级实付总额(float, 到分)。
-    蔬菜单底部金额总计常有手动优惠，此值即优惠后实付；识别不到返回 None。
-    只读 rows，不改动 parse_line_items 的明细提取逻辑。"""
+    """提取单据级实付总额(float, 到分)；识别不到返回 None（交人工填，不猜）。
+
+    手写单上合计的写法有三种：
+    1) 首列是「合计/总计/件数」，金额在末尾列；
+    2) 7 列单的品名列写「总…」（OCR 常认歪成「总没」），数量列空，金额在金额列；
+    3) 备注列手写「计110」「计:213」「合计 141」（补货后会再写一次新的合计）。
+    单据中出现多次合计时取最后一次（补货后的最终合计）。"""
+    found = None
     for cells in rows:
         if not cells or all((c or "").strip() == "" for c in cells):
             continue
-        first = (cells[0] or "").strip() if cells else ""
-        if first != "件数" and "合计" not in first and "总计" not in first:
+        cells = [(c or "").strip() for c in cells]
+        first = cells[0]
+        if first == "件数" or "合计" in first or "总计" in first:
+            for c in reversed(cells):
+                v = extract_num(c)
+                if v is not None:
+                    found = round(v, 2)
+                    break
             continue
-        # 金额通常落在金额列（蔬菜单 7 列格式为 cells[5]）或末尾列，从右往左找第一个数字
-        for c in reversed(cells):
-            v = extract_num((c or "").strip())
+        if len(cells) >= 7 and _is_total_label(cells[1]) and extract_num(cells[3]) is None:
+            v = extract_num(cells[5]) if cells[5] else extract_num(cells[6])
             if v is not None:
-                return round(v, 2)
-    return None
+                found = round(v, 2)
+        for c in cells[1:]:
+            m = _TOTAL_TAG.match(c)
+            if m:
+                found = round(float(m.group(1)), 2)
+    return found
 
 
 # ===== 4. 单价推导 =====
@@ -361,6 +384,27 @@ def price_anomaly(item, hist_price=None):
             return (f"数量×票面单价={qty:g}×{ticket:g}={expect:g}，与金额{amount:g}"
                     f"相差{off:.1f}倍，请核对数量/金额（可能丢了小数点）")
     return None
+
+
+def ticket_price_reliable(items, min_rows=3, bad_share=0.5):
+    """整张单的票面单价列是否可信。手写单价常被 OCR 整列丢小数点（8/12：3.9→39、5.9→59），
+    此时多数行「数量×票面单价」都和金额差约 10 倍，说明错的是单价列而不是数量。
+    有票面单价的行不少于 min_rows，且超过 bad_share 比例对不上 → 判整列不可信，
+    本单不再按票面单价判数量/金额（历史单价照常判）。"""
+    total = bad = 0
+    for it in items:
+        try:
+            qty, amount, ticket = float(it.get("数量")), float(it.get("金额")), float(it.get("票面单价"))
+        except (TypeError, ValueError):
+            continue
+        if qty <= 0 or amount <= 0 or ticket <= 0:
+            continue
+        total += 1
+        if _ratio_off(qty * ticket, amount) > PRICE_RATIO_LIMIT:
+            bad += 1
+    if total < min_rows:
+        return True
+    return bad / total <= bad_share
 
 
 # ===== 4.5 品名纠错 =====

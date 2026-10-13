@@ -318,6 +318,9 @@ def image_files():
 CONFUSABLE_PAIRS = [("番茄", "香草"), ("蒜米", "去皮蒜米"), ("蒜米", "蒜头")]
 
 
+TICKET_UNRELIABLE_TIP = "票面单价疑似整体错位，已改用历史单价核对"
+
+
 def compute_suspects(date, items):
     """OCR 后规则式存疑判定（零成本，不调 LLM），返回存疑原因列表（空=正常）。
     同时给每个 item 打上字段级存疑标记「品名存疑 / 数量存疑 / 金额存疑」，
@@ -330,7 +333,10 @@ def compute_suspects(date, items):
         return suspects
     cnt_q = cnt_a = cnt_z = 0
     bad_names = []
+    num_names = []
+    suggest_tips = []
     price_bad = []
+    ticket_ok = core.ticket_price_reliable(items)
     # 第一遍：逐行打字段级标记 + 聚合计数
     for it in items:
         g = it.get("勾稽")
@@ -338,7 +344,8 @@ def compute_suspects(date, items):
         it["金额存疑"] = g == "缺金额"
         it["存疑说明"] = ""
         if g == "OK":
-            why = core.price_anomaly(it, hist_price(it.get("品名", ""), date))
+            ref = it if ticket_ok else {k: v for k, v in it.items() if k != "票面单价"}
+            why = core.price_anomaly(ref, hist_price(it.get("品名", ""), date))
             if why:
                 it["数量存疑"] = it["金额存疑"] = True
                 it["存疑说明"] = why
@@ -351,11 +358,21 @@ def compute_suspects(date, items):
             cnt_z += 1
         nm = str(it.get("品名", "")).strip()
         fmt_bad = bool(nm) and (len(nm) == 1 or re.search(r"\d", nm) is not None)
+        # 品名为空（没认出来）或纯数字（如手写「盐」被数量吃掉认成「10」）：一定标存疑交人工
+        if not nm:
+            fmt_bad = True
+            nm = "（品名未识别）"
+        elif re.fullmatch(r"[\d.\s]+", nm):
+            num_names.append(nm)
         # 纠错后的最终品名不在物料表合法集合 → 才判存疑（OCR 认错但已纠正成功则信任）
         not_legal = bool(nm) and bool(_legal_names) and normalize_pin(nm) not in _legal_names
         # 需要人工核对的机器纠正：LLM 中置信，以及高分易混（如香菜/香葱）
         machine_fixed = it.get("纠正来源", "") in ("llm", name_match.REVIEW_SOURCE)
         it["品名存疑"] = fmt_bad or not_legal or machine_fixed
+        sg = name_match.suggest(nm, _legal_name_list) if it["品名存疑"] else None
+        it["建议品名"] = sg or ""
+        if sg:
+            suggest_tips.append(f"{nm}→{sg}")
         if it["品名存疑"]:
             bad_names.append(nm)
     # 易混品名对：同单同时出现时，整对都标红（合法名之间串位 OCR 很难自查）
@@ -389,12 +406,31 @@ def compute_suspects(date, items):
         suspects.append(f"{cnt_a} 行缺金额")
     if cnt_z:
         suspects.append(f"{cnt_z} 行数量为0")
+    if not ticket_ok:
+        suspects.append(TICKET_UNRELIABLE_TIP)
+    if suggest_tips:
+        suspects.append(f"品名建议待人工确认（{'、'.join(suggest_tips)}）")
+    if num_names:
+        suspects.append(f"{len(num_names)} 行品名是纯数字（{'、'.join(num_names)}），可能品名被数量吃掉，请对照原图改成正确品名")
     if price_bad:
         suspects.append(f"{len(price_bad)} 行单价异常（{'；'.join(price_bad[:3])}）")
     if bad_names:
         shown = "、".join(bad_names[:3]) + ("…" if len(bad_names) > 3 else "")
         suspects.append(f"{len(bad_names)} 行品名存疑（{shown}）")
     return suspects
+
+
+ORDER_TOTAL_TOL = 0.5
+
+
+def order_total_suspect(total, order_total):
+    """订单合计校验：没识别出来 → 提示人工填写；与明细金额和相差超过 0.5 元 → 提示核对。
+    只提示，不改值。返回提示文字或 None。"""
+    if order_total is None:
+        return "订单合计未识别，请对照原图填写"
+    if total is not None and abs(float(order_total) - float(total)) > ORDER_TOTAL_TOL:
+        return f"订单合计 {order_total:g} 与明细金额之和 {total:g} 不符（差 {float(order_total) - float(total):+g}），请核对"
+    return None
 
 
 def _count_missing_rows(rows):
@@ -485,6 +521,9 @@ def ocr_one(filename):
         it["纠正来源"] = src
     suspects = compute_suspects(date, items)
     missing = _count_missing_rows(rows)
+    tip = order_total_suspect(total, order_total)
+    if tip:
+        suspects.append(tip)
     if missing:
         suspects.append(f"疑似漏识别 {missing} 行（有序号但内容为空，可能补货段未识别，请人工核对补录）")
     return {"date": date, "total": total, "order_total": order_total, "items": items, "suspects": suspects}

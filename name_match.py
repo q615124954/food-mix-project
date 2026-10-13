@@ -35,17 +35,19 @@ WEAK_SCORE_CAP = 0.89
 # 默认变体表（首次运行时写入 JSON；seed 自 8 张菜类单实测 OCR 错例）
 DEFAULT_VARIANTS = {
     "蔬菜": {
-        "薄荷叶": ["莴青叶", "莲荷叶"],
-        "香菜": ["香蕊", "香芯"],
+        "薄荷叶": ["莴青叶", "莲荷叶", "薄荷"],
+        # 金标 8/11 香蕊 1斤4元、8/12 香蕊 2斤8元、8/13 香芯 3斤12元 都是香葱（8/12 香菜另有一行 2斤15元）
+        "香葱": ["香蕊", "香芯"],
+        "香菜": [],
         "金针菇": ["全针蕊", "金针"],
         "娃娃菜": ["搭娃亲"],
         "猪腱子肉": ["惜腱子肉", "腱肉"],
         "亿亩田大米": ["亿百日", "亿亩田"],
         "细面": ["细面条"],
-        "蒜头": ["蒜末"],
+        "蒜头": ["蒜末", "大蒜头"],
         "东古鸡精": ["鸡精"],
         "宏斌小米辣": ["小半辣", "小米辣"],
-        "去皮蒜米": ["蒜米"],
+        "去皮蒜米": ["蒜米", "蒜半"],
         "绿豆芽": ["绿豆牙"],
     },
     "肉类": {},
@@ -54,7 +56,49 @@ DEFAULT_VARIANTS = {
 # 同义词：别名 -> 标准名（仅当物料表只存在标准名、OCR 出现别名时才有用）
 SYNONYMS = {}
 
+# 旧版默认表里写错的变体：加载已有 JSON 时剔除（香蕊/香芯 是香葱，不是香菜）
+WRONG_VARIANTS = {"蔬菜": {"香菜": ["香蕊", "香芯"], "猪腱子肉": ["腊肉"]}}
+
+# 只给建议、不自动改的映射：OCR 名本身是真实品名（如「腊肉」），
+# 金标里虽然对应「猪腱子肉」，但不能静默替换。命中时置信度压在自动线以下、
+# source=needs_review，调用方保留原名、标存疑，并把建议品名给人工确认。
+SUGGESTIONS = {"蔬菜": {"腊肉": "猪腱子肉"}}
+SUGGEST_SCORE = 0.85
+
+
+def suggest(raw, candidates, category="蔬菜"):
+    """返回建议品名（必须在候选里，且原名本身不在候选里），没有返回 None"""
+    n = normalize(raw)
+    cands = [c for c in candidates if c and str(c).strip()]
+    if any(normalize(c) == n for c in cands):
+        return None
+    std = (SUGGESTIONS.get(category) or {}).get(n)
+    return std if std in cands else None
+
 _VARIANTS = None
+
+
+def _migrate(variants):
+    """已落盘的变体表：剔除旧版错误映射，补上默认表新增的变体（不删用户回流学到的）。
+    返回是否有改动。"""
+    changed = False
+    for cat, table in WRONG_VARIANTS.items():
+        for std, wrongs in table.items():
+            lst = variants.get(cat, {}).get(std)
+            if lst:
+                kept = [v for v in lst if v not in wrongs]
+                if kept != lst:
+                    variants[cat][std] = kept
+                    changed = True
+    for cat, table in DEFAULT_VARIANTS.items():
+        dst = variants.setdefault(cat, {})
+        for std, vs in table.items():
+            lst = dst.setdefault(std, [])
+            for v in vs:
+                if v not in lst:
+                    lst.append(v)
+                    changed = True
+    return changed
 
 
 def load_variants():
@@ -64,6 +108,8 @@ def load_variants():
         try:
             with open(VARIANTS_FILE, encoding="utf-8") as f:
                 _VARIANTS = json.load(f)
+            if _migrate(_VARIANTS):
+                save_variants()
             return _VARIANTS
         except (OSError, ValueError):
             pass
@@ -147,6 +193,11 @@ def match(raw, candidates, category="蔬菜", units=None, unit=None):
         for v in variants:
             if normalize(v) == n:
                 return std, 0.95, "variant", [(std, 0.95)]
+
+    # 2.5) 建议映射：只提示不自动改
+    sg = suggest(n, candidates, category)
+    if sg:
+        return sg, SUGGEST_SCORE, REVIEW_SOURCE, [(sg, SUGGEST_SCORE)]
 
     # 3) 同义词
     if n in SYNONYMS and SYNONYMS[n] in candidates:

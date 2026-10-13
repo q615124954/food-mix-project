@@ -48,6 +48,14 @@ class PriceAnomalyRule(unittest.TestCase):
         # 票面单价 3.9 被 OCR 成 39，但反算单价与历史一致 → 数量/金额没问题，不标
         self.assertIsNone(core.price_anomaly({"数量": 2, "金额": 8, "票面单价": 39}, hist_price=4.0))
 
+    def test_ticket_column_reliability(self):
+        bad_col = [{"数量": 2, "金额": 8, "票面单价": 39}, {"数量": 3, "金额": 18, "票面单价": 59},
+                   {"数量": 1, "金额": 5, "票面单价": 48}, {"数量": 1, "金额": 10, "票面单价": 10}]
+        self.assertFalse(core.ticket_price_reliable(bad_col))
+        good_col = [{"数量": 58, "金额": 28, "票面单价": 4.8}, {"数量": 3, "金额": 12, "票面单价": 3.8},
+                    {"数量": 1, "金额": 10, "票面单价": 10}, {"数量": 4, "金额": 27, "票面单价": 6.8}]
+        self.assertTrue(core.ticket_price_reliable(good_col))
+
 
 class GoldReceipt0813(unittest.TestCase):
     @classmethod
