@@ -24,7 +24,11 @@ def _load_env():
 _load_env()
 
 API_URL = "https://ai.gitee.com/v1/images/ocr"
-API_KEY = os.environ.get("HUNYUAN_API_KEY", "")
+# 混元与模力方舟是同一把密钥：优先 HUNYUAN_API_KEY，为空再用 MOLLI_ARK_API_KEY
+API_KEY = (
+    os.environ.get("HUNYUAN_API_KEY", "").strip()
+    or os.environ.get("MOLLI_ARK_API_KEY", "").strip()
+)
 MAX_SIZE = 2048
 
 IMAGES = [

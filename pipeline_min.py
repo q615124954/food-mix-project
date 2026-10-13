@@ -32,7 +32,11 @@ _load_env()
 # ===== 配置 =====
 API_URL = "https://ai.gitee.com/v1/images/ocr"
 CHAT_URL = "https://ai.gitee.com/v1/chat/completions"
-API_KEY = os.environ.get("HUNYUAN_API_KEY", "")
+# 混元与模力方舟是同一把密钥：优先 HUNYUAN_API_KEY，为空再用 MOLLI_ARK_API_KEY
+API_KEY = (
+    os.environ.get("HUNYUAN_API_KEY", "").strip()
+    or os.environ.get("MOLLI_ARK_API_KEY", "").strip()
+)
 MODEL = "HunyuanOCR"
 MAX_SIZE = 2048          # 图片最长边上限
 INPUT_DIR = r"D:\采购单"
