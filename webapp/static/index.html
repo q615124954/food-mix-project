@@ -115,7 +115,7 @@
       <button type="button" class="gray" id="btn-prev">上一张</button>
       <button type="button" class="gray" id="btn-next">下一张</button>
       <label>日期 <input type="date" id="fld-date"><span id="date-warn" class="field-warn" style="display:none" title="日期未识别">❗</span></label>
-      <label>类别 <select id="fld-category"><option value="蔬菜">蔬菜</option><option value="肉类">肉类</option></select></label>
+      <label>类别 <select id="fld-category"><option value="">请选择</option><option value="蔬菜">蔬菜</option><option value="肉类">肉类</option></select><span id="category-warn" class="field-warn" style="display:none" title="该单据没有保存类别，请手动选择。不会默认成蔬菜。">❗</span></label>
       <button type="button" class="green" id="btn-confirm">确认落地</button>
       <button type="button" class="green" id="btn-sync">同步到物料明细</button>
       <button type="button" class="gray" id="btn-rescan">重新扫描</button>
@@ -226,7 +226,14 @@ function renderCurrent() {
   document.getElementById('fld-date').value = inv.date || '';
   const dw = document.getElementById('date-warn');
   if (dw) dw.style.display = inv.date ? 'none' : 'inline';
-  document.getElementById('fld-category').value = inv.category || (inv.items[0] && inv.items[0]['类别']) || '蔬菜';
+  // 确认后用保存的类别；未确认时显示明细上识别出的类别。都没有则留空并提示，不默认蔬菜。
+  const itemCat = inv.items && inv.items[0] && inv.items[0]['类别'];
+  const rawCat = String(inv.category || itemCat || '').trim();
+  const catSel = document.getElementById('fld-category');
+  catSel.value = rawCat;
+  if (catSel.value !== rawCat) catSel.value = '';
+  const cw = document.getElementById('category-warn');
+  if (cw) cw.style.display = catSel.value ? 'none' : 'inline';
   const paidInp = document.getElementById('fld-paid');
   if (paidInp) {
     const v = inv.paid_total != null ? inv.paid_total : inv.order_total;
@@ -273,7 +280,11 @@ function renderCurrent() {
 }
 
 document.getElementById('fld-date').addEventListener('input', () => { dirty = true; });
-document.getElementById('fld-category').addEventListener('change', () => { dirty = true; });
+document.getElementById('fld-category').addEventListener('change', () => {
+  dirty = true;
+  const cw = document.getElementById('category-warn');
+  if (cw) cw.style.display = document.getElementById('fld-category').value ? 'none' : 'inline';
+});
 document.getElementById('fld-paid').addEventListener('input', () => { dirty = true; updatePaidHint(); });
 
 function recompute(row) {
@@ -358,9 +369,14 @@ function toast(msg, isErr) {
 async function submitConfirm() {
   const inv = state.invoices[cur];
   if (!inv) return;
+  const category = document.getElementById('fld-category').value;
+  if (!category) {
+    toast('请先选择类别（不会默认成蔬菜）', true);
+    return;
+  }
   const payload = {
     date: document.getElementById('fld-date').value.trim(),
-    category: document.getElementById('fld-category').value,
+    category: category,
     paid_total: paidValue(),
     items: inv.items.map(it => ({ '品名': it['品名'], '原品名': it['原品名'], '品名编辑': it['品名编辑'], '数量': it['数量'], '单价': it['单价'], '金额': it['金额'] }))
   };

@@ -494,8 +494,10 @@ def _num(v):
         return v
 
 
-def normalize_item(it):
-    return {
+def normalize_item(it, category=None):
+    """规范化明细。category 为确认时用户选择的类别。
+    未传入时保留明细上已有的类别；两边都没有则不填，不默认成蔬菜。"""
+    out = {
         "品名": it.get("品名", ""),
         "原品名": it.get("原品名", ""),
         "品名编辑": bool(it.get("品名编辑")),
@@ -503,6 +505,33 @@ def normalize_item(it):
         "单价": _num(it.get("单价")),
         "金额": _num(it.get("金额")),
     }
+    if category not in (None, ""):
+        cat = str(category).strip()
+    else:
+        cat = str(it.get("类别") or "").strip()
+    if cat:
+        out["类别"] = cat
+    return out
+
+
+def confirmed_categories():
+    """文件名 -> 确认时保存的类别。没保存过类别的旧单不在表里，调用方不得默认成蔬菜。"""
+    found = {}
+    for inv in _state.get("invoices", []):
+        fn = inv.get("filename")
+        cat = str(inv.get("category") or "").strip()
+        if fn and cat:
+            found[fn] = cat
+    return found
+
+
+def resolve_sync_category(saved, land_cat):
+    """同步用类别：优先确认时保存的类别；没有保存值时沿用落地表上的类别。
+    两边都没有时返回空串，调用方必须提示，不得默认成蔬菜。"""
+    saved = str(saved or "").strip()
+    if saved:
+        return saved
+    return str(land_cat or "").strip()
 
 
 # ===== 物料明细同步 =====
@@ -810,6 +839,7 @@ def sync_to_material(model):
     cur_paid = ""
     # 用哨兵区分「还没读到任何单据」和「来源图片本身是空的」
     cur_src = object()
+    saved_cats = confirmed_categories()
     for r in lws.iter_rows(min_row=2, values_only=True):
         name = r[col["品名"]] if "品名" in col else None
         if name is None:
@@ -817,11 +847,13 @@ def sync_to_material(model):
         src = r[col["来源图片"]] if "来源图片" in col else None
         date = r[col["日期"]] if "日期" in col else ""
         # 日期/类别/合计按来源图片合并，只有每张单的首行留着值，续行是空单元格。
-        # 同一张单的续行继承本单日期；换了一张单则只认本单自己的日期。
+        # 同一张单的续行继承本单日期和类别；换了一张单则只认本单自己的值。
         # 本单日期为空时不得沿用上一张单，否则会写进错误的日期列并覆盖那天原有的值。
+        # 本单类别为空时同样不得沿用上一张（尤其不能默认为蔬菜）。
         if src != cur_src:
             cur_src = src
             cur_date = _land_date_text(date)
+            cur_cat = ""
         else:
             own_date = _land_date_text(date)
             if own_date:
@@ -829,6 +861,7 @@ def sync_to_material(model):
         cat = r[col["类别"]] if "类别" in col else ""
         if cat:
             cur_cat = cat
+        cur_cat = resolve_sync_category(saved_cats.get(cur_src), cur_cat)
         qty = r[col["数量"]] if "数量" in col else None
         amt = r[col["金额"]] if "金额" in col else None
         price = r[col["单价"]] if "单价" in col else None
@@ -859,11 +892,16 @@ def sync_to_material(model):
     map_cache = {}
     results = []
     # 日期为空的单据不参与写入（含员工餐汇总），避免落到错误列或参与同一天累加。
+    # 有日期但缺少类别的行同样跳过，不进入 cell_sums，也不默认归入蔬菜。
     dated_rows = []
     for row in rows:
         if not row["date"]:
             results.append({"日期": "", "落地品名": row["name"], "目标品名": "", "置信度": 0,
                             "理由": BLANK_DATE_SYNC_REASON, "来源": "error"})
+            continue
+        if not str(row.get("cat") or "").strip():
+            results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": "", "置信度": 0,
+                            "理由": "缺少类别，未默认归入蔬菜，请重新打开该单据选择类别并确认", "来源": "error"})
             continue
         dated_rows.append(row)
     # 同一天同一物料可能来自多张已确认单据。先按目标单元格（日期列+物料行）
@@ -1125,15 +1163,18 @@ def confirm(filename: str, payload: ConfirmPayload):
     if not _land_date_text(payload.date):
         _mark_blank_date(filename)
         raise HTTPException(400, "日期为空，请人工补填日期后再确认（本次未写入 Excel）")
-    items = [normalize_item(it) for it in payload.items]
+    category = str(payload.category or "").strip()
+    if category not in CATEGORY_SHEET:
+        raise HTTPException(400, "请选择类别（蔬菜或肉类）后再确认；缺少类别时不会默认写成蔬菜")
+    items = [normalize_item(it, category) for it in payload.items]
     # 回流学习：仅当用户手动编辑过品名时，才把「OCR 原品名 → 确认后品名」写入纠错字典
     for it in items:
         if it.get("品名编辑"):
-            learn_name(payload.category, it.get("原品名", ""), it.get("品名", ""))
+            learn_name(category, it.get("原品名", ""), it.get("品名", ""))
     # code_map 联动：本次确认的全部品名集合之外/品名被改动的旧映射条目失效，
     # 避免人工纠正品名后，旧的「旧品名→代码」映射继续误同步到新单据。
     confirmed_names = {str(it.get("品名", "")).strip() for it in items}
-    code_map_cat = _code_map.setdefault(payload.category, {})
+    code_map_cat = _code_map.setdefault(category, {})
     if any(it.get("品名编辑") for it in items):
         for it in items:
             if it.get("品名编辑"):
@@ -1148,6 +1189,7 @@ def confirm(filename: str, payload: ConfirmPayload):
     for inv in _state["invoices"]:
         if inv["filename"] == filename:
             inv["date"] = payload.date
+            inv["category"] = category
             inv["total"] = total
             inv["paid_total"] = paid
             inv["items"] = items
@@ -1155,7 +1197,7 @@ def confirm(filename: str, payload: ConfirmPayload):
             inv["status"] = "confirmed"
             save_state()
             try:
-                append_land(filename, payload.date, payload.category, total, paid, items)
+                append_land(filename, payload.date, category, total, paid, items)
             except PermissionError:
                 raise HTTPException(500, "落地文件被占用，请先关闭 WPS 后重试")
             return {"ok": True}
