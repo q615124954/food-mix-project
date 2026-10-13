@@ -512,6 +512,25 @@ def _excel_serial(date_str):
     return (dt - datetime(1899, 12, 30)).days
 
 
+def _land_date_text(value):
+    """落地表日期单元格转成 YYYY-MM-DD。空单元格返回空字符串。
+
+    合并单元格的续行、以及整张单都没填日期时，openpyxl 读出来都是 None。
+    这里只负责「这个单元格自己有没有日期」，不把上一张单的日期带过来。
+    """
+    if value is None:
+        return ""
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d")
+    text = str(value).strip()
+    return text[:10] if text else ""
+
+
+# 日期为空时的提示。确认接口标成存疑并拒绝落地；同步接口逐行跳过、不写 Excel。
+BLANK_DATE_SUSPECT = "日期为空，需人工补填"
+BLANK_DATE_SYNC_REASON = "日期为空，需人工补填日期，未写入 Excel"
+
+
 def _extract_json(text):
     """从模型回复中提取 JSON 对象文本"""
     if not text:
@@ -778,13 +797,24 @@ def sync_to_material(model):
     cur_cat = ""
     cur_total = ""
     cur_paid = ""
+    # 用哨兵区分「还没读到任何单据」和「来源图片本身是空的」
+    cur_src = object()
     for r in lws.iter_rows(min_row=2, values_only=True):
         name = r[col["品名"]] if "品名" in col else None
         if name is None:
             continue
+        src = r[col["来源图片"]] if "来源图片" in col else None
         date = r[col["日期"]] if "日期" in col else ""
-        if date:
-            cur_date = date
+        # 日期/类别/合计按来源图片合并，只有每张单的首行留着值，续行是空单元格。
+        # 同一张单的续行继承本单日期；换了一张单则只认本单自己的日期。
+        # 本单日期为空时不得沿用上一张单，否则会写进错误的日期列并覆盖那天原有的值。
+        if src != cur_src:
+            cur_src = src
+            cur_date = _land_date_text(date)
+        else:
+            own_date = _land_date_text(date)
+            if own_date:
+                cur_date = own_date
         cat = r[col["类别"]] if "类别" in col else ""
         if cat:
             cur_cat = cat
@@ -804,7 +834,7 @@ def sync_to_material(model):
         merge_name = str(name).strip() if name else (str(raw).strip() if raw else "")
         # 实付总额：优先「实付合计」，旧落地表无该列时回退到「合计」（即无优惠）
         paid = cur_paid if cur_paid not in (None, "") else cur_total
-        rows.append({"date": str(cur_date)[:10], "cat": cur_cat, "name": merge_name,
+        rows.append({"date": cur_date, "cat": cur_cat, "name": merge_name,
                      "qty": qty, "price": price, "amt": amt, "paid": paid})
     if not rows:
         raise HTTPException(400, "落地表没有可同步的数据")
@@ -817,13 +847,21 @@ def sync_to_material(model):
     sheet_cache = {}
     map_cache = {}
     results = []
+    # 日期为空的单据不参与写入（含员工餐汇总），避免 _excel_serial 落到错误列
+    dated_rows = []
+    for row in rows:
+        if not row["date"]:
+            results.append({"日期": "", "落地品名": row["name"], "目标品名": "", "置信度": 0,
+                            "理由": BLANK_DATE_SYNC_REASON, "来源": "error"})
+            continue
+        dated_rows.append(row)
     # 员工餐sheet汇总：按日期聚合蔬菜单实付合计（同一天只有一张蔬菜单，不做累加）
     staff = {}
-    for row in rows:
+    for row in dated_rows:
         if row["cat"] == "蔬菜" and row.get("paid") not in (None, ""):
             staff.setdefault(row["date"], {"paid": Decimal(str(row["paid"])), "material": Decimal("0")})
 
-    for row in rows:
+    for row in dated_rows:
         primary = CATEGORY_SHEET.get(row["cat"])
         alt = "日物料采购" if primary == "肉类采购" else ("肉类采购" if primary == "日物料采购" else None)
         sheets_to_try = [s for s in (primary, alt) if s and s in twb.sheetnames]
@@ -1041,8 +1079,25 @@ def get_image(filename: str):
     return FileResponse(p)
 
 
+def _mark_blank_date(filename):
+    """确认时日期为空：标为存疑，保持未确认，不写落地表。"""
+    for inv in _state["invoices"]:
+        if inv["filename"] == filename:
+            suspects = list(inv.get("suspects") or [])
+            if BLANK_DATE_SUSPECT not in suspects:
+                suspects.append(BLANK_DATE_SUSPECT)
+            inv["suspects"] = suspects
+            save_state()
+            return
+    raise HTTPException(404, "未找到该票据")
+
+
 @app.post("/api/invoice/{filename}/confirm")
 def confirm(filename: str, payload: ConfirmPayload):
+    # 日期为空不得落地：既不继承别的单据日期，也不把空日期写进 Excel
+    if not _land_date_text(payload.date):
+        _mark_blank_date(filename)
+        raise HTTPException(400, "日期为空，请人工补填日期后再确认（本次未写入 Excel）")
     items = [normalize_item(it) for it in payload.items]
     # 回流学习：仅当用户手动编辑过品名时，才把「OCR 原品名 → 确认后品名」写入纠错字典
     for it in items:
