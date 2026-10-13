@@ -810,6 +810,24 @@ def _cell_number(total):
     return float(total)
 
 
+# 票面指定只进员工餐、不写进日物料采购（也不写其他物料 sheet）的品名。
+STAFF_MEAL_ONLY_MARK = "海底捞"
+
+
+def is_staff_meal_only(name):
+    """海底捞只计员工餐。品名归一化后只要包含该标记即命中，避免规格后缀漏网。"""
+    norm = normalize_pin(name or "")
+    return bool(norm) and STAFF_MEAL_ONLY_MARK in norm
+
+
+def _row_amount(row):
+    """明细金额转 Decimal。空金额返回 None，调用方不得按 0 计入。"""
+    value = row.get("amt")
+    if value in (None, ""):
+        return None
+    return Decimal(str(value))
+
+
 def sync_to_material(model):
     """把落地表数据同步到物料明细表（写前自动备份，只写数量+金额，单价/合计靠公式）。
 
@@ -891,35 +909,78 @@ def sync_to_material(model):
     sheet_cache = {}
     map_cache = {}
     results = []
-    # 日期为空的单据不参与写入（含员工餐汇总），避免落到错误列或参与同一天累加。
-    # 有日期但缺少类别的行同样跳过，不进入 cell_sums，也不默认归入蔬菜。
+    # 员工餐 / 日物料按「这行金额有没有写进物料表」拆开。
+    # 日物料 = 实际写入物料表的金额；员工餐 = 没写入的金额（海底捞、对不上的蔬菜、缺类别等）。
+    # 不用「实付 − 已落地」倒挤，否则实付里多出来的差额会把员工餐抬高。
+    # 空日期没有自己的日期行，不能记到别的日期上，否则会把另一天的员工餐抬高。
+    staff = {}
+
+    def _staff_slot(date):
+        slot = staff.get(date)
+        if slot is None:
+            slot = {"paid": None, "material": Decimal("0"), "meal": Decimal("0")}
+            staff[date] = slot
+        return slot
+
+    def _add_meal(row):
+        amount = _row_amount(row)
+        if amount is None or not row.get("date"):
+            return
+        _staff_slot(row["date"])["meal"] += amount
+
+    def _add_material(row):
+        amount = _row_amount(row)
+        if amount is None or not row.get("date"):
+            return
+        _staff_slot(row["date"])["material"] += amount
+
+    # 日期为空、缺少类别的行不写入物料表。有日期的未落地金额计入当天员工餐。
     dated_rows = []
     for row in rows:
         if not row["date"]:
             results.append({"日期": "", "落地品名": row["name"], "目标品名": "", "置信度": 0,
                             "理由": BLANK_DATE_SYNC_REASON, "来源": "error"})
+            amount = _row_amount(row)
+            if amount is not None:
+                # 金额属于员工餐，但没有日期行可写，不能摊到其他日期。
+                # 落地品名留空：这不是物料写入成功记录，避免被当成已经落表。
+                results.append({"日期": "", "落地品名": "", "目标品名": "员工餐",
+                                "置信度": 1, "来源": "staff_meal", "金额": row["amt"],
+                                "理由": f"日期为空，{row['name']}未写入物料表，金额{float(amount):.2f}计入员工餐，但没有日期行，不记入其他日期"})
             continue
         if not str(row.get("cat") or "").strip():
             results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": "", "置信度": 0,
                             "理由": "缺少类别，未默认归入蔬菜，请重新打开该单据选择类别并确认", "来源": "error"})
+            _add_meal(row)
             continue
         dated_rows.append(row)
     # 同一天同一物料可能来自多张已确认单据。先按目标单元格（日期列+物料行）
     # 汇总落地表全部已确认行，再一次性写入合计；不读取、不累加单元格旧值，重复同步幂等。
     cell_sums = {}
-    # 员工餐sheet汇总：按日期聚合蔬菜单实付合计（同一天只有一张蔬菜单，不做累加）
-    staff = {}
+    # 先占住蔬菜单和海底捞所在日期，方便同一天写进日物料采购的金额归到日物料而不是员工餐。
+    # 实付只留给总计列展示；员工餐不再用实付倒挤。同一天只取第一张蔬菜单的实付。
     for row in dated_rows:
-        if row["cat"] == "蔬菜" and row.get("paid") not in (None, ""):
-            staff.setdefault(row["date"], {"paid": Decimal(str(row["paid"])), "material": Decimal("0")})
+        if row["cat"] == "蔬菜" or is_staff_meal_only(row["name"]):
+            slot = _staff_slot(row["date"])
+            if slot["paid"] is None and row["cat"] == "蔬菜" and row.get("paid") not in (None, ""):
+                slot["paid"] = Decimal(str(row["paid"]))
 
     for row in dated_rows:
+        # 海底捞只进员工餐，不参与日物料，也不写进肉类采购。
+        if is_staff_meal_only(row["name"]):
+            _add_meal(row)
+            results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": "员工餐",
+                            "置信度": 1, "来源": "staff_meal", "数量": row["qty"], "金额": row["amt"],
+                            "理由": "海底捞只计入员工餐，不写入日物料采购"})
+            continue
         primary = CATEGORY_SHEET.get(row["cat"])
         alt = "日物料采购" if primary == "肉类采购" else ("肉类采购" if primary == "日物料采购" else None)
         sheets_to_try = [s for s in (primary, alt) if s and s in twb.sheetnames]
         if not sheets_to_try:
             results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": "", "置信度": 0,
                             "理由": f"未识别类别或缺少sheet：{row['cat']}", "来源": "error"})
+            if row["cat"] == "蔬菜":
+                _add_meal(row)
             continue
         placed = False
         for sheet_name in sheets_to_try:
@@ -940,6 +1001,8 @@ def sync_to_material(model):
             if mp["置信度"] < 0.8:
                 results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": mp["目标品名"],
                                 "置信度": mp["置信度"], "理由": f"置信度不足(低于0.8)，跳过不落地：{mp['理由']}", "来源": mp["来源"]})
+                if row["cat"] == "蔬菜":
+                    _add_meal(row)
                 placed = True
                 break
             tr = code_rows[mp["物料代码"]]
@@ -947,6 +1010,8 @@ def sync_to_material(model):
             if col_qty is None:
                 results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": mp["目标品名"],
                                 "置信度": mp["置信度"], "理由": f"目标表无该日期列：{row['date']}", "来源": mp["来源"]})
+                if row["cat"] == "蔬菜":
+                    _add_meal(row)
                 placed = True
                 break
             bucket = cell_sums.get((sheet_name, tr, col_qty))
@@ -959,9 +1024,11 @@ def sync_to_material(model):
             if row["amt"] is not None:
                 amt = Decimal(str(row["amt"]))
                 bucket["amt"] = amt if bucket["amt"] is None else bucket["amt"] + amt
-            # 累计该单成功落到「日物料采购」的物料金额，供员工餐sheet员工餐金额=实付−物料合计
-            if sheet_name == "日物料采购" and row["date"] in staff and row["amt"] is not None:
-                staff[row["date"]]["material"] += Decimal(str(row["amt"]))
+            # 只有真正进入写入队列的金额才算日物料。蔬菜写到肉类采购也算已落物料表。
+            # 纯肉类写到肉类采购不进员工餐汇总；写到日物料采购且当天已有员工餐日期时计入日物料。
+            if row["amt"] is not None and (sheet_name == "日物料采购" or row["cat"] == "蔬菜"):
+                if row["cat"] == "蔬菜" or row["date"] in staff:
+                    _add_material(row)
             results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": mp["目标品名"],
                             "置信度": mp["置信度"], "理由": mp["理由"], "来源": mp["来源"],
                             "数量": row["qty"], "金额": row["amt"]})
@@ -970,6 +1037,8 @@ def sync_to_material(model):
         if not placed:
             results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": "", "置信度": 0,
                             "理由": "品名在肉类/日物料表中均无法归并", "来源": "error"})
+            if row["cat"] == "蔬菜":
+                _add_meal(row)
 
     for (_sheet, tr, col_qty), bucket in cell_sums.items():
         ws = bucket["ws"]
@@ -978,8 +1047,9 @@ def sync_to_material(model):
         if bucket["amt"] is not None:
             ws.cell(tr, col_qty + 2).value = _cell_number(bucket["amt"])
 
-    # 写入员工餐sheet（仅蔬菜单）：日物料金额列=物料金额合计，日物料总计列=实付总额(优惠后)，
-    # 员工餐金额列=实付合计−物料金额合计（员工餐+物料=总计）
+    # 写入员工餐sheet：日物料金额 = 实际写入物料表的金额；
+    # 员工餐金额 = 未写入物料表的金额（海底捞、对不上的蔬菜行、缺类别等）。
+    # 总计列仍写蔬菜单实付（优惠后）；没有实付时用两侧金额之和。
     if "员工餐" in twb.sheetnames:
         try:
             staff_ws = twb["员工餐"]
@@ -995,18 +1065,22 @@ def sync_to_material(model):
                     results.append({"日期": d, "落地品名": "", "目标品名": "", "置信度": 0,
                                     "理由": "员工餐sheet无该日期行", "来源": "error"})
                     continue
-                paid = v["paid"].quantize(CENT, rounding=ROUND_HALF_UP)
                 material_sum = v["material"].quantize(CENT, rounding=ROUND_HALF_UP)
-                staff_amt = (paid - material_sum).quantize(CENT, rounding=ROUND_HALF_UP)
-                staff_ws.cell(r, daily_amt_col).value = float(material_sum)   # 日物料·金额 = 物料金额合计
-                staff_ws.cell(r, daily_total_col).value = float(paid)         # 日物料·总计 = 实付总额(优惠后)
-                staff_ws.cell(r, staff_amt_col).value = float(staff_amt)      # 员工餐·金额 = 实付-物料
+                staff_amt = v["meal"].quantize(CENT, rounding=ROUND_HALF_UP)
+                paid = v["paid"].quantize(CENT, rounding=ROUND_HALF_UP) if v["paid"] is not None else None
+                total_cell = paid if paid is not None else (material_sum + staff_amt)
+                staff_ws.cell(r, daily_amt_col).value = float(material_sum)   # 日物料·金额 = 已落物料表
+                staff_ws.cell(r, daily_total_col).value = float(total_cell)   # 总计 = 实付（无实付则为两侧之和）
+                staff_ws.cell(r, staff_amt_col).value = float(staff_amt)      # 员工餐 = 未落物料表的金额
                 note = ""
+                if paid is not None and (staff_amt + material_sum - paid).copy_abs() > CENT:
+                    note = "，员工餐只统计未落入物料表的金额，实付差额未摊入员工餐"
                 if staff_amt < 0:
-                    note = "，注意：员工餐金额为负（优惠额>员工餐部分，请人工核对）"
+                    note += "，注意：员工餐金额为负（请人工核对）"
+                paid_txt = f"{float(paid):.2f}" if paid is not None else "无"
                 results.append({"日期": d, "落地品名": "", "目标品名": "员工餐",
                                 "置信度": 1, "来源": "mapping",
-                                "理由": f"日物料金额={float(material_sum):.2f}，日物料总计=实付{float(paid):.2f}，员工餐金额={float(staff_amt):.2f}{note}"})
+                                "理由": f"日物料金额={float(material_sum):.2f}，日物料总计=实付{paid_txt}，员工餐金额={float(staff_amt):.2f}{note}"})
 
     twb.save(material)
     return results, backup
