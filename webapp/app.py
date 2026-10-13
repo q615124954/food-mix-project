@@ -268,6 +268,7 @@ def compute_suspects(date, items):
         return suspects
     cnt_q = cnt_a = cnt_z = 0
     bad_names = []
+    num_names = []
     # 第一遍：逐行打字段级标记 + 聚合计数
     for it in items:
         g = it.get("勾稽")
@@ -281,6 +282,12 @@ def compute_suspects(date, items):
             cnt_z += 1
         nm = str(it.get("品名", "")).strip()
         fmt_bad = bool(nm) and (len(nm) == 1 or re.search(r"\d", nm) is not None)
+        # 品名为空（没认出来）或纯数字（如手写「盐」被数量吃掉认成「10」）：一定标存疑交人工
+        if not nm:
+            fmt_bad = True
+            nm = "（品名未识别）"
+        elif re.fullmatch(r"[\d.\s]+", nm):
+            num_names.append(nm)
         # 纠错后的最终品名不在物料表合法集合 → 才判存疑（OCR 认错但已纠正成功则信任）
         not_legal = bool(nm) and bool(_legal_names) and normalize_pin(nm) not in _legal_names
         # 需要人工核对的机器纠正：LLM 中置信，以及高分易混（如香菜/香葱）
@@ -319,10 +326,25 @@ def compute_suspects(date, items):
         suspects.append(f"{cnt_a} 行缺金额")
     if cnt_z:
         suspects.append(f"{cnt_z} 行数量为0")
+    if num_names:
+        suspects.append(f"{len(num_names)} 行品名是纯数字（{'、'.join(num_names)}），可能品名被数量吃掉，请对照原图改成正确品名")
     if bad_names:
         shown = "、".join(bad_names[:3]) + ("…" if len(bad_names) > 3 else "")
         suspects.append(f"{len(bad_names)} 行品名存疑（{shown}）")
     return suspects
+
+
+ORDER_TOTAL_TOL = 0.5
+
+
+def order_total_suspect(total, order_total):
+    """订单合计校验：没识别出来 → 提示人工填写；与明细金额和相差超过 0.5 元 → 提示核对。
+    只提示，不改值。返回提示文字或 None。"""
+    if order_total is None:
+        return "订单合计未识别，请对照原图填写"
+    if total is not None and abs(float(order_total) - float(total)) > ORDER_TOTAL_TOL:
+        return f"订单合计 {order_total:g} 与明细金额之和 {total:g} 不符（差 {float(order_total) - float(total):+g}），请核对"
+    return None
 
 
 def _count_missing_rows(rows):
@@ -413,6 +435,9 @@ def ocr_one(filename):
         it["纠正来源"] = src
     suspects = compute_suspects(date, items)
     missing = _count_missing_rows(rows)
+    tip = order_total_suspect(total, order_total)
+    if tip:
+        suspects.append(tip)
     if missing:
         suspects.append(f"疑似漏识别 {missing} 行（有序号但内容为空，可能补货段未识别，请人工核对补录）")
     return {"date": date, "total": total, "order_total": order_total, "items": items, "suspects": suspects}

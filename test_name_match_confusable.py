@@ -107,12 +107,13 @@ class NameMatchConfusableTests(unittest.TestCase):
         self.assertEqual(conf, 1.0)
         self.assertEqual(source, "exact")
 
-    def test_variant_xiangrui_still_maps_to_xiangcai(self):
+    def test_variant_xiangrui_maps_to_xiangcong(self):
+        # 金标核对：8/11、8/12 的「香蕊」和 8/13 的「香芯」单价都是 4 元/斤，对应香葱（香菜约 7.5 元/斤）
         best, conf, source, _top = name_match.match(
             "香蕊", ["香菜", "香葱"], category="蔬菜")
         adopted, prompt = name_match.correction_action("香蕊", best, conf, source)
-        self.assertEqual(best, "香菜")
-        self.assertEqual(adopted, "香菜")
+        self.assertEqual(best, "香葱")
+        self.assertEqual(adopted, "香葱")
         self.assertFalse(prompt)
         self.assertGreaterEqual(conf, name_match.AUTO_CONF)
         self.assertEqual(source, "variant")

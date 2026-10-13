@@ -35,17 +35,20 @@ WEAK_SCORE_CAP = 0.89
 # 默认变体表（首次运行时写入 JSON；seed 自 8 张菜类单实测 OCR 错例）
 DEFAULT_VARIANTS = {
     "蔬菜": {
-        "薄荷叶": ["莴青叶", "莲荷叶"],
-        "香菜": ["香蕊", "香芯"],
+        "薄荷叶": ["莴青叶", "莲荷叶", "薄荷"],
+        # 金标 8/11 香蕊 1斤4元、8/12 香蕊 2斤8元、8/13 香芯 3斤12元 都是香葱（8/12 香菜另有一行 2斤15元）
+        "香葱": ["香蕊", "香芯"],
+        "香菜": [],
         "金针菇": ["全针蕊", "金针"],
         "娃娃菜": ["搭娃亲"],
-        "猪腱子肉": ["惜腱子肉", "腱肉"],
+        # 腊肉：变体只在精确匹配之后才查，物料表里真有「腊肉」时会先精确命中，不会被改成猪腱子肉
+        "猪腱子肉": ["惜腱子肉", "腱肉", "腊肉"],
         "亿亩田大米": ["亿百日", "亿亩田"],
         "细面": ["细面条"],
-        "蒜头": ["蒜末"],
+        "蒜头": ["蒜末", "大蒜头"],
         "东古鸡精": ["鸡精"],
         "宏斌小米辣": ["小半辣", "小米辣"],
-        "去皮蒜米": ["蒜米"],
+        "去皮蒜米": ["蒜米", "蒜半"],
         "绿豆芽": ["绿豆牙"],
     },
     "肉类": {},
@@ -54,7 +57,33 @@ DEFAULT_VARIANTS = {
 # 同义词：别名 -> 标准名（仅当物料表只存在标准名、OCR 出现别名时才有用）
 SYNONYMS = {}
 
+# 旧版默认表里写错的变体：加载已有 JSON 时剔除（香蕊/香芯 是香葱，不是香菜）
+WRONG_VARIANTS = {"蔬菜": {"香菜": ["香蕊", "香芯"]}}
+
 _VARIANTS = None
+
+
+def _migrate(variants):
+    """已落盘的变体表：剔除旧版错误映射，补上默认表新增的变体（不删用户回流学到的）。
+    返回是否有改动。"""
+    changed = False
+    for cat, table in WRONG_VARIANTS.items():
+        for std, wrongs in table.items():
+            lst = variants.get(cat, {}).get(std)
+            if lst:
+                kept = [v for v in lst if v not in wrongs]
+                if kept != lst:
+                    variants[cat][std] = kept
+                    changed = True
+    for cat, table in DEFAULT_VARIANTS.items():
+        dst = variants.setdefault(cat, {})
+        for std, vs in table.items():
+            lst = dst.setdefault(std, [])
+            for v in vs:
+                if v not in lst:
+                    lst.append(v)
+                    changed = True
+    return changed
 
 
 def load_variants():
@@ -64,6 +93,8 @@ def load_variants():
         try:
             with open(VARIANTS_FILE, encoding="utf-8") as f:
                 _VARIANTS = json.load(f)
+            if _migrate(_VARIANTS):
+                save_variants()
             return _VARIANTS
         except (OSError, ValueError):
             pass
