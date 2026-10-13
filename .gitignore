@@ -10,12 +10,15 @@ venv/
 
 # 运行时状态（自动生成，可删）
 webapp/state.json
+webapp/state.json.bak
 # 本地路径配置（机器相关，勿提交）
 webapp/settings.json
 # 品名纠错字典（回流学习累积的运行时数据，随使用持续变化）
 webapp/product_dict.json
 # 品名归并映射表（同步映射，随人工确认持续累积）
 webapp/name_map.json
+# 品名→物料代码映射表（物料代码主键同步，随确认持续累积）
+webapp/code_map.json
 # 品名变体表（初始由 name_match.py 的 DEFAULT_VARIANTS 生成，随回流学习累积）
 webapp/name_variants.json
 
@@ -29,5 +32,6 @@ webapp/_uvicorn.err
 # IDE / 系统
 .vscode/
 .idea/
+.codebuddy/
 .DS_Store
 Thumbs.db

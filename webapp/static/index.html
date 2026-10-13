@@ -62,6 +62,11 @@
   .empty { padding: 30px; text-align: center; color: #999; font-size: 13px; }
   .totalbar { padding: 10px 14px; font-size: 15px; font-weight: 600; border-top: 1px solid #eee; }
   .totalbar .val { color: #2563eb; }
+  .totalbar .paid { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 14px; font-weight: 600; }
+  .totalbar .paid input { width: 120px; border: 1px solid #d1d5db; border-radius: 4px; padding: 4px 6px; font-size: 14px; font-weight: 600; }
+  .totalbar .paid input:focus { border-color: #2563eb; outline: none; }
+  .paid-hint { font-size: 12px; font-weight: 400; color: #f59e0b; margin-left: 2px; }
+  .paid-hint.bad { color: #ef4444; }
   .hint { padding: 8px 14px; font-size: 12px; color: #999; border-top: 1px solid #eee; }
   .toast { position: fixed; left: 50%; bottom: 30px; transform: translateX(-50%); background: #111; color: #fff; padding: 9px 18px; border-radius: 6px; font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .25s; z-index: 999; }
   .toast.show { opacity: 1; }
@@ -126,7 +131,10 @@
             <tbody id="tbody"></tbody>
           </table>
         </div>
-        <div class="totalbar">合计：¥<span class="val" id="total-val">0.00</span></div>
+        <div class="totalbar">
+          <div>合计：¥<span class="val" id="total-val">0.00</span></div>
+          <div class="paid">实付总额(优惠后) ¥<input id="fld-paid" type="number" step="0.01" min="0" placeholder="默认=明细合计"><span class="paid-hint" id="paid-hint"></span></div>
+        </div>
         <div class="hint">修改数量或金额时，单价自动 = 金额 ÷ 数量；也可直接改单价。</div>
       </div>
     </div>
@@ -219,6 +227,11 @@ function renderCurrent() {
   const dw = document.getElementById('date-warn');
   if (dw) dw.style.display = inv.date ? 'none' : 'inline';
   document.getElementById('fld-category').value = inv.category || (inv.items[0] && inv.items[0]['类别']) || '蔬菜';
+  const paidInp = document.getElementById('fld-paid');
+  if (paidInp) {
+    const v = inv.paid_total != null ? inv.paid_total : inv.order_total;
+    paidInp.value = (v != null && v !== '') ? v : '';
+  }
   recomputeTotal();
   document.getElementById('tbl-title').textContent = inv.filename;
   document.getElementById('btn-confirm').disabled = !inv.ocr_done;
@@ -261,6 +274,7 @@ function renderCurrent() {
 
 document.getElementById('fld-date').addEventListener('input', () => { dirty = true; });
 document.getElementById('fld-category').addEventListener('change', () => { dirty = true; });
+document.getElementById('fld-paid').addEventListener('input', () => { dirty = true; updatePaidHint(); });
 
 function recompute(row) {
   const it = state.invoices[cur].items[row];
@@ -273,10 +287,8 @@ function recompute(row) {
   recomputeTotal();
 }
 
-function recomputeTotal() {
+function currentSum() {
   const inv = state.invoices[cur];
-  const el = document.getElementById('total-val');
-  if (!el) return;
   let sum = 0;
   if (inv && inv.items && inv.items.length > 0) {
     inv.items.forEach(it => {
@@ -284,7 +296,41 @@ function recomputeTotal() {
       if (!isNaN(v)) sum += v;
     });
   }
-  el.textContent = (Math.round(sum * 100) / 100).toFixed(2);
+  return Math.round(sum * 100) / 100;
+}
+
+function recomputeTotal() {
+  const el = document.getElementById('total-val');
+  if (el) el.textContent = currentSum().toFixed(2);
+  updatePaidHint();
+}
+
+function paidValue() {
+  const el = document.getElementById('fld-paid');
+  if (!el) return null;
+  const v = el.value;
+  if (v === '' || v == null) return null;
+  const n = parseFloat(v);
+  return isNaN(n) ? null : n;
+}
+
+function updatePaidHint() {
+  const el = document.getElementById('paid-hint');
+  if (!el) return;
+  const paid = paidValue();
+  if (paid == null) { el.textContent = ''; el.className = 'paid-hint'; return; }
+  const sum = currentSum();
+  const diff = Math.round((sum - paid) * 100) / 100;
+  if (diff > 0.005) {
+    el.textContent = '优惠 ¥' + diff.toFixed(2);
+    el.className = 'paid-hint';
+  } else if (diff < -0.005) {
+    el.textContent = '实付高于明细 ¥' + Math.abs(diff).toFixed(2);
+    el.className = 'paid-hint bad';
+  } else {
+    el.textContent = '无优惠';
+    el.className = 'paid-hint';
+  }
 }
 
 function toNum(v) {
@@ -315,6 +361,7 @@ async function submitConfirm() {
   const payload = {
     date: document.getElementById('fld-date').value.trim(),
     category: document.getElementById('fld-category').value,
+    paid_total: paidValue(),
     items: inv.items.map(it => ({ '品名': it['品名'], '原品名': it['原品名'], '品名编辑': it['品名编辑'], '数量': it['数量'], '单价': it['单价'], '金额': it['金额'] }))
   };
   try {
@@ -432,10 +479,12 @@ document.getElementById('btn-reset').addEventListener('click', doReset);
 
 document.querySelectorAll('.pick').forEach(btn => {
   btn.addEventListener('click', async () => {
+    const input = document.getElementById(btn.dataset.target);
+    const initial = input ? input.value.trim() : '';
     try {
-      const r = await fetch('/api/pick?kind=' + btn.dataset.kind);
+      const r = await fetch('/api/pick?kind=' + btn.dataset.kind + '&initial=' + encodeURIComponent(initial));
       const data = await r.json();
-      if (r.ok && data.path) document.getElementById(btn.dataset.target).value = data.path;
+      if (r.ok && data.path) input.value = data.path;
     } catch (err) {
       toast('打开选择器失败：' + err.message, true);
     }

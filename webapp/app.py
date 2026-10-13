@@ -12,7 +12,10 @@ import shutil
 import time
 import threading
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 from contextlib import asynccontextmanager
+
+CENT = Decimal("0.01")
 
 # 让 webapp 能 import 到上级目录的 pipeline_min
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -35,6 +38,9 @@ _name_dict = {"蔬菜": {}, "肉类": {}}
 # 品名归并映射表（物料明细同步用，别名→目标品名，按类别隔离）
 NAME_MAP_FILE = os.path.join(BASE_DIR, "name_map.json")
 _name_map = {"肉类": {}, "蔬菜": {}}
+# 品名→物料代码映射表（物料代码主键同步用，财务品名→物料代码，按类别隔离）
+CODE_MAP_FILE = os.path.join(BASE_DIR, "code_map.json")
+_code_map = {"肉类": {}, "蔬菜": {}}
 # 合法品名集合（来自物料明细表「日物料采购」sheet 的品名列，归一化后）
 _legal_names = set()
 # 合法品名有序列表（原始品名，用于 name_match 模糊匹配候选集）
@@ -93,6 +99,22 @@ def load_name_map():
 def save_name_map():
     with open(NAME_MAP_FILE, "w", encoding="utf-8") as f:
         json.dump(_name_map, f, ensure_ascii=False, indent=2)
+
+
+# ===== 品名→物料代码映射表：持久化 =====
+def load_code_map():
+    global _code_map
+    if os.path.exists(CODE_MAP_FILE):
+        try:
+            with open(CODE_MAP_FILE, encoding="utf-8") as f:
+                _code_map = json.load(f)
+        except (OSError, ValueError):
+            _code_map = {"肉类": {}, "蔬菜": {}}
+
+
+def save_code_map():
+    with open(CODE_MAP_FILE, "w", encoding="utf-8") as f:
+        json.dump(_code_map, f, ensure_ascii=False, indent=2)
 
 
 # ===== 合法品名表 + 员工餐归属判定 =====
@@ -230,6 +252,10 @@ def image_files():
 
 
 # ===== 复用 pipeline_min 做单张 OCR =====
+# 易混品名对：OCR 常把这两个合法品名互相认串（香葱↔香菜等），同单同时出现时全部标红提示人工核对
+CONFUSABLE_PAIRS = [("番茄", "香草"), ("蒜米", "去皮蒜米"), ("蒜米", "蒜头")]
+
+
 def compute_suspects(date, items):
     """OCR 后规则式存疑判定（零成本，不调 LLM），返回存疑原因列表（空=正常）。
     同时给每个 item 打上字段级存疑标记「品名存疑 / 数量存疑 / 金额存疑」，
@@ -255,9 +281,24 @@ def compute_suspects(date, items):
             cnt_z += 1
         nm = str(it.get("品名", "")).strip()
         fmt_bad = bool(nm) and (len(nm) == 1 or re.search(r"\d", nm) is not None)
-        it["品名存疑"] = fmt_bad
+        # 纠错后的最终品名不在物料表合法集合 → 才判存疑（OCR 认错但已纠正成功则信任）
+        not_legal = bool(nm) and bool(_legal_names) and normalize_pin(nm) not in _legal_names
+        # 仅 LLM 中置信（有歧义）纠正才提示核对；高置信 fuzzy 纠正已可信
+        machine_fixed = it.get("纠正来源", "") == "llm"
+        it["品名存疑"] = fmt_bad or not_legal or machine_fixed
         if it["品名存疑"]:
             bad_names.append(nm)
+    # 易混品名对：同单同时出现时，整对都标红（合法名之间串位 OCR 很难自查）
+    names_set = {str(it.get("品名", "")).strip() for it in items}
+    if names_set:
+        for a, b in CONFUSABLE_PAIRS:
+            if a in names_set and b in names_set:
+                for it in items:
+                    if str(it.get("品名", "")).strip() in (a, b):
+                        it["品名存疑"] = True
+                        nm = str(it.get("品名", "")).strip()
+                        if nm not in bad_names:
+                            bad_names.append(nm)
     # 重复品名也标品名存疑（同一单内重复品名多为误识别）
     name_counts = {}
     for it in items:
@@ -313,12 +354,26 @@ def ocr_one(filename):
     rows = core.parse_table(text)
     items = core.parse_line_items(rows)
     items, _stat = core.derive_price(items)
+    # 漏识别兜底：有序号但内容为空的行较多（阴影遮挡/补货段未识别）时，
+    # 用阴影补偿后的增强图重试一次 OCR，解析出更多明细时采用增强结果
+    if _count_missing_rows(rows) >= 2 or not items:
+        try:
+            text2 = core.call_ocr(path, enhance=True)
+            rows2 = core.parse_table(text2)
+            items2, _s2 = core.derive_price(core.parse_line_items(rows2))
+            if len(items2) > len(items):
+                text, rows, items = text2, rows2, items2
+                date = core.extract_date(text2, filename)
+        except Exception:
+            pass  # 增强重试失败则保留原结果，交人工核对
     total = core.sum_amount(items)
+    order_total = core.extract_order_total(rows)
     for it in items:
         it["日期"] = date
         raw = it.get("品名", "")
         cat = it.get("类别", "蔬菜")
         corrected, _ = core.correct_name(raw, cat, _name_dict)
+        src = "dict" if corrected != raw else ""
         # 纠错字典未命中时，对蔬菜走「变体表+拼音+单位」模糊匹配（阶段1+2）
         if corrected == raw and cat == "蔬菜" and _legal_name_list:
             best, conf, _src, top = name_match.match(
@@ -326,6 +381,7 @@ def ocr_one(filename):
                 units=_legal_units, unit=it.get("单位"))
             if best and conf >= name_match.AUTO_CONF:
                 corrected = best
+                src = "fuzzy"
             elif best and conf >= name_match.SUGGEST_CONF:
                 # 中置信歧义：LLM 在 top 候选里定夺（带数量/金额/单位上下文）
                 try:
@@ -335,15 +391,17 @@ def ocr_one(filename):
                         candidate_units=_legal_units)
                     if mp.get("来源") in ("mapping", "ai") and mp.get("目标品名") in _legal_name_list:
                         corrected = mp["目标品名"]
+                        src = "llm"
                 except Exception:
                     pass  # LLM 失败则保留 OCR 原值，交人工
         it["原品名"] = raw
         it["品名"] = corrected
+        it["纠正来源"] = src
     suspects = compute_suspects(date, items)
     missing = _count_missing_rows(rows)
     if missing:
         suspects.append(f"疑似漏识别 {missing} 行（有序号但内容为空，可能补货段未识别，请人工核对补录）")
-    return {"date": date, "total": total, "items": items, "suspects": suspects}
+    return {"date": date, "total": total, "order_total": order_total, "items": items, "suspects": suspects}
 
 
 def build_invoice_index():
@@ -369,6 +427,7 @@ def build_invoice_index():
                 "ocr_done": False,
                 "date": "",
                 "total": "",
+                "order_total": "",
                 "items": [],
                 "error": "",
                 "suspects": [],
@@ -387,6 +446,7 @@ def _ocr_one_inv(inv):
             res = ocr_one(inv["filename"])
             inv["date"] = res["date"]
             inv["total"] = res.get("total")
+            inv["order_total"] = res.get("order_total")
             inv["items"] = res["items"]
             inv["suspects"] = res.get("suspects", [])
             inv["ocr_done"] = True
@@ -469,6 +529,14 @@ def map_product_name(raw_name, category, candidates, model, qty=None, price=None
     mapping = _name_map.get(category, {})
     if raw_name in mapping:
         return {"目标品名": mapping[raw_name], "置信度": 1.0, "理由": "映射表命中", "来源": "mapping"}
+    # 品名本身已是候选集标准名 → 直接命中，省掉一次 LLM 调用（同步性能关键）
+    if raw_name in candidates:
+        return {"目标品名": raw_name, "置信度": 1.0, "理由": "精确匹配", "来源": "exact"}
+    # 仅差空白/括号等归一化差异的标准名也直接命中
+    norm = normalize_pin(raw_name)
+    for c in candidates:
+        if normalize_pin(c) == norm:
+            return {"目标品名": c, "置信度": 1.0, "理由": "精确匹配", "来源": "exact"}
     # 候选集名称（带单位注解，帮助模型区分相似品名）
     if candidate_units:
         cand_str = "、".join(
@@ -525,8 +593,99 @@ def map_product_name(raw_name, category, candidates, model, qty=None, price=None
     return {"目标品名": target, "置信度": conf, "理由": str(obj.get("理由", "")), "来源": "ai"}
 
 
+def _code_name_lookup(code, name_code):
+    """从物料代码反查标准品名（用于 code_map 命中时回填目标品名）"""
+    for nm, cd in name_code.items():
+        if cd == code:
+            return nm
+    return code
+
+
+def map_product_code(raw_name, category, name_code, model, qty=None, amt=None):
+    """品名归并到物料代码：三层兜底，逐级返回，仅最后一级调 LLM。
+    1) code_map 精确命中(已归并过的财务品名→代码)；
+    2) 品名精确/归一化命中候选标准品名；
+    3) name_match 本地召回 top5 候选 + LLM 定夺(LLM 返回候选品名, 再映射代码)。
+    返回 dict：物料代码 / 目标品名 / 置信度 / 理由 / 来源。
+    来源=="ai" 且置信度>=0.8 时写回 code_map 持久化，供重复同步零 LLM 复用。"""
+    code_map_cat = _code_map.get(category, {})
+    # 1) code_map 命中（且代码仍在当前候选 sheet 中）
+    if raw_name in code_map_cat and code_map_cat[raw_name] in set(name_code.values()):
+        code = code_map_cat[raw_name]
+        return {"物料代码": code, "目标品名": _code_name_lookup(code, name_code),
+                "置信度": 1.0, "理由": "代码映射表命中", "来源": "code_map"}
+    # 2) 品名精确/归一化命中候选标准品名
+    if raw_name in name_code:
+        return {"物料代码": name_code[raw_name], "目标品名": raw_name,
+                "置信度": 1.0, "理由": "品名精确匹配", "来源": "exact"}
+    norm = normalize_pin(raw_name)
+    candidates = list(name_code.keys())
+    for c in candidates:
+        if normalize_pin(c) == norm:
+            return {"物料代码": name_code[c], "目标品名": c,
+                    "置信度": 1.0, "理由": "品名归一化匹配", "来源": "exact"}
+    # 3) name_match 本地召回 top5 候选，缩短 prompt 后喂 LLM
+    top_names = candidates[:5]
+    try:
+        _best, _conf, _src, top = name_match.match(raw_name, candidates, category=category)
+        if top:
+            top_names = [t[0] for t in top]
+    except Exception:
+        pass
+    cand_str = "、".join(top_names)
+    system = (
+        "你是餐饮采购品名归并助手。把采购单上的品名归并到给定的标准品名之一。"
+        "判断要点：1) 结合单价区分品类：单价约2~3元/斤的多为骨头，30元以上的多为肉；"
+        "2) 优先看品名字面含义，再结合单价佐证；3) 目标品名必须从候选集原样选取，一字不差。"
+        "只输出 JSON，不要解释、不要多余文字。"
+    )
+    ctx = []
+    if qty is not None:
+        ctx.append(f"数量={qty}")
+    if amt is not None:
+        ctx.append(f"金额={amt}")
+    ctx_str = ("，".join(ctx)) if ctx else "无"
+    user = (
+        f"标准品名候选集：{cand_str}\n"
+        f"待归并品名：{raw_name}\n"
+        f"类别：{category}\n"
+        f"参考信息：{ctx_str}\n"
+        f'输出格式示例：{{"目标品名":"牛大骨","置信度":0.9,"理由":"单价2.48为骨类"}}\n'
+        f'注意：目标品名只输出品名本身，不要带括号或单位。\n'
+        f'只输出 JSON：{{"目标品名":"候选集之一","置信度":0到1,"理由":"简短说明"}}'
+    )
+    try:
+        text = core.call_chat(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            model=model,
+        )
+    except Exception as e:
+        return {"物料代码": "", "目标品名": raw_name, "置信度": 0.0, "理由": f"AI调用失败: {e}", "来源": "ai_error"}
+    try:
+        obj = json.loads(_extract_json(text))
+    except Exception:
+        return {"物料代码": "", "目标品名": raw_name, "置信度": 0.0, "理由": "AI返回无法解析", "来源": "ai_error"}
+    target = str(obj.get("目标品名", "")).strip()
+    target_plain = re.sub(r"[（(].*?[)）]", "", target).strip()
+    if target_plain in name_code:
+        target = target_plain
+    elif target not in name_code:
+        return {"物料代码": "", "目标品名": raw_name, "置信度": 0.0, "理由": f"目标不在候选集: {target}", "来源": "ai_invalid"}
+    try:
+        conf = float(obj.get("置信度", 0))
+    except (TypeError, ValueError):
+        conf = 0.0
+    code = name_code[target]
+    # 高置信 LLM 归并写回持久化（一次归并永久复用）
+    if conf >= 0.8:
+        _code_map.setdefault(category, {})[raw_name] = code
+        save_code_map()
+    return {"物料代码": code, "目标品名": target, "置信度": conf,
+            "理由": str(obj.get("理由", "")), "来源": "ai"}
+
+
 def _parse_target(ws):
-    """解析矩阵式目标表：返回 (日期序列号->数量列号, 品名->行号, 品名->单位)"""
+    """解析矩阵式目标表：返回 (日期序列号->数量列号, 品名->行号, 品名->单位, 物料代码->行号, 品名->物料代码)"""
     header_row = None
     for r in range(1, min(ws.max_row, 60) + 1):
         cells = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
@@ -544,13 +703,56 @@ def _parse_target(ws):
             date_cols[int(v)] = c
     name_rows = {}
     name_units = {}
+    code_rows = {}
+    name_code = {}
     for r in range(header_row + 2, ws.max_row + 1):
         name = ws.cell(r, 4).value
         if name and str(name).strip() and "合计" not in str(name):
             nm = str(name).strip()
             name_rows[nm] = r
             name_units[nm] = str(ws.cell(r, 5).value or "").strip()
-    return date_cols, name_rows, name_units
+            code = str(ws.cell(r, 2).value or "").strip()
+            if code:
+                code_rows[code] = r
+                name_code[nm] = code
+    return date_cols, name_rows, name_units, code_rows, name_code
+
+
+def _parse_staff_sheet(ws):
+    """解析员工餐sheet：返回 (日期序列号->行号, 员工餐金额列号, 日物料金额列号, 日物料总计列号)。
+    表头第2行：序号|日期|类别|金额(员工餐) … 序号|日期|类别|金额(日物料)|总计。
+    日期单元格为 Excel 序列号(General 格式)；合计行(日期为空)自动跳过。"""
+    header_row = None
+    for r in range(1, min(ws.max_row, 10) + 1):
+        vals = [str(ws.cell(r, c).value or "").strip() for c in range(1, ws.max_column + 1)]
+        if "总计" in vals:
+            header_row = r
+            break
+    if header_row is None:
+        raise ValueError("未找到员工餐sheet表头行")
+    amount_cols = []
+    total_col = None
+    date_col = None
+    for c in range(1, ws.max_column + 1):
+        v = str(ws.cell(header_row, c).value or "").strip()
+        if v == "金额":
+            amount_cols.append(c)
+        elif v == "总计" and total_col is None:
+            total_col = c
+        elif v == "日期" and date_col is None:
+            date_col = c
+    if len(amount_cols) < 2 or date_col is None:
+        raise ValueError("员工餐sheet缺少金额/日期列")
+    staff_amt_col = min(amount_cols)   # 员工餐·金额
+    daily_amt_col = max(amount_cols)   # 日物料·金额
+    if total_col is None:
+        total_col = daily_amt_col + 1  # 总计列默认紧跟日物料金额列右侧
+    date_row_map = {}
+    for r in range(header_row + 1, ws.max_row + 1):
+        v = ws.cell(r, date_col).value
+        if isinstance(v, (int, float)):
+            date_row_map[int(v)] = r
+    return date_row_map, staff_amt_col, daily_amt_col, total_col
 
 
 def sync_to_material(model):
@@ -574,6 +776,8 @@ def sync_to_material(model):
     rows = []
     cur_date = ""
     cur_cat = ""
+    cur_total = ""
+    cur_paid = ""
     for r in lws.iter_rows(min_row=2, values_only=True):
         name = r[col["品名"]] if "品名" in col else None
         if name is None:
@@ -588,11 +792,20 @@ def sync_to_material(model):
         amt = r[col["金额"]] if "金额" in col else None
         price = r[col["单价"]] if "单价" in col else None
         raw = r[raw_col] if raw_col is not None else None
+        # 合计/实付合计按来源图片合并，只在首行有值，需向下继承
+        total_v = r[col["合计"]] if "合计" in col else None
+        if total_v not in (None, ""):
+            cur_total = total_v
+        paid_v = r[col["实付合计"]] if "实付合计" in col else None
+        if paid_v not in (None, ""):
+            cur_paid = paid_v
         # 归并以「品名」（用户确认后的最终值）为准，「原品名」仅作追溯/回流学习，
         # 不再作为归并输入，否则会忽略用户手动修正的品名（如把「牛肉」误归成「牛骨」）
         merge_name = str(name).strip() if name else (str(raw).strip() if raw else "")
+        # 实付总额：优先「实付合计」，旧落地表无该列时回退到「合计」（即无优惠）
+        paid = cur_paid if cur_paid not in (None, "") else cur_total
         rows.append({"date": str(cur_date)[:10], "cat": cur_cat, "name": merge_name,
-                     "qty": qty, "price": price, "amt": amt})
+                     "qty": qty, "price": price, "amt": amt, "paid": paid})
     if not rows:
         raise HTTPException(400, "落地表没有可同步的数据")
 
@@ -604,6 +817,11 @@ def sync_to_material(model):
     sheet_cache = {}
     map_cache = {}
     results = []
+    # 员工餐sheet汇总：按日期聚合蔬菜单实付合计（同一天只有一张蔬菜单，不做累加）
+    staff = {}
+    for row in rows:
+        if row["cat"] == "蔬菜" and row.get("paid") not in (None, ""):
+            staff.setdefault(row["date"], {"paid": Decimal(str(row["paid"])), "material": Decimal("0")})
 
     for row in rows:
         primary = CATEGORY_SHEET.get(row["cat"])
@@ -617,18 +835,16 @@ def sync_to_material(model):
         for sheet_name in sheets_to_try:
             if sheet_name not in sheet_cache:
                 ws = twb[sheet_name]
-                date_cols, name_rows, name_units = _parse_target(ws)
-                sheet_cache[sheet_name] = (ws, date_cols, name_rows, name_units)
-            ws, date_cols, name_rows, name_units = sheet_cache[sheet_name]
-            candidates = list(name_rows.keys())
+                date_cols, name_rows, name_units, code_rows, name_code = _parse_target(ws)
+                sheet_cache[sheet_name] = (ws, date_cols, name_rows, name_units, code_rows, name_code)
+            ws, date_cols, name_rows, name_units, code_rows, name_code = sheet_cache[sheet_name]
             key = (sheet_name, row["name"])
             mp = map_cache.get(key)
             if mp is None:
-                mp = map_product_name(row["name"], row["cat"], candidates, model,
-                                      qty=row.get("qty"), price=row.get("price"), amt=row.get("amt"),
-                                      candidate_units=name_units)
+                mp = map_product_code(row["name"], row["cat"], name_code, model,
+                                      qty=row.get("qty"), amt=row.get("amt"))
                 map_cache[key] = mp
-            if mp["目标品名"] not in name_rows:
+            if not mp.get("物料代码") or mp["物料代码"] not in code_rows:
                 continue  # 该 sheet 匹配不上，试备选
             # 置信度不足（<0.8）不落地，避免错误品名被放入错误位置
             if mp["置信度"] < 0.8:
@@ -636,7 +852,7 @@ def sync_to_material(model):
                                 "置信度": mp["置信度"], "理由": f"置信度不足(低于0.8)，跳过不落地：{mp['理由']}", "来源": mp["来源"]})
                 placed = True
                 break
-            tr = name_rows[mp["目标品名"]]
+            tr = code_rows[mp["物料代码"]]
             col_qty = date_cols.get(_excel_serial(row["date"]))
             if col_qty is None:
                 results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": mp["目标品名"],
@@ -647,6 +863,9 @@ def sync_to_material(model):
                 ws.cell(tr, col_qty).value = row["qty"]
             if row["amt"] is not None:
                 ws.cell(tr, col_qty + 2).value = row["amt"]
+            # 累计该单成功落到「日物料采购」的物料金额，供员工餐sheet员工餐金额=实付−物料合计
+            if sheet_name == "日物料采购" and row["date"] in staff and row["amt"] is not None:
+                staff[row["date"]]["material"] += Decimal(str(row["amt"]))
             results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": mp["目标品名"],
                             "置信度": mp["置信度"], "理由": mp["理由"], "来源": mp["来源"],
                             "数量": row["qty"], "金额": row["amt"]})
@@ -656,13 +875,43 @@ def sync_to_material(model):
             results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": "", "置信度": 0,
                             "理由": "品名在肉类/日物料表中均无法归并", "来源": "error"})
 
+    # 写入员工餐sheet（仅蔬菜单）：日物料金额列=物料金额合计，日物料总计列=实付总额(优惠后)，
+    # 员工餐金额列=实付合计−物料金额合计（员工餐+物料=总计）
+    if "员工餐" in twb.sheetnames:
+        try:
+            staff_ws = twb["员工餐"]
+            date_row_map, staff_amt_col, daily_amt_col, daily_total_col = _parse_staff_sheet(staff_ws)
+        except Exception as e:
+            results.append({"日期": "", "落地品名": "", "目标品名": "", "置信度": 0,
+                            "理由": f"员工餐sheet解析失败：{e}", "来源": "error"})
+        else:
+            for d, v in staff.items():
+                serial = _excel_serial(d)
+                r = date_row_map.get(serial)
+                if r is None:
+                    results.append({"日期": d, "落地品名": "", "目标品名": "", "置信度": 0,
+                                    "理由": "员工餐sheet无该日期行", "来源": "error"})
+                    continue
+                paid = v["paid"].quantize(CENT, rounding=ROUND_HALF_UP)
+                material_sum = v["material"].quantize(CENT, rounding=ROUND_HALF_UP)
+                staff_amt = (paid - material_sum).quantize(CENT, rounding=ROUND_HALF_UP)
+                staff_ws.cell(r, daily_amt_col).value = float(material_sum)   # 日物料·金额 = 物料金额合计
+                staff_ws.cell(r, daily_total_col).value = float(paid)         # 日物料·总计 = 实付总额(优惠后)
+                staff_ws.cell(r, staff_amt_col).value = float(staff_amt)      # 员工餐·金额 = 实付-物料
+                note = ""
+                if staff_amt < 0:
+                    note = "，注意：员工餐金额为负（优惠额>员工餐部分，请人工核对）"
+                results.append({"日期": d, "落地品名": "", "目标品名": "员工餐",
+                                "置信度": 1, "来源": "mapping",
+                                "理由": f"日物料金额={float(material_sum):.2f}，日物料总计=实付{float(paid):.2f}，员工餐金额={float(staff_amt):.2f}{note}"})
+
     twb.save(material)
     return results, backup
 
 
 # ===== 落地写 xlsx =====
 def _merge_by_source(ws):
-    """按「来源图片」分组合并：日期/类别/合计三列纵向合并并居中"""
+    """按「来源图片」分组合并：日期/类别/合计/实付合计四列纵向合并并居中"""
     from openpyxl.styles import Alignment
     for mr in list(ws.merged_cells.ranges):
         ws.unmerge_cells(str(mr))
@@ -676,6 +925,7 @@ def _merge_by_source(ws):
         total_col = header.index("合计") + 1
     except ValueError:
         return
+    paid_col = header.index("实付合计") + 1 if "实付合计" in header else None
     center = Alignment(horizontal="center", vertical="center")
     start = 2
     while start <= ws.max_row:
@@ -683,16 +933,17 @@ def _merge_by_source(ws):
         end = start
         while end + 1 <= ws.max_row and ws.cell(end + 1, img_col).value == key:
             end += 1
-        for col in (date_col, cat_col, total_col):
+        merge_cols = [date_col, cat_col, total_col] + ([paid_col] if paid_col else [])
+        for col in merge_cols:
             if end > start:
                 ws.merge_cells(start_row=start, start_column=col, end_row=end, end_column=col)
             ws.cell(start, col).alignment = center
         start = end + 1
 
 
-def append_land(filename, date, category, total, items):
+def append_land(filename, date, category, total, paid_total, items):
     os.makedirs(_paths["output_dir"], exist_ok=True)
-    HEADERS = ["日期", "类别", "品名", "数量", "单价", "金额", "来源图片", "合计"]
+    HEADERS = ["日期", "类别", "品名", "数量", "单价", "金额", "来源图片", "合计", "实付合计"]
     land = land_file()
     with _land_lock:
         if os.path.exists(land):
@@ -702,11 +953,12 @@ def append_land(filename, date, category, total, items):
             # 先取消所有合并，避免删除列/行时冲突
             for mr in list(ws.merged_cells.ranges):
                 ws.unmerge_cells(str(mr))
-            # 兼容旧表头：删除「原品名」列（第9列），统一为8列
-            if ws.cell(1, 9).value == "原品名":
-                ws.delete_cols(9)
-            if ws.cell(1, 8).value != "合计":
-                ws.cell(1, 8).value = "合计"
+            # 兼容旧表头：删除旧「原品名」列，统一为固定 9 列
+            for c in range(ws.max_column, 0, -1):
+                if ws.cell(1, c).value == "原品名":
+                    ws.delete_cols(c)
+            ws.cell(1, 8).value = "合计"
+            ws.cell(1, 9).value = "实付合计"
             # 按来源图片去重：先删掉该图片已有的旧行，再覆盖式写入
             for r in range(ws.max_row, 1, -1):
                 if ws.cell(r, 7).value == filename:
@@ -720,7 +972,7 @@ def append_land(filename, date, category, total, items):
         for it in items:
             ws.append([
                 date, category, it.get("品名"), it.get("数量"),
-                it.get("单价"), it.get("金额"), filename, total,
+                it.get("单价"), it.get("金额"), filename, total, paid_total,
             ])
         _merge_by_source(ws)
         wb.save(land)
@@ -732,6 +984,7 @@ async def lifespan(app: FastAPI):
     load_settings()
     load_name_dict()
     load_name_map()
+    load_code_map()
     load_legal_names()
     load_state()
     build_invoice_index()
@@ -746,6 +999,7 @@ class ConfirmPayload(BaseModel):
     date: str = ""
     category: str = ""
     items: List[dict] = Field(default_factory=list)
+    paid_total: float | None = None   # 实付总额（优惠后）；None 时按明细加总处理
 
 
 class PathsPayload(BaseModel):
@@ -794,18 +1048,32 @@ def confirm(filename: str, payload: ConfirmPayload):
     for it in items:
         if it.get("品名编辑"):
             learn_name(payload.category, it.get("原品名", ""), it.get("品名", ""))
+    # code_map 联动：本次确认的全部品名集合之外/品名被改动的旧映射条目失效，
+    # 避免人工纠正品名后，旧的「旧品名→代码」映射继续误同步到新单据。
+    confirmed_names = {str(it.get("品名", "")).strip() for it in items}
+    code_map_cat = _code_map.setdefault(payload.category, {})
+    if any(it.get("品名编辑") for it in items):
+        for it in items:
+            if it.get("品名编辑"):
+                raw_old = str(it.get("原品名", "")).strip()
+                if raw_old and raw_old not in confirmed_names:
+                    code_map_cat.pop(raw_old, None)
+        save_code_map()
     # 合计 = 所有品名金额累加（不再区分员工餐/物料），所有明细行都落地
     total = core.sum_amount(items)
+    # 实付总额（优惠后）：用户未填或为空时按明细加总（即无优惠）
+    paid = payload.paid_total if payload.paid_total not in (None, "") else total
     for inv in _state["invoices"]:
         if inv["filename"] == filename:
             inv["date"] = payload.date
             inv["total"] = total
+            inv["paid_total"] = paid
             inv["items"] = items
             inv["suspects"] = []   # 已确认，清除存疑标记
             inv["status"] = "confirmed"
             save_state()
             try:
-                append_land(filename, payload.date, payload.category, total, items)
+                append_land(filename, payload.date, payload.category, total, paid, items)
             except PermissionError:
                 raise HTTPException(500, "落地文件被占用，请先关闭 WPS 后重试")
             return {"ok": True}
@@ -888,18 +1156,27 @@ def sync(payload: SyncPayload):
 
 
 # ===== 系统原生文件/文件夹选择器 =====
-def _pick_dialog(kind):
+def _pick_dialog(kind, initial=""):
     """弹系统选择器：kind='dir' 选文件夹，'file' 选 .xlsx 文件；取消返回空串。
+    initial 为初始定位目录（文件夹选择器取目录本身，文件选择器取其父目录）。
     用独立子进程弹 tkinter 对话框，避免 tkinter 在 web 服务线程里的线程/消息循环问题。"""
     import subprocess
+    init_dir = ""
+    if initial:
+        if kind == "dir":
+            init_dir = initial if os.path.isdir(initial) else ""
+        else:
+            d = os.path.dirname(initial)
+            init_dir = d if os.path.isdir(d) else ""
+    init_arg = f", initialdir={init_dir!r}" if init_dir else ""
     pick = (
-        "print(filedialog.askdirectory(title='选择文件夹') or '')"
+        f"print(filedialog.askdirectory(title='选择文件夹'{init_arg}) or '')"
         if kind == "dir"
-        else "print(filedialog.askopenfilename(title='选择物料明细表',filetypes=[('Excel','*.xlsx')]) or '')"
+        else f"print(filedialog.askopenfilename(title='选择物料明细表', filetypes=[('Excel','*.xlsx')]{init_arg}) or '')"
     )
     code = (
         "import tkinter as tk;from tkinter import filedialog;"
-        "r=tk.Tk();r.withdraw();r.attributes('-topmost',True);"
+        "r=tk.Tk();r.withdraw();r.attributes('-topmost',True);r.update();"
         + pick + ";r.destroy()"
     )
     env = dict(os.environ)
@@ -922,11 +1199,11 @@ def _pick_dialog(kind):
 
 
 @app.get("/api/pick")
-def pick(kind: str = "dir"):
+def pick(kind: str = "dir", initial: str = ""):
     if kind not in ("dir", "file"):
         raise HTTPException(400, "kind 必须是 dir 或 file")
     try:
-        return {"path": _pick_dialog(kind)}
+        return {"path": _pick_dialog(kind, initial)}
     except Exception as e:
         raise HTTPException(500, f"无法打开选择器：{e}")
 
