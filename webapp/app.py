@@ -774,8 +774,19 @@ def _parse_staff_sheet(ws):
     return date_row_map, staff_amt_col, daily_amt_col, total_col
 
 
+def _cell_number(total):
+    """累加后的 Decimal 写回单元格：整数值保持 int，其余转 float。"""
+    if total == total.to_integral_value():
+        return int(total)
+    return float(total)
+
+
 def sync_to_material(model):
-    """把落地表数据同步到物料明细表（写前自动备份，只写数量+金额，单价/合计靠公式）"""
+    """把落地表数据同步到物料明细表（写前自动备份，只写数量+金额，单价/合计靠公式）。
+
+    同一天同一物料若出现在多张已确认单据中，数量和金额先按日期+物料汇总再写入。
+    写入的是落地表全部已确认单据的合计，不在单元格旧值上累加，因此重复同步幂等。
+    """
     land = land_file()
     if not os.path.exists(land):
         raise HTTPException(400, f"落地表不存在：{land}")
@@ -847,7 +858,7 @@ def sync_to_material(model):
     sheet_cache = {}
     map_cache = {}
     results = []
-    # 日期为空的单据不参与写入（含员工餐汇总），避免 _excel_serial 落到错误列
+    # 日期为空的单据不参与写入（含员工餐汇总），避免落到错误列或参与同一天累加。
     dated_rows = []
     for row in rows:
         if not row["date"]:
@@ -855,6 +866,9 @@ def sync_to_material(model):
                             "理由": BLANK_DATE_SYNC_REASON, "来源": "error"})
             continue
         dated_rows.append(row)
+    # 同一天同一物料可能来自多张已确认单据。先按目标单元格（日期列+物料行）
+    # 汇总落地表全部已确认行，再一次性写入合计；不读取、不累加单元格旧值，重复同步幂等。
+    cell_sums = {}
     # 员工餐sheet汇总：按日期聚合蔬菜单实付合计（同一天只有一张蔬菜单，不做累加）
     staff = {}
     for row in dated_rows:
@@ -897,10 +911,16 @@ def sync_to_material(model):
                                 "置信度": mp["置信度"], "理由": f"目标表无该日期列：{row['date']}", "来源": mp["来源"]})
                 placed = True
                 break
+            bucket = cell_sums.get((sheet_name, tr, col_qty))
+            if bucket is None:
+                bucket = {"ws": ws, "qty": None, "amt": None}
+                cell_sums[(sheet_name, tr, col_qty)] = bucket
             if row["qty"] is not None:
-                ws.cell(tr, col_qty).value = row["qty"]
+                qty = Decimal(str(row["qty"]))
+                bucket["qty"] = qty if bucket["qty"] is None else bucket["qty"] + qty
             if row["amt"] is not None:
-                ws.cell(tr, col_qty + 2).value = row["amt"]
+                amt = Decimal(str(row["amt"]))
+                bucket["amt"] = amt if bucket["amt"] is None else bucket["amt"] + amt
             # 累计该单成功落到「日物料采购」的物料金额，供员工餐sheet员工餐金额=实付−物料合计
             if sheet_name == "日物料采购" and row["date"] in staff and row["amt"] is not None:
                 staff[row["date"]]["material"] += Decimal(str(row["amt"]))
@@ -912,6 +932,13 @@ def sync_to_material(model):
         if not placed:
             results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": "", "置信度": 0,
                             "理由": "品名在肉类/日物料表中均无法归并", "来源": "error"})
+
+    for (_sheet, tr, col_qty), bucket in cell_sums.items():
+        ws = bucket["ws"]
+        if bucket["qty"] is not None:
+            ws.cell(tr, col_qty).value = _cell_number(bucket["qty"])
+        if bucket["amt"] is not None:
+            ws.cell(tr, col_qty + 2).value = _cell_number(bucket["amt"])
 
     # 写入员工餐sheet（仅蔬菜单）：日物料金额列=物料金额合计，日物料总计列=实付总额(优惠后)，
     # 员工餐金额列=实付合计−物料金额合计（员工餐+物料=总计）
