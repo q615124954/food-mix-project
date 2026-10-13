@@ -283,8 +283,8 @@ def compute_suspects(date, items):
         fmt_bad = bool(nm) and (len(nm) == 1 or re.search(r"\d", nm) is not None)
         # 纠错后的最终品名不在物料表合法集合 → 才判存疑（OCR 认错但已纠正成功则信任）
         not_legal = bool(nm) and bool(_legal_names) and normalize_pin(nm) not in _legal_names
-        # 仅 LLM 中置信（有歧义）纠正才提示核对；高置信 fuzzy 纠正已可信
-        machine_fixed = it.get("纠正来源", "") == "llm"
+        # 需要人工核对的机器纠正：LLM 中置信，以及高分易混（如香菜/香葱）
+        machine_fixed = it.get("纠正来源", "") in ("llm", name_match.REVIEW_SOURCE)
         it["品名存疑"] = fmt_bad or not_legal or machine_fixed
         if it["品名存疑"]:
             bad_names.append(nm)
@@ -347,6 +347,36 @@ def _count_missing_rows(rows):
     return cnt
 
 
+def apply_veg_name_correction(raw, unit=None, qty=None, amt=None):
+    """字典未命中时，用变体/拼音/单位给蔬菜品名纠错。
+
+    返回 (corrected, src)。src 为 fuzzy / needs_review / llm / ""。
+    高分弱相似（香菜与香葱同首字母，单位再加成 0.9）不替换，src=needs_review。
+    """
+    if not _legal_name_list:
+        return raw, ""
+    best, conf, match_src, top = name_match.match(
+        raw, _legal_name_list, category="蔬菜",
+        units=_legal_units, unit=unit)
+    adopted, review = name_match.correction_action(raw, best, conf, match_src)
+    if review:
+        return raw, name_match.REVIEW_SOURCE
+    if best and conf >= name_match.AUTO_CONF:
+        return adopted, "fuzzy"
+    if best and conf >= name_match.SUGGEST_CONF:
+        # 中置信歧义：LLM 在 top 候选里定夺（带数量/金额/单位上下文）
+        try:
+            mp = map_product_name(
+                raw, "蔬菜", [t[0] for t in top], "DeepSeek-V4-Pro",
+                qty=qty, amt=amt,
+                candidate_units=_legal_units)
+            if mp.get("来源") in ("mapping", "ai") and mp.get("目标品名") in _legal_name_list:
+                return mp["目标品名"], "llm"
+        except Exception:
+            pass  # LLM 失败则保留 OCR 原值，交人工
+    return raw, ""
+
+
 def ocr_one(filename):
     path = os.path.join(_paths["input_dir"], filename)
     text = core.call_ocr(path)
@@ -376,24 +406,8 @@ def ocr_one(filename):
         src = "dict" if corrected != raw else ""
         # 纠错字典未命中时，对蔬菜走「变体表+拼音+单位」模糊匹配（阶段1+2）
         if corrected == raw and cat == "蔬菜" and _legal_name_list:
-            best, conf, _src, top = name_match.match(
-                raw, _legal_name_list, category=cat,
-                units=_legal_units, unit=it.get("单位"))
-            if best and conf >= name_match.AUTO_CONF:
-                corrected = best
-                src = "fuzzy"
-            elif best and conf >= name_match.SUGGEST_CONF:
-                # 中置信歧义：LLM 在 top 候选里定夺（带数量/金额/单位上下文）
-                try:
-                    mp = map_product_name(
-                        raw, cat, [t[0] for t in top], "DeepSeek-V4-Pro",
-                        qty=it.get("数量"), amt=it.get("金额"),
-                        candidate_units=_legal_units)
-                    if mp.get("来源") in ("mapping", "ai") and mp.get("目标品名") in _legal_name_list:
-                        corrected = mp["目标品名"]
-                        src = "llm"
-                except Exception:
-                    pass  # LLM 失败则保留 OCR 原值，交人工
+            corrected, src = apply_veg_name_correction(
+                raw, unit=it.get("单位"), qty=it.get("数量"), amt=it.get("金额"))
         it["原品名"] = raw
         it["品名"] = corrected
         it["纠正来源"] = src
