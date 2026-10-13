@@ -41,8 +41,7 @@ DEFAULT_VARIANTS = {
         "香菜": [],
         "金针菇": ["全针蕊", "金针"],
         "娃娃菜": ["搭娃亲"],
-        # 腊肉：变体只在精确匹配之后才查，物料表里真有「腊肉」时会先精确命中，不会被改成猪腱子肉
-        "猪腱子肉": ["惜腱子肉", "腱肉", "腊肉"],
+        "猪腱子肉": ["惜腱子肉", "腱肉"],
         "亿亩田大米": ["亿百日", "亿亩田"],
         "细面": ["细面条"],
         "蒜头": ["蒜末", "大蒜头"],
@@ -58,7 +57,23 @@ DEFAULT_VARIANTS = {
 SYNONYMS = {}
 
 # 旧版默认表里写错的变体：加载已有 JSON 时剔除（香蕊/香芯 是香葱，不是香菜）
-WRONG_VARIANTS = {"蔬菜": {"香菜": ["香蕊", "香芯"]}}
+WRONG_VARIANTS = {"蔬菜": {"香菜": ["香蕊", "香芯"], "猪腱子肉": ["腊肉"]}}
+
+# 只给建议、不自动改的映射：OCR 名本身是真实品名（如「腊肉」），
+# 金标里虽然对应「猪腱子肉」，但不能静默替换。命中时置信度压在自动线以下、
+# source=needs_review，调用方保留原名、标存疑，并把建议品名给人工确认。
+SUGGESTIONS = {"蔬菜": {"腊肉": "猪腱子肉"}}
+SUGGEST_SCORE = 0.85
+
+
+def suggest(raw, candidates, category="蔬菜"):
+    """返回建议品名（必须在候选里，且原名本身不在候选里），没有返回 None"""
+    n = normalize(raw)
+    cands = [c for c in candidates if c and str(c).strip()]
+    if any(normalize(c) == n for c in cands):
+        return None
+    std = (SUGGESTIONS.get(category) or {}).get(n)
+    return std if std in cands else None
 
 _VARIANTS = None
 
@@ -178,6 +193,11 @@ def match(raw, candidates, category="蔬菜", units=None, unit=None):
         for v in variants:
             if normalize(v) == n:
                 return std, 0.95, "variant", [(std, 0.95)]
+
+    # 2.5) 建议映射：只提示不自动改
+    sg = suggest(n, candidates, category)
+    if sg:
+        return sg, SUGGEST_SCORE, REVIEW_SOURCE, [(sg, SUGGEST_SCORE)]
 
     # 3) 同义词
     if n in SYNONYMS and SYNONYMS[n] in candidates:

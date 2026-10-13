@@ -269,6 +269,7 @@ def compute_suspects(date, items):
     cnt_q = cnt_a = cnt_z = 0
     bad_names = []
     num_names = []
+    suggest_tips = []
     # 第一遍：逐行打字段级标记 + 聚合计数
     for it in items:
         g = it.get("勾稽")
@@ -293,6 +294,10 @@ def compute_suspects(date, items):
         # 需要人工核对的机器纠正：LLM 中置信，以及高分易混（如香菜/香葱）
         machine_fixed = it.get("纠正来源", "") in ("llm", name_match.REVIEW_SOURCE)
         it["品名存疑"] = fmt_bad or not_legal or machine_fixed
+        sg = name_match.suggest(nm, _legal_name_list) if it["品名存疑"] else None
+        it["建议品名"] = sg or ""
+        if sg:
+            suggest_tips.append(f"{nm}→{sg}")
         if it["品名存疑"]:
             bad_names.append(nm)
     # 易混品名对：同单同时出现时，整对都标红（合法名之间串位 OCR 很难自查）
@@ -326,6 +331,8 @@ def compute_suspects(date, items):
         suspects.append(f"{cnt_a} 行缺金额")
     if cnt_z:
         suspects.append(f"{cnt_z} 行数量为0")
+    if suggest_tips:
+        suspects.append(f"品名建议待人工确认（{'、'.join(suggest_tips)}）")
     if num_names:
         suspects.append(f"{len(num_names)} 行品名是纯数字（{'、'.join(num_names)}），可能品名被数量吃掉，请对照原图改成正确品名")
     if bad_names:

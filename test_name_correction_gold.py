@@ -54,11 +54,18 @@ class DefaultVariants(unittest.TestCase):
 
     def test_gold_mappings(self):
         cases = {"香蕊": "香葱", "香芯": "香葱", "搭娃亲": "娃娃菜", "全针蕊": "金针菇",
-                 "腱肉": "猪腱子肉", "腊肉": "猪腱子肉", "蒜半": "去皮蒜米",
+                 "腱肉": "猪腱子肉", "蒜半": "去皮蒜米",
                  "大蒜头": "蒜头", "薄荷": "薄荷叶", "细面条": "细面"}
         for raw, want in cases.items():
             best, conf, src, _ = name_match.match(raw, CANDS)
             self.assertEqual((best, src), (want, "variant"), raw)
+
+    def test_larou_only_suggested(self):
+        best, conf, src, _ = name_match.match("腊肉", CANDS)
+        self.assertEqual((best, src), ("猪腱子肉", name_match.REVIEW_SOURCE))
+        self.assertLess(conf, name_match.AUTO_CONF)
+        adopted, prompt = name_match.correction_action("腊肉", best, conf, src)
+        self.assertEqual((adopted, prompt), ("腊肉", True))
 
     def test_real_larou_not_rewritten(self):
         best, conf, src, _ = name_match.match("腊肉", CANDS + ["腊肉"])
@@ -74,7 +81,7 @@ class DefaultVariants(unittest.TestCase):
         self.assertTrue(name_match._migrate(old))
         self.assertEqual(old["蔬菜"]["香菜"], ["用户学的"])
         self.assertIn("香蕊", old["蔬菜"]["香葱"])
-        self.assertIn("腊肉", old["蔬菜"]["猪腱子肉"])
+        self.assertNotIn("腊肉", old["蔬菜"]["猪腱子肉"])
         self.assertFalse(name_match._migrate(old))
 
 
@@ -140,7 +147,11 @@ class GoldReceipts(unittest.TestCase):
         names = {i["原品名"]: i["品名"] for i in items}
         self.assertEqual(names["香芯"], "香葱")
         self.assertEqual(names["香菜"], "香菜")
-        self.assertEqual(names["腊肉"], "猪腱子肉")
+        larou = self._get(items, "腊肉")[0]
+        self.assertEqual(larou["品名"], "腊肉")          # 不自动改
+        self.assertTrue(larou["品名存疑"])
+        self.assertEqual(larou["建议品名"], "猪腱子肉")
+        self.assertTrue(any("腊肉→猪腱子肉" in s for s in suspects))
         self.assertEqual(names["薄荷"], "薄荷叶")
         self.assertEqual(names["细面条"], "细面")
         salt = self._get(items, "10")
