@@ -47,8 +47,10 @@ _legal_names = set()
 _legal_name_list = []
 # 合法品名单位映射 {品名: 单位}，用于阶段2单位辅助匹配
 _legal_units = {}
-# 品名历史单价 {品名: 中位单价}，来自物料表各日期 金额÷数量，用于数量/金额存疑判定
+# 品名各日期单价 {品名: {Excel日期序列号: 金额÷数量}}，来自物料表，用于数量/金额存疑判定
 _hist_prices = {}
+# 剔除离群值：与中位数相差超过这个倍数的历史单价不参与（如原表把 5.8 斤记成 58 斤）
+HIST_OUTLIER_RATIO = 3.0
 
 # 类别 -> 目标表 sheet 名
 CATEGORY_SHEET = {"肉类": "肉类采购", "蔬菜": "日物料采购"}
@@ -144,6 +146,7 @@ def load_legal_names():
         if "日物料采购" in wb.sheetnames:
             ws = wb["日物料采购"]
             # read_only 模式下 ws.cell 逐格随机访问很慢，历史单价一次性按行读出
+            header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
             row_vals = {i: row for i, row in enumerate(
                 ws.iter_rows(min_row=3, values_only=True), start=3)}
             for r in range(3, ws.max_row + 1):
@@ -155,7 +158,7 @@ def load_legal_names():
                     unit = str(ws.cell(r, 5).value or "").strip()
                     if unit:
                         _legal_units[raw] = unit
-                    hp = _row_hist_price(row_vals.get(r, ()))
+                    hp = _row_day_prices(header, row_vals.get(r, ()))
                     if hp:
                         _hist_prices[raw] = hp
         wb.close()
@@ -163,10 +166,19 @@ def load_legal_names():
         pass
 
 
-def _row_hist_price(row):
-    """物料表一行（values 元组）的历史单价：从第 9 列起每 3 列一组（数量/单价/金额），
-    取各日期 金额÷数量 的中位数；没有有效数据返回 None。"""
-    prices = []
+def _date_key(v):
+    """表头日期单元格 → Excel 日期序列号（int）；不是日期返回 None"""
+    if isinstance(v, datetime):
+        return (v - datetime(1899, 12, 30)).days
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 30000:
+        return int(v)
+    return None
+
+
+def _row_day_prices(header, row):
+    """物料表一行（values 元组）的各日期单价 {日期序列号: 金额÷数量}。
+    从第 9 列起每 3 列一组（数量/单价/金额），日期写在该组第一列的表头上。"""
+    out = {}
     for c in range(8, len(row) - 2, 3):
         q, a = row[c], row[c + 2]
         try:
@@ -174,12 +186,34 @@ def _row_hist_price(row):
         except (TypeError, ValueError):
             continue
         if q > 0 and a > 0:
-            prices.append(a / q)
-    if not prices:
+            key = _date_key(header[c]) if c < len(header) else None
+            out[key if key is not None else -c] = a / q
+    return out
+
+
+def _median(vals):
+    vals = sorted(vals)
+    n = len(vals)
+    return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
+
+
+def hist_price(name, date=None):
+    """品名历史单价：排除单据当天那一格（当天可能正是待核的错数），
+    再剔除与中位数相差超过 HIST_OUTLIER_RATIO 倍的离群值，取剩余的中位数。
+    没有可用历史返回 None（此时不按历史判，避免误报）。"""
+    days = _hist_prices.get(str(name or "").strip()) or {}
+    skip = None
+    if date:
+        try:
+            skip = _excel_serial(date)
+        except ValueError:
+            skip = None
+    vals = [p for k, p in days.items() if k != skip]
+    if not vals:
         return None
-    prices.sort()
-    n = len(prices)
-    return prices[n // 2] if n % 2 else (prices[n // 2 - 1] + prices[n // 2]) / 2
+    med = _median(vals)
+    kept = [p for p in vals if max(p / med, med / p) <= HIST_OUTLIER_RATIO]
+    return _median(kept) if kept else None
 
 
 def classify_item(name, category):
@@ -304,7 +338,7 @@ def compute_suspects(date, items):
         it["金额存疑"] = g == "缺金额"
         it["存疑说明"] = ""
         if g == "OK":
-            why = core.price_anomaly(it, _hist_prices.get(str(it.get("品名", "")).strip()))
+            why = core.price_anomaly(it, hist_price(it.get("品名", ""), date))
             if why:
                 it["数量存疑"] = it["金额存疑"] = True
                 it["存疑说明"] = why

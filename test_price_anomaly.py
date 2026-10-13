@@ -6,7 +6,9 @@
 OCR 原文来自 samples/gold/ocr/（真实 HunyuanOCR 返回，可离线复现）。
 """
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -60,7 +62,11 @@ class GoldReceipt0813(unittest.TestCase):
         webapp.load_legal_names()
 
     def test_history_loaded(self):
-        self.assertAlmostEqual(webapp._hist_prices["鸡毛菜"], 28 / 5.8, places=2)
+        serial = webapp._excel_serial("2026-08-13")
+        self.assertAlmostEqual(webapp._hist_prices["鸡毛菜"][serial], 28 / 5.8, places=2)
+        # 当天那一格不算历史：金标表里鸡毛菜只有 8/13 有数，当天没有可用历史
+        self.assertIsNone(webapp.hist_price("鸡毛菜", "2026-08-13"))
+        self.assertAlmostEqual(webapp.hist_price("鸡毛菜"), 28 / 5.8, places=2)
 
     def test_jimaocai_flagged_only(self):
         items = _ocr_items("13")
@@ -93,6 +99,78 @@ class GoldReceipt0813(unittest.TestCase):
             flagged = [it["品名"] for it in items
                        if it.get("存疑说明") and webapp.normalize_pin(it["品名"]) in webapp._legal_names]
             self.assertEqual(flagged, [], day)
+
+
+class HistPriceExcludeAndOutlier(unittest.TestCase):
+    def setUp(self):
+        self._old = webapp._hist_prices
+        s = webapp._excel_serial
+        webapp._hist_prices = {"鸡毛菜": {
+            s("2026-08-01"): 4.8, s("2026-08-02"): 5.0, s("2026-08-03"): 4.6,
+            s("2026-08-05"): 0.48,          # 原表记错的离群值
+            s("2026-08-13"): 28 / 58,       # 当天这一格（正是待核的错数）
+        }}
+
+    def tearDown(self):
+        webapp._hist_prices = self._old
+
+    def test_excludes_same_day_and_outlier(self):
+        self.assertAlmostEqual(webapp.hist_price("鸡毛菜", "2026-08-13"), 4.8, places=2)
+
+    def test_flag_and_clear(self):
+        items = [{"品名": "鸡毛菜", "数量": 58, "金额": 28}]
+        core.derive_price(items)
+        webapp.compute_suspects("2026-08-13", items)
+        self.assertTrue(items[0]["数量存疑"])
+        self.assertIn("历史单价4.80", items[0]["存疑说明"])
+        items[0]["数量"] = 5.8
+        core.derive_price(items)
+        webapp.compute_suspects("2026-08-13", items)
+        self.assertFalse(items[0]["数量存疑"])
+
+
+class UserOriginalSheet(unittest.TestCase):
+    """用户原表：8/13 鸡毛菜误写成 58 斤 28 元。当天这一格不能把错数洗成「正常单价」。"""
+
+    @classmethod
+    def setUpClass(cls):
+        from openpyxl import load_workbook
+        cls.tmp = tempfile.mkdtemp()
+        path = os.path.join(cls.tmp, "material_original.xlsx")
+        wb = load_workbook(os.path.join(GOLD, "material_gold.xlsx"))
+        ws = wb["日物料采购"]
+        serial = webapp._excel_serial("2026-08-13")
+        col = next(c for c in range(1, ws.max_column + 1)
+                   if webapp._date_key(ws.cell(1, c).value) == serial)
+        row = next(r for r in range(3, ws.max_row + 1) if ws.cell(r, 4).value == "鸡毛菜")
+        ws.cell(row, col, 58)
+        ws.cell(row, col + 2, 28)
+        wb.save(path)
+        cls._old = webapp._paths.get("material_file", "")
+        webapp._paths["material_file"] = path
+        webapp.load_legal_names()
+
+    @classmethod
+    def tearDownClass(cls):
+        webapp._paths["material_file"] = cls._old
+        webapp.load_legal_names()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_original_sheet_has_bad_value(self):
+        serial = webapp._excel_serial("2026-08-13")
+        self.assertAlmostEqual(webapp._hist_prices["鸡毛菜"][serial], 28 / 58, places=3)
+
+    def test_ocr_58_flagged_then_fixed(self):
+        items = _ocr_items("13")
+        jm = next(it for it in items if it["品名"] == "鸡毛菜")
+        webapp.compute_suspects("2026-08-13", items)
+        self.assertTrue(jm["数量存疑"])
+        self.assertTrue(jm["金额存疑"])
+        jm["数量"] = 5.8
+        core.derive_price(items)
+        webapp.compute_suspects("2026-08-13", items)
+        self.assertFalse(jm["数量存疑"])
+        self.assertFalse(jm["金额存疑"])
 
 
 if __name__ == "__main__":
