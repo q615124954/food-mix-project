@@ -141,6 +141,12 @@ class GoldReceipts(unittest.TestCase):
         self.assertEqual(names["大蒜头"], "蒜头")
         self.assertEqual(names["蒜半"], "去皮蒜米")
         self.assertTrue(any("订单合计未识别" in s for s in suspects))
+        # 票面单价被 OCR 丢小数点（39/59/48），归对品名后历史单价能对上，不报单价异常
+        for raw in ("香蕊", "大蒜头", "蒜半"):
+            it = self._get(items, raw)[0]
+            self.assertFalse(it["数量存疑"] or it["金额存疑"], raw)
+            self.assertEqual(it.get("存疑说明", ""), "", raw)
+        self.assertFalse(any("单价异常" in s for s in suspects))
 
     def test_0813(self):
         items, suspects = _run("13")

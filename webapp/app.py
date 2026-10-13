@@ -47,6 +47,10 @@ _legal_names = set()
 _legal_name_list = []
 # 合法品名单位映射 {品名: 单位}，用于阶段2单位辅助匹配
 _legal_units = {}
+# 品名各日期单价 {品名: {Excel日期序列号: 金额÷数量}}，来自物料表，用于数量/金额存疑判定
+_hist_prices = {}
+# 剔除离群值：与中位数相差超过这个倍数的历史单价不参与（如原表把 5.8 斤记成 58 斤）
+HIST_OUTLIER_RATIO = 3.0
 
 # 类别 -> 目标表 sheet 名
 CATEGORY_SHEET = {"肉类": "肉类采购", "蔬菜": "日物料采购"}
@@ -128,10 +132,11 @@ def normalize_pin(name):
 def load_legal_names():
     """从物料明细表的「日物料采购」sheet 读取合法品名（每次路径变更/启动时刷新）。
     同时维护：归一化集合（归属判定）+ 原始品名有序列表（模糊匹配候选集）+ 单位映射。"""
-    global _legal_names, _legal_name_list, _legal_units
+    global _legal_names, _legal_name_list, _legal_units, _hist_prices
     _legal_names = set()
     _legal_name_list = []
     _legal_units = {}
+    _hist_prices = {}
     material = _paths.get("material_file", "")
     if not material or not os.path.exists(material):
         return
@@ -140,6 +145,10 @@ def load_legal_names():
         wb = load_workbook(material, read_only=True, data_only=True)
         if "日物料采购" in wb.sheetnames:
             ws = wb["日物料采购"]
+            # read_only 模式下 ws.cell 逐格随机访问很慢，历史单价一次性按行读出
+            header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
+            row_vals = {i: row for i, row in enumerate(
+                ws.iter_rows(min_row=3, values_only=True), start=3)}
             for r in range(3, ws.max_row + 1):
                 v = ws.cell(r, 4).value
                 if v and str(v).strip():
@@ -149,9 +158,62 @@ def load_legal_names():
                     unit = str(ws.cell(r, 5).value or "").strip()
                     if unit:
                         _legal_units[raw] = unit
+                    hp = _row_day_prices(header, row_vals.get(r, ()))
+                    if hp:
+                        _hist_prices[raw] = hp
         wb.close()
     except Exception:
         pass
+
+
+def _date_key(v):
+    """表头日期单元格 → Excel 日期序列号（int）；不是日期返回 None"""
+    if isinstance(v, datetime):
+        return (v - datetime(1899, 12, 30)).days
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 30000:
+        return int(v)
+    return None
+
+
+def _row_day_prices(header, row):
+    """物料表一行（values 元组）的各日期单价 {日期序列号: 金额÷数量}。
+    从第 9 列起每 3 列一组（数量/单价/金额），日期写在该组第一列的表头上。"""
+    out = {}
+    for c in range(8, len(row) - 2, 3):
+        q, a = row[c], row[c + 2]
+        try:
+            q, a = float(q), float(a)
+        except (TypeError, ValueError):
+            continue
+        if q > 0 and a > 0:
+            key = _date_key(header[c]) if c < len(header) else None
+            out[key if key is not None else -c] = a / q
+    return out
+
+
+def _median(vals):
+    vals = sorted(vals)
+    n = len(vals)
+    return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
+
+
+def hist_price(name, date=None):
+    """品名历史单价：排除单据当天那一格（当天可能正是待核的错数），
+    再剔除与中位数相差超过 HIST_OUTLIER_RATIO 倍的离群值，取剩余的中位数。
+    没有可用历史返回 None（此时不按历史判，避免误报）。"""
+    days = _hist_prices.get(str(name or "").strip()) or {}
+    skip = None
+    if date:
+        try:
+            skip = _excel_serial(date)
+        except ValueError:
+            skip = None
+    vals = [p for k, p in days.items() if k != skip]
+    if not vals:
+        return None
+    med = _median(vals)
+    kept = [p for p in vals if max(p / med, med / p) <= HIST_OUTLIER_RATIO]
+    return _median(kept) if kept else None
 
 
 def classify_item(name, category):
@@ -270,11 +332,21 @@ def compute_suspects(date, items):
     bad_names = []
     num_names = []
     suggest_tips = []
+    price_bad = []
+    ticket_ok = core.ticket_price_reliable(items)
     # 第一遍：逐行打字段级标记 + 聚合计数
     for it in items:
         g = it.get("勾稽")
         it["数量存疑"] = g in ("缺数量", "数量为0")
         it["金额存疑"] = g == "缺金额"
+        it["存疑说明"] = ""
+        if g == "OK":
+            ref = it if ticket_ok else {k: v for k, v in it.items() if k != "票面单价"}
+            why = core.price_anomaly(ref, hist_price(it.get("品名", ""), date))
+            if why:
+                it["数量存疑"] = it["金额存疑"] = True
+                it["存疑说明"] = why
+                price_bad.append(f"{it.get('品名', '')}：{why}")
         if g == "缺数量":
             cnt_q += 1
         elif g == "缺金额":
@@ -335,6 +407,8 @@ def compute_suspects(date, items):
         suspects.append(f"品名建议待人工确认（{'、'.join(suggest_tips)}）")
     if num_names:
         suspects.append(f"{len(num_names)} 行品名是纯数字（{'、'.join(num_names)}），可能品名被数量吃掉，请对照原图改成正确品名")
+    if price_bad:
+        suspects.append(f"{len(price_bad)} 行单价异常（{'；'.join(price_bad[:3])}）")
     if bad_names:
         shown = "、".join(bad_names[:3]) + ("…" if len(bad_names) > 3 else "")
         suspects.append(f"{len(bad_names)} 行品名存疑（{shown}）")

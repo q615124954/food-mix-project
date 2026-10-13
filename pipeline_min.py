@@ -211,7 +211,8 @@ def parse_line_items(rows):
             # 由存疑规则标红交人工补，不能整行丢掉让金额漏账。
             unit = re.sub(r"[\d.\s×xX]", "", cells[2]) if len(cells) > 2 else ""
             amount = extract_num(cells[5]) if len(cells) > 5 else None
-            items.append({"品名": name, "数量": qty, "金额": amount, "类别": "蔬菜", "单位": unit})
+            items.append({"品名": name, "数量": qty, "金额": amount, "类别": "蔬菜", "单位": unit,
+                          "票面单价": extract_num(cells[4]) if len(cells) > 4 else None})
             continue
         # 序号开头的单据（肉类/销货清单）：5 列，品名在 cells[1]，金额在 cells[4]
         # 注：OCR 偶把数据行序号"1"识别成"序号"，故 first=="序号" 也按数据行处理
@@ -241,7 +242,8 @@ def parse_line_items(rows):
         amount = extract_num(cells[3]) if len(cells) > 3 else None
         if not name and (qty is None or amount is None):
             continue
-        items.append({"品名": name, "数量": qty, "金额": amount, "类别": "蔬菜"})
+        items.append({"品名": name, "数量": qty, "金额": amount, "类别": "蔬菜",
+                      "票面单价": extract_num(cells[2]) if len(cells) > 2 else None})
     return items
 
 
@@ -334,6 +336,75 @@ def derive_price(items):
             it["勾稽"] = "OK"
             stat["OK"] += 1
     return items, stat
+
+
+# ===== 4.4 单价异常（数量/金额存疑） =====
+# 单价是「金额÷数量」反算的，数量丢小数点（5.8→58）时反算单价跟着变小，
+# 「数量×单价≠金额」永远不会触发。所以改为拿外部参照比，偏离超过 PRICE_RATIO_LIMIT 倍才判：
+#   1) 历史单价（物料表该品名各日期 金额÷数量 的中位数）有值时以它为准：
+#      反算单价与历史单价相差超过 3 倍 → 存疑；在 3 倍以内 → 不判
+#      （票面单价列常被 OCR 丢小数点，如 3.9 认成 39，此时历史单价证明数量/金额没问题）。
+#   2) 没有历史单价、票面有单价列：数量×票面单价 与 金额 相差超过 3 倍 → 存疑。
+#   3) 两者都没有 → 不判，避免误报。
+# 手写单常把金额抹零（3×3.8=11.4 记 12），所以阈值按倍数不按百分比。
+# 只标记交人工核对，不自动改数量/金额。
+PRICE_RATIO_LIMIT = 3.0
+
+
+def _ratio_off(a, b):
+    """a、b 均为正数时返回 max(a/b, b/a)"""
+    r = a / b
+    return max(r, 1 / r)
+
+
+def price_anomaly(item, hist_price=None):
+    """返回存疑说明（字符串）或 None。item 需要 数量/金额，可带 票面单价。"""
+    try:
+        qty = float(item.get("数量"))
+        amount = float(item.get("金额"))
+    except (TypeError, ValueError):
+        return None
+    if qty <= 0 or amount <= 0:
+        return None
+    price = amount / qty
+    if hist_price and hist_price > 0:
+        off = _ratio_off(price, hist_price)
+        if off > PRICE_RATIO_LIMIT:
+            return (f"单价{price:.2f}（金额{amount:g}÷数量{qty:g}）与历史单价{hist_price:.2f}"
+                    f"相差{off:.1f}倍，请核对数量/金额（可能丢了小数点）")
+        return None
+    try:
+        ticket = float(item.get("票面单价"))
+    except (TypeError, ValueError):
+        ticket = None
+    if ticket and ticket > 0:
+        expect = qty * ticket
+        off = _ratio_off(expect, amount)
+        if off > PRICE_RATIO_LIMIT:
+            return (f"数量×票面单价={qty:g}×{ticket:g}={expect:g}，与金额{amount:g}"
+                    f"相差{off:.1f}倍，请核对数量/金额（可能丢了小数点）")
+    return None
+
+
+def ticket_price_reliable(items, min_rows=3, bad_share=0.5):
+    """整张单的票面单价列是否可信。手写单价常被 OCR 整列丢小数点（8/12：3.9→39、5.9→59），
+    此时多数行「数量×票面单价」都和金额差约 10 倍，说明错的是单价列而不是数量。
+    有票面单价的行不少于 min_rows，且超过 bad_share 比例对不上 → 判整列不可信，
+    本单不再按票面单价判数量/金额（历史单价照常判）。"""
+    total = bad = 0
+    for it in items:
+        try:
+            qty, amount, ticket = float(it.get("数量")), float(it.get("金额")), float(it.get("票面单价"))
+        except (TypeError, ValueError):
+            continue
+        if qty <= 0 or amount <= 0 or ticket <= 0:
+            continue
+        total += 1
+        if _ratio_off(qty * ticket, amount) > PRICE_RATIO_LIMIT:
+            bad += 1
+    if total < min_rows:
+        return True
+    return bad / total <= bad_share
 
 
 # ===== 4.5 品名纠错 =====
