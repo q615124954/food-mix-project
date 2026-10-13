@@ -35,3 +35,16 @@ webapp/_uvicorn.err
 .codebuddy/
 .DS_Store
 Thumbs.db
+
+# 公开金标样本（samples/）必须入库。例外放在末尾，避免被前面的宽泛规则盖掉。
+!samples/
+!samples/**/
+!samples/**/*.jpg
+!samples/**/*.jpeg
+!samples/**/*.xlsx
+!samples/**/*.json
+!samples/**/*.md
+!samples/**/*.py
+# 样本目录里跑出来的字节码仍然忽略
+samples/**/__pycache__/
+samples/**/*.pyc
