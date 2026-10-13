@@ -318,6 +318,9 @@ def image_files():
 CONFUSABLE_PAIRS = [("番茄", "香草"), ("蒜米", "去皮蒜米"), ("蒜米", "蒜头")]
 
 
+TICKET_UNRELIABLE_TIP = "票面单价疑似整体错位，已改用历史单价核对"
+
+
 def compute_suspects(date, items):
     """OCR 后规则式存疑判定（零成本，不调 LLM），返回存疑原因列表（空=正常）。
     同时给每个 item 打上字段级存疑标记「品名存疑 / 数量存疑 / 金额存疑」，
@@ -403,6 +406,8 @@ def compute_suspects(date, items):
         suspects.append(f"{cnt_a} 行缺金额")
     if cnt_z:
         suspects.append(f"{cnt_z} 行数量为0")
+    if not ticket_ok:
+        suspects.append(TICKET_UNRELIABLE_TIP)
     if suggest_tips:
         suspects.append(f"品名建议待人工确认（{'、'.join(suggest_tips)}）")
     if num_names:

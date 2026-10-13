@@ -147,6 +147,7 @@ class GoldReceipts(unittest.TestCase):
             self.assertFalse(it["数量存疑"] or it["金额存疑"], raw)
             self.assertEqual(it.get("存疑说明", ""), "", raw)
         self.assertFalse(any("单价异常" in s for s in suspects))
+        self.assertIn(webapp.TICKET_UNRELIABLE_TIP, suspects)
 
     def test_0813(self):
         items, suspects = _run("13")
@@ -166,6 +167,7 @@ class GoldReceipts(unittest.TestCase):
         self.assertEqual((salt[0]["数量"], salt[0]["金额"]), (10, 15))
         self.assertTrue(any("纯数字" in s for s in suspects))
         self.assertTrue(any("订单合计 213" in s and "不符" in s for s in suspects))
+        self.assertNotIn(webapp.TICKET_UNRELIABLE_TIP, suspects)
         # 金标里出现过的物料错名都纠正了；员工餐那几行（五花肉、油麦菜…）不在物料表，照样标品名存疑
         legal = [i for i in items if webapp.normalize_pin(i["品名"]) in webapp._legal_names]
         self.assertEqual([i["品名"] for i in legal if i["品名存疑"]], [])
