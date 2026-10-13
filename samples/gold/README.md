@@ -37,4 +37,4 @@ python3 samples/gold/summarize_gold.py
 
 ## 密钥
 
-本目录不含 OCR API 密钥。百度 OCR 密钥只从环境变量 `BAIDU_OCR_API_KEY` 读取，不要写进仓库，也不要提交 `.env`。
+本目录不含 OCR API 密钥。密钥放在环境变量里：优先使用 `HUNYUAN_API_KEY`，没有时再用 `MOLLI_ARK_API_KEY`。不要写进仓库，也不要提交 `.env`。
