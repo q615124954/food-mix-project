@@ -58,6 +58,8 @@
   td select:focus { border-color: #2563eb; outline: none; background: #fff; }
   .cell { display: flex; align-items: center; }
   .cell input { flex: 1; min-width: 0; }
+  .tag-staff { font-size: 11px; padding: 0 5px; margin-left: 3px; border-radius: 4px; background: #f59e0b; color: #fff; flex-shrink: 0; cursor: help; white-space: nowrap; }
+  .tag-staff.confirm { background: #ef4444; }
   .field-warn { color: #ef4444; font-weight: bold; margin-left: 3px; flex-shrink: 0; cursor: help; }
   .empty { padding: 30px; text-align: center; color: #999; font-size: 13px; }
   .totalbar { padding: 10px 14px; font-size: 15px; font-weight: 600; border-top: 1px solid #eee; }
@@ -133,9 +135,9 @@
         </div>
         <div class="totalbar">
           <div>合计：¥<span class="val" id="total-val">0.00</span></div>
-          <div class="paid">实付总额(优惠后) ¥<input id="fld-paid" type="number" step="0.01" min="0" placeholder="默认=明细合计"><span class="paid-hint" id="paid-hint"></span></div>
+          <div class="paid">实付总额(优惠后) ¥<input id="fld-paid" type="number" step="0.01" min="0" placeholder="必填，按票面实付"><span class="paid-hint" id="ocr-total-ref"></span><span class="paid-hint" id="paid-hint"></span></div>
         </div>
-        <div class="hint">修改数量或金额时，单价自动 = 金额 ÷ 数量；也可直接改单价。</div>
+        <div class="hint">修改数量或金额时，单价自动 = 金额 ÷ 数量；也可直接改单价。<button type="button" class="gray" id="btn-add-staff">＋补录员工餐行</button></div>
       </div>
     </div>
   </div>
@@ -236,8 +238,13 @@ function renderCurrent() {
   if (cw) cw.style.display = catSel.value ? 'none' : 'inline';
   const paidInp = document.getElementById('fld-paid');
   if (paidInp) {
-    const v = inv.paid_total != null ? inv.paid_total : inv.order_total;
-    paidInp.value = (v != null && v !== '') ? v : '';
+    // 实付必须人工按票面填写：只回显已确认过的实付，不拿 OCR 合计预填
+    paidInp.value = (inv.paid_total != null && inv.paid_total !== '') ? inv.paid_total : '';
+  }
+  const ocrRef = document.getElementById('ocr-total-ref');
+  if (ocrRef) {
+    const ot = inv.order_total;
+    ocrRef.textContent = (ot != null && ot !== '') ? `（OCR 认出合计 ¥${ot}，仅供参考）` : '（OCR 未认出合计）';
   }
   recomputeTotal();
   document.getElementById('tbl-title').textContent = inv.filename;
@@ -259,8 +266,10 @@ function renderCurrent() {
   inv.items.forEach((it, idx) => {
     const tr = document.createElement('tr');
     const warn = (flag, tip) => flag ? `<span class="field-warn" title="${tip}">❗</span>` : '';
+    const staffTag = it['归属'] === '员工餐'
+      ? `<span class="tag-staff${it['归属待确认'] ? ' confirm' : ''}" title="${esc((it['归属依据'] || '员工餐') + (it['归属待确认'] ? '，请人工确认' : ''))}">员工餐${it['归属待确认'] ? '?' : ''}</span>` : '';
     tr.innerHTML = `
-      <td><div class="cell"><input data-k="品名" data-row="${idx}" value="${esc(it['品名'] || '')}">${warn(it['品名存疑'], it['建议品名'] ? esc('建议改为：' + it['建议品名'] + '（请人工确认）') : '品名可能不准确')}</div></td>
+      <td><div class="cell"><input data-k="品名" data-row="${idx}" value="${esc(it['品名'] || '')}">${staffTag}${warn(it['品名存疑'], it['建议品名'] ? esc('建议改为：' + it['建议品名'] + '（请人工确认）') : '品名可能不准确')}</div></td>
       <td><div class="cell"><input data-k="数量" data-row="${idx}" data-trigger="true" value="${esc(it['数量'] != null ? it['数量'] : '')}">${warn(it['数量存疑'], esc(it['存疑说明'] || '数量缺失或为0'))}</div></td>
       <td><div class="cell"><input data-k="单价" data-row="${idx}" value="${esc(it['单价'] != null ? it['单价'] : '')}"></div></td>
       <td><div class="cell"><input data-k="金额" data-row="${idx}" data-trigger="true" value="${esc(it['金额'] != null ? it['金额'] : '')}">${warn(it['金额存疑'], esc(it['存疑说明'] || '金额缺失'))}</div></td>`;
@@ -286,6 +295,17 @@ document.getElementById('fld-category').addEventListener('change', () => {
   if (cw) cw.style.display = document.getElementById('fld-category').value ? 'none' : 'inline';
 });
 document.getElementById('fld-paid').addEventListener('input', () => { dirty = true; updatePaidHint(); });
+
+// 员工区漏识别时人工补录：新增一行，标记在员工区（确认时按员工餐计，不写日物料）
+document.getElementById('btn-add-staff').addEventListener('click', () => {
+  const inv = state.invoices[cur];
+  if (!inv || !inv.ocr_done) return;
+  inv.items = inv.items || [];
+  inv.items.push({ '品名': '', '原品名': '', '品名编辑': true, '数量': null, '单价': null, '金额': null,
+                   '员工区': true, '人工补录': true, '归属': '员工餐', '归属依据': '人工补录（员工区）' });
+  dirty = true;
+  renderCurrent();
+});
 
 function recompute(row) {
   const it = state.invoices[cur].items[row];
@@ -374,11 +394,17 @@ async function submitConfirm() {
     toast('请先选择类别（不会默认成蔬菜）', true);
     return;
   }
+  if (paidValue() == null) {
+    toast('请对照票面填写实付总额（优惠后）再确认', true);
+    const p = document.getElementById('fld-paid');
+    if (p) p.focus();
+    return;
+  }
   const payload = {
     date: document.getElementById('fld-date').value.trim(),
     category: category,
     paid_total: paidValue(),
-    items: inv.items.map(it => ({ '品名': it['品名'], '原品名': it['原品名'], '品名编辑': it['品名编辑'], '数量': it['数量'], '单价': it['单价'], '金额': it['金额'] }))
+    items: inv.items.map(it => ({ '品名': it['品名'], '原品名': it['原品名'], '品名编辑': it['品名编辑'], '数量': it['数量'], '单价': it['单价'], '金额': it['金额'], '员工区': !!it['员工区'], '人工补录': !!it['人工补录'] }))
   };
   try {
     const r = await fetch(`/api/invoice/${encodeURIComponent(inv.filename)}/confirm`, {

@@ -216,11 +216,44 @@ def hist_price(name, date=None):
     return _median(kept) if kept else None
 
 
-def classify_item(name, category):
-    """行级归属：蔬菜单按合法品名表判定（命中→物料，未命中→员工餐）；肉类单全部物料。"""
-    if category == "蔬菜":
-        return "员工餐" if (name and normalize_pin(name) not in _legal_names) else "物料"
-    return "物料"
+STAFF = "员工餐"
+MATERIAL = "物料"
+
+
+def classify_item(name, category, in_staff_zone=False):
+    """行级归属，返回 (归属, 归属依据, 是否需人工确认)。
+
+    规则（用户已确认）：
+    - 海底捞固定算员工餐；
+    - 7 列蔬菜单上位于员工分区之后（物料小计 /「员工：」之后）→ 员工餐；
+      若这行品名恰好在物料表里，仍按员工区归员工餐，但提示人工确认；
+    - 物料段里品名不在物料表 → 默认员工餐，提示人工确认（可能是新物料）；
+    - 其余 → 物料。肉类单全部算物料。没加载物料表时不按品名判，避免全部被当成员工餐。"""
+    nm = str(name or "").strip()
+    if is_staff_meal_only(nm):
+        return STAFF, "海底捞固定计员工餐", False
+    if category not in (None, "", "蔬菜"):
+        return MATERIAL, "", False
+    legal = bool(nm) and normalize_pin(nm) in _legal_names
+    if in_staff_zone:
+        if legal:
+            return STAFF, "位于票面员工分区之后（该品名在物料表里，请确认是否员工餐）", True
+        return STAFF, "位于票面员工分区之后", False
+    if nm and _legal_names and not legal:
+        return STAFF, "物料段品名不在物料表，默认计员工餐（请确认是否新物料）", True
+    return MATERIAL, "", False
+
+
+def assign_attribution(items, category=None):
+    """给每行打「归属 / 归属依据 / 归属待确认」，返回 items。"""
+    for it in items:
+        cat = category if category not in (None, "") else (it.get("类别") or "蔬菜")
+        zone = bool(it.get("员工区"))
+        attr, why, need = classify_item(it.get("品名", ""), cat, zone)
+        it["归属"] = attr
+        it["归属依据"] = why
+        it["归属待确认"] = need
+    return items
 
 
 # ===== 品名纠错字典：持久化 + 回流学习 =====
@@ -337,6 +370,8 @@ def compute_suspects(date, items):
     suggest_tips = []
     price_bad = []
     ticket_ok = core.ticket_price_reliable(items)
+    assign_attribution(items)
+    staff_confirm = []
     # 第一遍：逐行打字段级标记 + 聚合计数
     for it in items:
         g = it.get("勾稽")
@@ -368,8 +403,14 @@ def compute_suspects(date, items):
         not_legal = bool(nm) and bool(_legal_names) and normalize_pin(nm) not in _legal_names
         # 需要人工核对的机器纠正：LLM 中置信，以及高分易混（如香菜/香葱）
         machine_fixed = it.get("纠正来源", "") in ("llm", name_match.REVIEW_SOURCE)
-        it["品名存疑"] = fmt_bad or not_legal or machine_fixed
-        sg = name_match.suggest(nm, _legal_name_list) if it["品名存疑"] else None
+        # 员工餐行本来就不在物料表里，不再因此标品名存疑（归属依据会显示在复核页）
+        if it.get("归属") == STAFF:
+            not_legal = False
+            if it.get("归属待确认"):
+                staff_confirm.append(nm)
+        sg = name_match.suggest(nm, _legal_name_list) if (
+            fmt_bad or not_legal or machine_fixed or it.get("归属待确认")) else None
+        it["品名存疑"] = fmt_bad or not_legal or machine_fixed or bool(sg)
         it["建议品名"] = sg or ""
         if sg:
             suggest_tips.append(f"{nm}→{sg}")
@@ -408,6 +449,9 @@ def compute_suspects(date, items):
         suspects.append(f"{cnt_z} 行数量为0")
     if not ticket_ok:
         suspects.append(TICKET_UNRELIABLE_TIP)
+    if staff_confirm:
+        shown = "、".join(staff_confirm[:5]) + ("…" if len(staff_confirm) > 5 else "")
+        suspects.append(f"{len(staff_confirm)} 行已默认归员工餐，请确认（{shown}）")
     if suggest_tips:
         suspects.append(f"品名建议待人工确认（{'、'.join(suggest_tips)}）")
     if num_names:
@@ -521,6 +565,10 @@ def ocr_one(filename):
         it["纠正来源"] = src
     suspects = compute_suspects(date, items)
     missing = _count_missing_rows(rows)
+    staff_missing = core.count_staff_zone_missing(rows)
+    if staff_missing:
+        suspects.append(f"员工区疑似漏识别 {staff_missing} 行（可能被阴影遮挡），请对照原图补录")
+        missing = max(0, missing - staff_missing)
     tip = order_total_suspect(total, order_total)
     if tip:
         suspects.append(tip)
@@ -629,7 +677,10 @@ def normalize_item(it, category=None):
         "数量": _num(it.get("数量")),
         "单价": _num(it.get("单价")),
         "金额": _num(it.get("金额")),
+        "员工区": bool(it.get("员工区")),
     }
+    if it.get("人工补录"):
+        out["人工补录"] = True
     if category not in (None, ""):
         cat = str(category).strip()
     else:
@@ -975,6 +1026,7 @@ def sync_to_material(model):
     header = [c.value for c in lws[1]]
     col = {str(h).strip(): i for i, h in enumerate(header) if h}
     raw_col = col.get("原品名")
+    attr_col = col.get("归属")
     rows = []
     cur_date = ""
     cur_cat = ""
@@ -997,6 +1049,9 @@ def sync_to_material(model):
             cur_src = src
             cur_date = _land_date_text(date)
             cur_cat = ""
+            # 合计/实付也只认本单自己的值：本单没填实付时不能沿用上一张单的实付
+            cur_total = ""
+            cur_paid = ""
         else:
             own_date = _land_date_text(date)
             if own_date:
@@ -1019,10 +1074,13 @@ def sync_to_material(model):
         # 归并以「品名」（用户确认后的最终值）为准，「原品名」仅作追溯/回流学习，
         # 不再作为归并输入，否则会忽略用户手动修正的品名（如把「牛肉」误归成「牛骨」）
         merge_name = str(name).strip() if name else (str(raw).strip() if raw else "")
-        # 实付总额：优先「实付合计」，旧落地表无该列时回退到「合计」（即无优惠）
-        paid = cur_paid if cur_paid not in (None, "") else cur_total
+        # 实付：确认时必填，写在「实付合计」；更早的落地表没有该列时回退到「合计」
+        paid = cur_paid if cur_paid not in (None, "") else (cur_total if cur_total not in (None, "") else None)
+        attr = r[attr_col] if attr_col is not None and attr_col < len(r) else None
         rows.append({"date": cur_date, "cat": cur_cat, "name": merge_name,
-                     "qty": qty, "price": price, "amt": amt, "paid": paid})
+                     "qty": qty, "price": price, "amt": amt, "paid": paid,
+                     "src": src, "detail_total": cur_total,
+                     "attr": str(attr).strip() if attr not in (None, "") else ""})
     if not rows:
         raise HTTPException(400, "落地表没有可同步的数据")
 
@@ -1034,30 +1092,42 @@ def sync_to_material(model):
     sheet_cache = {}
     map_cache = {}
     results = []
-    # 员工餐 / 日物料按「这行金额有没有写进物料表」拆开。
-    # 日物料 = 实际写入物料表的金额；员工餐 = 没写入的金额（海底捞、对不上的蔬菜、缺类别等）。
-    # 不用「实付 − 已落地」倒挤，否则实付里多出来的差额会把员工餐抬高。
+    # 员工餐 sheet（用户已确认的口径）：
+    #   日物料(H) = 实际写入日物料/肉类表的明细金额；
+    #   员工餐(D) = 蔬菜单实付 − 本单日物料（优惠、手写小计与明细的差额都归员工餐）；
+    #   总计(I)  = 实付（复核页必填）。
+    # 每张单（来源图片）单独算再按日期相加；非蔬菜单（肉类、缺类别）沿用「未落地金额计员工餐」。
     # 空日期没有自己的日期行，不能记到别的日期上，否则会把另一天的员工餐抬高。
     staff = {}
 
     def _staff_slot(date):
         slot = staff.get(date)
         if slot is None:
-            slot = {"paid": None, "material": Decimal("0"), "meal": Decimal("0")}
+            slot = {"srcs": {}}
             staff[date] = slot
         return slot
+
+    def _src_slot(row):
+        slot = _staff_slot(row["date"])["srcs"]
+        key = row.get("src")
+        rec = slot.get(key)
+        if rec is None:
+            rec = {"veg": row.get("cat") == "蔬菜", "paid": None, "detail": Decimal("0"),
+                   "material": Decimal("0"), "meal": Decimal("0")}
+            slot[key] = rec
+        return rec
 
     def _add_meal(row):
         amount = _row_amount(row)
         if amount is None or not row.get("date"):
             return
-        _staff_slot(row["date"])["meal"] += amount
+        _src_slot(row)["meal"] += amount
 
     def _add_material(row):
         amount = _row_amount(row)
         if amount is None or not row.get("date"):
             return
-        _staff_slot(row["date"])["material"] += amount
+        _src_slot(row)["material"] += amount
 
     # 日期为空、缺少类别的行不写入物料表。有日期的未落地金额计入当天员工餐。
     dated_rows = []
@@ -1086,11 +1156,25 @@ def sync_to_material(model):
     # 实付只留给总计列展示；员工餐不再用实付倒挤。同一天只取第一张蔬菜单的实付。
     for row in dated_rows:
         if row["cat"] == "蔬菜" or is_staff_meal_only(row["name"]):
-            slot = _staff_slot(row["date"])
-            if slot["paid"] is None and row["cat"] == "蔬菜" and row.get("paid") not in (None, ""):
-                slot["paid"] = Decimal(str(row["paid"]))
+            rec = _src_slot(row)
+            amount = _row_amount(row)
+            if amount is not None:
+                rec["detail"] += amount
+            if rec["paid"] is None and row.get("paid") not in (None, ""):
+                rec["paid"] = Decimal(str(row["paid"]))
 
     for row in dated_rows:
+        # 员工餐行（确认时判定：员工分区之后 / 物料表没有的品名）不调大模型、不写物料表
+        attr = row.get("attr") or ""
+        if not attr and row["cat"] == "蔬菜" and _legal_names:
+            # 旧落地表没有「归属」列：按品名回退判定（拿不到员工分区信息）
+            attr = classify_item(row["name"], row["cat"])[0]
+        if attr == STAFF and not is_staff_meal_only(row["name"]):
+            _add_meal(row)
+            results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": "员工餐",
+                            "置信度": 1, "来源": "staff_meal", "数量": row["qty"], "金额": row["amt"],
+                            "理由": "员工餐行，只计入员工餐总额，不写入日物料采购"})
+            continue
         # 海底捞只进员工餐，不参与日物料，也不写进肉类采购。
         if is_staff_meal_only(row["name"]):
             _add_meal(row)
@@ -1190,22 +1274,27 @@ def sync_to_material(model):
                     results.append({"日期": d, "落地品名": "", "目标品名": "", "置信度": 0,
                                     "理由": "员工餐sheet无该日期行", "来源": "error"})
                     continue
-                material_sum = v["material"].quantize(CENT, rounding=ROUND_HALF_UP)
-                staff_amt = v["meal"].quantize(CENT, rounding=ROUND_HALF_UP)
-                paid = v["paid"].quantize(CENT, rounding=ROUND_HALF_UP) if v["paid"] is not None else None
-                total_cell = paid if paid is not None else (material_sum + staff_amt)
-                staff_ws.cell(r, daily_amt_col).value = float(material_sum)   # 日物料·金额 = 已落物料表
-                staff_ws.cell(r, daily_total_col).value = float(total_cell)   # 总计 = 实付（无实付则为两侧之和）
-                staff_ws.cell(r, staff_amt_col).value = float(staff_amt)      # 员工餐 = 未落物料表的金额
+                material_sum = Decimal("0")
+                staff_amt = Decimal("0")
+                for rec in v["srcs"].values():
+                    material_sum += rec["material"]
+                    if rec["veg"]:
+                        paid_eff = rec["paid"] if rec["paid"] is not None else rec["detail"]
+                        staff_amt += paid_eff - rec["material"]
+                    else:
+                        staff_amt += rec["meal"]
+                material_sum = material_sum.quantize(CENT, rounding=ROUND_HALF_UP)
+                staff_amt = staff_amt.quantize(CENT, rounding=ROUND_HALF_UP)
+                total_cell = material_sum + staff_amt
+                staff_ws.cell(r, daily_amt_col).value = float(material_sum)   # H 日物料 = 已落物料表的明细
+                staff_ws.cell(r, daily_total_col).value = float(total_cell)   # I 总计 = 实付
+                staff_ws.cell(r, staff_amt_col).value = float(staff_amt)      # D 员工餐 = 实付 − 日物料
                 note = ""
-                if paid is not None and (staff_amt + material_sum - paid).copy_abs() > CENT:
-                    note = "，员工餐只统计未落入物料表的金额，实付差额未摊入员工餐"
                 if staff_amt < 0:
                     note += "，注意：员工餐金额为负（请人工核对）"
-                paid_txt = f"{float(paid):.2f}" if paid is not None else "无"
                 results.append({"日期": d, "落地品名": "", "目标品名": "员工餐",
                                 "置信度": 1, "来源": "mapping",
-                                "理由": f"日物料金额={float(material_sum):.2f}，日物料总计=实付{paid_txt}，员工餐金额={float(staff_amt):.2f}{note}"})
+                                "理由": f"日物料金额={float(material_sum):.2f}，实付总计={float(total_cell):.2f}，员工餐金额={float(staff_amt):.2f}（实付−日物料）{note}"})
 
     twb.save(material)
     return results, backup
@@ -1245,7 +1334,7 @@ def _merge_by_source(ws):
 
 def append_land(filename, date, category, total, paid_total, items):
     os.makedirs(_paths["output_dir"], exist_ok=True)
-    HEADERS = ["日期", "类别", "品名", "数量", "单价", "金额", "来源图片", "合计", "实付合计"]
+    HEADERS = ["日期", "类别", "品名", "数量", "单价", "金额", "来源图片", "合计", "实付合计", "归属"]
     land = land_file()
     with _land_lock:
         if os.path.exists(land):
@@ -1261,6 +1350,7 @@ def append_land(filename, date, category, total, paid_total, items):
                     ws.delete_cols(c)
             ws.cell(1, 8).value = "合计"
             ws.cell(1, 9).value = "实付合计"
+            ws.cell(1, 10).value = "归属"
             # 按来源图片去重：先删掉该图片已有的旧行，再覆盖式写入
             for r in range(ws.max_row, 1, -1):
                 if ws.cell(r, 7).value == filename:
@@ -1275,6 +1365,7 @@ def append_land(filename, date, category, total, paid_total, items):
             ws.append([
                 date, category, it.get("品名"), it.get("数量"),
                 it.get("单价"), it.get("金额"), filename, total, paid_total,
+                it.get("归属") or "",
             ])
         _merge_by_source(ws)
         wb.save(land)
@@ -1365,7 +1456,12 @@ def confirm(filename: str, payload: ConfirmPayload):
     category = str(payload.category or "").strip()
     if category not in CATEGORY_SHEET:
         raise HTTPException(400, "请选择类别（蔬菜或肉类）后再确认；缺少类别时不会默认写成蔬菜")
+    # 实付必须人工按票面填写（优惠后），员工餐 = 实付 − 日物料，不能拿明细合计或 OCR 合计顶替
+    if payload.paid_total is None:
+        raise HTTPException(400, "请对照票面填写实付总额（优惠后）再确认；本次未写入 Excel")
     items = [normalize_item(it, category) for it in payload.items]
+    # 归属以确认时的最终品名重新判定（人工改过品名也生效）；员工区标记来自识别或人工补录
+    assign_attribution(items, category)
     # 回流学习：仅当用户手动编辑过品名时，才把「OCR 原品名 → 确认后品名」写入纠错字典
     for it in items:
         if it.get("品名编辑"):
@@ -1383,8 +1479,8 @@ def confirm(filename: str, payload: ConfirmPayload):
         save_code_map()
     # 合计 = 所有品名金额累加（不再区分员工餐/物料），所有明细行都落地
     total = core.sum_amount(items)
-    # 实付总额（优惠后）：用户未填或为空时按明细加总（即无优惠）
-    paid = payload.paid_total if payload.paid_total not in (None, "") else total
+    # 实付总额（优惠后）：上面已校验必填
+    paid = payload.paid_total
     for inv in _state["invoices"]:
         if inv["filename"] == filename:
             # 先写落地表，成功后再标已确认。WPS 占用导致写入失败时保持未确认，
