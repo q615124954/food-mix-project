@@ -189,6 +189,7 @@ def parse_line_items(rows):
     跳过重复表头、合计/件数等脏行。
     """
     items = []
+    staff_zone = False   # 7 列蔬菜单：物料小计 /「员工：」分区之后的行都在员工区
     for cells in rows:
         if not cells or all(c.strip() == "" for c in cells):
             continue
@@ -206,13 +207,16 @@ def parse_line_items(rows):
             name = name_or_raw(cells[1]) if len(cells) > 1 else ""
             qty = extract_num(cells[3]) if len(cells) > 3 else None
             if qty is None:
+                if is_staff_marker(cells):
+                    staff_zone = True
                 continue
             # 品名为空但数量、金额都有：手写品名没认出来，保留整行（品名留空），
             # 由存疑规则标红交人工补，不能整行丢掉让金额漏账。
             unit = re.sub(r"[\d.\s×xX]", "", cells[2]) if len(cells) > 2 else ""
             amount = extract_num(cells[5]) if len(cells) > 5 else None
             items.append({"品名": name, "数量": qty, "金额": amount, "类别": "蔬菜", "单位": unit,
-                          "票面单价": extract_num(cells[4]) if len(cells) > 4 else None})
+                          "票面单价": extract_num(cells[4]) if len(cells) > 4 else None,
+                          "员工区": staff_zone})
             continue
         # 序号开头的单据（肉类/销货清单）：5 列，品名在 cells[1]，金额在 cells[4]
         # 注：OCR 偶把数据行序号"1"识别成"序号"，故 first=="序号" 也按数据行处理
@@ -245,6 +249,41 @@ def parse_line_items(rows):
         items.append({"品名": name, "数量": qty, "金额": amount, "类别": "蔬菜",
                       "票面单价": extract_num(cells[2]) if len(cells) > 2 else None})
     return items
+
+
+STAFF_HEADER_RE = re.compile(r"员\s*工")
+
+
+def is_staff_marker(cells):
+    """7 列蔬菜单的员工分区标记行（数量列为空）：
+    1) 品名格写「员工」；
+    2) 品名格为空或是合计类标签（OCR 常把「员工：」认成「总没」），且金额/备注列有手写数（物料小计，如「计110」「71」「168」）。
+    票面写法是：物料段 → 物料小计 →「员工：」→ 员工餐行 → 员工小计 → 总计 → 优惠 → 实付。"""
+    if len(cells) < 7:
+        return False
+    name = (cells[1] or "").strip()
+    if extract_num(cells[3] or "") is not None:
+        return False
+    if STAFF_HEADER_RE.search(name):
+        return True
+    has_num = any(extract_num((c or "").strip()) is not None for c in cells[5:])
+    return has_num and (not name or _is_total_label(name))
+
+
+def count_staff_zone_missing(rows):
+    """员工区里「有序号、其余全空」的行数：员工区手写内容疑似没识别出来（如 8/12 被阴影遮住）。"""
+    zone = False
+    cnt = 0
+    for cells in rows:
+        if not cells or len(cells) < 7 or is_header_row(cells):
+            continue
+        cells = [(c or "").strip() for c in cells]
+        if not zone:
+            zone = is_staff_marker(cells)
+            continue
+        if re.fullmatch(r"\d+", cells[0]) and not cells[1] and not re.search(r"\d", "".join(cells[2:])):
+            cnt += 1
+    return cnt
 
 
 _TOTAL_TAG = re.compile(r"^(?:合计|总计|小计|总额|计)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*$")

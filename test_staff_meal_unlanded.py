@@ -127,10 +127,10 @@ class StaffMealUnlandedTest(unittest.TestCase):
         }
 
     def test_unlanded_rows_do_not_overstate_staff_meal(self):
-        """有未落地行时，员工餐只等于没写进物料表的金额，不能把已落地或实付差额算进去。
+        """员工餐 = 蔬菜单实付 − 本单已落日物料（用户确认的口径：优惠、差额都归员工餐）。
 
-        实付 120 大于明细（青菜 50 + 野草 40）。旧算法用实付减已落地，员工餐会变成 70。
-        缺类别的 15 元要进员工餐；空日期的 20 元不能记到 8 月 1 日，否则虚高。
+        ok.jpg 实付 120，只有青菜 50 写进物料表 → 员工餐 70（含没归并上的野草 40 和差额 30）。
+        缺类别的白菜 15 不写物料表，计员工餐；空日期的 20 元不能记到 8 月 1 日，否则虚高。
         """
         results, _backup = self._sync([
             (DATE, "蔬菜", "青菜", 2, 25, 50, "ok.jpg", 90, 120),
@@ -144,9 +144,9 @@ class StaffMealUnlandedTest(unittest.TestCase):
         self.assertEqual(got["青菜"], (2, 50))
         self.assertEqual(got["白菜"], (99, 999))
         self.assertEqual(got["日物料"], 50)
-        # 野草 40（没归并上）+ 缺类别白菜 15。不是 70（实付倒挤），也不是 120，更不是 75（再加空日期）
-        self.assertEqual(got["员工餐"], 55)
-        self.assertEqual(got["总计"], 120)
+        # ok.jpg：120 − 50 = 70；缺类别白菜 15。空日期的 20 不算进来（否则是 105）
+        self.assertEqual(got["员工餐"], 85)
+        self.assertEqual(got["总计"], 135)
 
         blank = [r for r in results if r.get("来源") == "staff_meal" and r.get("金额") == 20]
         self.assertEqual(len(blank), 1)
