@@ -69,14 +69,19 @@ class SameDayMaterialSumTest(unittest.TestCase):
                 webapp._paths["output_dir"] = out
                 webapp._paths["material_file"] = material
 
+                land = os.path.join(out, webapp.LAND_FILENAME)
                 webapp.sync_to_material("unused-model")
                 qty, amt = _read_beef(material)
                 self.assertEqual((qty, amt), (15, 750))
+                self.assertFalse(os.path.exists(land))
 
-                # 同一批已确认单据再同步一次，不能变成 30/1500
+                # 同一批已确认单据再同步一次，不能变成 30/1500。
+                # 成功同步会删掉中间表，所以用同一份落地表再写一次来验证覆盖而不是累加。
+                _build_land(land)
                 webapp.sync_to_material("unused-model")
                 qty, amt = _read_beef(material)
                 self.assertEqual((qty, amt), (15, 750))
+                self.assertFalse(os.path.exists(land))
         finally:
             webapp._paths.clear()
             webapp._paths.update(saved)

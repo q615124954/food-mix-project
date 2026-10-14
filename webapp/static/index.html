@@ -137,7 +137,7 @@
         </div>
         <div class="totalbar">
           <div>合计：¥<span class="val" id="total-val">0.00</span></div>
-          <div class="paid">实付总额(优惠后) ¥<input id="fld-paid" type="number" step="0.01" min="0" placeholder="必填，按票面实付"><span class="paid-hint" id="ocr-total-ref"></span><span class="paid-hint" id="paid-hint"></span></div>
+          <div class="paid">实付总额(优惠后) ¥<input id="fld-paid" type="number" step="0.01" min="0" placeholder="默认同合计，有优惠请手改"><span class="paid-hint" id="ocr-total-ref"></span><span class="paid-hint" id="paid-hint"></span></div>
         </div>
         <div class="hint">修改数量或金额时，单价自动 = 金额 ÷ 数量；也可直接改单价。<button type="button" class="gray" id="btn-add-staff">＋补录员工餐行</button></div>
       </div>
@@ -155,6 +155,7 @@ let state = { invoices: [] };
 let cur = -1;
 let lastJson = '';
 let dirty = false;   // 有未提交的编辑时置 true，暂停自动刷新以免覆盖用户修改
+let paidDirty = false;   // 用户改过实付后，不再用合计覆盖
 
 async function refresh() {
   // 有未提交编辑时直接跳过，避免把用户改的内容还原成 OCR 原值
@@ -198,6 +199,7 @@ function renderPaths(p) {
 
 function selectInvoice(i) {
   dirty = false;   // 切换票据时放弃当前未保存的刷新保护
+  paidDirty = false;
   cur = i;
   renderList();
   renderCurrent();
@@ -252,11 +254,7 @@ function renderCurrent() {
   if (catSel.value !== rawCat) catSel.value = '';
   const cw = document.getElementById('category-warn');
   if (cw) cw.style.display = catSel.value ? 'none' : 'inline';
-  const paidInp = document.getElementById('fld-paid');
-  if (paidInp) {
-    // 实付必须人工按票面填写：只回显已确认过的实付，不拿 OCR 合计预填
-    paidInp.value = (inv.paid_total != null && inv.paid_total !== '') ? inv.paid_total : '';
-  }
+  syncDefaultPaid();
   const ocrRef = document.getElementById('ocr-total-ref');
   if (ocrRef) {
     const ot = inv.order_total;
@@ -310,7 +308,7 @@ document.getElementById('fld-category').addEventListener('change', () => {
   const cw = document.getElementById('category-warn');
   if (cw) cw.style.display = document.getElementById('fld-category').value ? 'none' : 'inline';
 });
-document.getElementById('fld-paid').addEventListener('input', () => { dirty = true; updatePaidHint(); });
+document.getElementById('fld-paid').addEventListener('input', () => { dirty = true; paidDirty = true; updatePaidHint(); });
 
 // 员工区漏识别时人工补录：新增一行，标记在员工区（确认时按员工餐计，不写日物料）
 document.getElementById('btn-add-staff').addEventListener('click', () => {
@@ -349,7 +347,34 @@ function currentSum() {
 function recomputeTotal() {
   const el = document.getElementById('total-val');
   if (el) el.textContent = currentSum().toFixed(2);
+  syncDefaultPaid();
   updatePaidHint();
+}
+
+function syncDefaultPaid() {
+  const inv = state.invoices[cur];
+  const paidInp = document.getElementById('fld-paid');
+  if (!paidInp || !inv || paidDirty) return;
+  if (inv.paid_total != null && inv.paid_total !== '') {
+    paidInp.value = inv.paid_total;
+    return;
+  }
+  // 打开复核页时实付默认等于明细合计，用户可以改；清空则确认时仍按合计入账
+  const hasItems = inv.items && inv.items.length;
+  paidInp.value = hasItems ? currentSum() : '';
+}
+
+function paidFollowsSum() {
+  const paid = paidValue();
+  const sum = currentSum();
+  if (paid == null) return true;
+  return Math.abs(paid - sum) <= 0.02;
+}
+
+function ticketBelowSum() {
+  const inv = state.invoices[cur];
+  if (!inv || inv.order_total == null || inv.order_total === '') return false;
+  return Math.round((currentSum() - Number(inv.order_total)) * 100) / 100 > 0.5;
 }
 
 function paidValue() {
@@ -365,7 +390,16 @@ function updatePaidHint() {
   const el = document.getElementById('paid-hint');
   if (!el) return;
   const paid = paidValue();
-  if (paid == null) { el.textContent = ''; el.className = 'paid-hint'; return; }
+  if (paidFollowsSum() && ticketBelowSum()) {
+    el.textContent = '按合计入账会盖住优惠，员工餐可能算错，请手改实付';
+    el.className = 'paid-hint bad';
+    return;
+  }
+  if (paid == null) {
+    el.textContent = '未填则按合计 ¥' + currentSum().toFixed(2) + ' 入账';
+    el.className = 'paid-hint';
+    return;
+  }
   const sum = currentSum();
   const diff = Math.round((sum - paid) * 100) / 100;
   if (diff > 0.005) {
@@ -410,12 +444,6 @@ async function submitConfirm() {
     toast('请先选择类别（不会默认成蔬菜）', true);
     return;
   }
-  if (paidValue() == null) {
-    toast('请对照票面填写实付总额（优惠后）再确认', true);
-    const p = document.getElementById('fld-paid');
-    if (p) p.focus();
-    return;
-  }
   const payload = {
     date: document.getElementById('fld-date').value.trim(),
     category: category,
@@ -426,7 +454,7 @@ async function submitConfirm() {
     const r = await fetch(`/api/invoice/${encodeURIComponent(inv.filename)}/confirm`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
     });
-    if (r.ok) { dirty = false; toast('已落地'); await refresh(); }
+    if (r.ok) { dirty = false; paidDirty = false; toast('已落地'); await refresh(); }
     else { const e = await r.json(); toast('落地失败：' + (e.detail || '未知错误'), true); }
   } catch (err) {
     toast('请求失败：' + err.message, true);

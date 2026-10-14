@@ -58,6 +58,14 @@ HIST_OUTLIER_RATIO = 3.0
 
 # 类别 -> 目标表 sheet 名
 CATEGORY_SHEET = {"肉类": "肉类采购", "蔬菜": "日物料采购"}
+# 同步落地门槛：置信度低于此值不写入物料表。员工餐? 归并共用这一道，不再另设门槛。
+# 比较与下面 map_product_code / sync 循环一致：低于 0.8 不落地，0.8 本身可以落地。
+SYNC_CONF = 0.8
+# 落地表里「待确认的员工餐」。已确认的员工餐仍写「员工餐」，同步时不调模型。
+STAFF_QUERY = "员工餐?"
+PAID_DISCOUNT_SUSPECT = (
+    "实付按明细合计入账；票面合计更低，优惠未计入，员工餐可能被算错，请手改实付后再确认"
+)
 
 _lock = threading.Lock()
 _land_lock = threading.Lock()
@@ -714,6 +722,8 @@ def ocr_one(filename):
         suspects.append(tip)
     if missing:
         suspects.append(f"疑似漏识别 {missing} 行（有序号但内容为空，可能补货段未识别，请人工核对补录）")
+    # 实付还没填，打开复核页会按合计预填。票面合计更低时先标出来，等人手改实付。
+    suspects = _with_paid_suspect(suspects, None, items, order_total)
     return {"date": date, "total": total, "order_total": order_total, "items": items, "suspects": suspects}
 
 
@@ -729,7 +739,9 @@ def build_invoice_index():
                 inv["total"] = core.sum_amount(inv.get("items", []))
             # 每次重算 suspects（基于现有明细），保证规则更新后重启即生效
             if inv.get("ocr_done") and inv.get("items"):
-                inv["suspects"] = compute_suspects(inv.get("date", ""), inv.get("items", []))
+                suspects = compute_suspects(inv.get("date", ""), inv.get("items", []))
+                inv["suspects"] = _with_paid_suspect(
+                    suspects, inv.get("paid_total"), inv.get("items", []), inv.get("order_total"))
             elif "suspects" not in inv:
                 inv["suspects"] = []
             invoices.append(inv)
@@ -971,7 +983,7 @@ def map_product_code(raw_name, category, name_code, model, qty=None, amt=None):
     2) 品名精确/归一化命中候选标准品名；
     3) name_match 本地召回 top5 候选 + LLM 定夺(LLM 返回候选品名, 再映射代码)。
     返回 dict：物料代码 / 目标品名 / 置信度 / 理由 / 来源。
-    来源=="ai" 且置信度>=0.8 时写回 code_map 持久化，供重复同步零 LLM 复用。"""
+    来源=="ai" 且置信度>=SYNC_CONF 时写回 code_map 持久化，供重复同步零 LLM 复用。"""
     code_map_cat = _code_map.get(category, {})
     # 1) code_map 命中（且代码仍在当前候选 sheet 中）。海天/老抽→生抽 的旧映射不沿用。
     if raw_name in code_map_cat and code_map_cat[raw_name] in set(name_code.values()):
@@ -1062,8 +1074,8 @@ def map_product_code(raw_name, category, name_code, model, qty=None, amt=None):
         return {"物料代码": "", "目标品名": raw_name, "置信度": 0.0,
                 "理由": "海天/老抽不能自动归到生抽", "来源": "ai_invalid"}
     code = name_code[target]
-    # 高置信 LLM 归并写回持久化（一次归并永久复用）
-    if conf >= 0.8:
+    # 高置信 LLM 归并写回持久化（一次归并永久复用）。门槛与同步落地相同。
+    if conf >= SYNC_CONF:
         _code_map.setdefault(category, {})[raw_name] = code
         save_code_map()
     return {"物料代码": code, "目标品名": target, "置信度": conf,
@@ -1158,6 +1170,251 @@ def is_staff_meal_only(name):
     return bool(norm) and STAFF_MEAL_ONLY_MARK in norm
 
 
+def _true_staff_item(it):
+    """票面员工区、人工补录、海底捞。这些不走员工餐? 的物料归并，也不调大模型。"""
+    if is_staff_meal_only(it.get("品名")):
+        return True
+    return bool(it.get("员工区") or it.get("人工补录"))
+
+
+def excel_attr(it):
+    """落地表「归属」列。待确认且不是真员工餐时写成「员工餐?」，同步才会再去对物料表。"""
+    attr = str(it.get("归属") or "")
+    if attr != STAFF:
+        return attr
+    if _true_staff_item(it) or it.get("品名编辑") or not it.get("归属待确认"):
+        return STAFF
+    return STAFF_QUERY
+
+
+def _as_bool(value):
+    if value is True or value == 1:
+        return True
+    if isinstance(value, str) and value.strip().lower() in ("true", "1", "是", "yes"):
+        return True
+    return False
+
+
+def _optional_float(value):
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def paid_discount_suspect(paid, items, order_total):
+    """实付空着或仍等于明细合计，而票面合计更低：按合计入账会把优惠抹掉，员工餐跟着算错。
+
+    不替用户改成更低的实付。返回提示文字；没有这回事返回 None。
+    """
+    total = core.sum_amount(items)
+    if total is None:
+        return None
+    effective = total if paid is None or paid == "" else _optional_float(paid)
+    if effective is None or abs(float(effective) - float(total)) > 0.02:
+        return None
+    ticket = _optional_float(order_total)
+    if ticket is None:
+        return None
+    if float(total) - ticket > ORDER_TOTAL_TOL:
+        return PAID_DISCOUNT_SUSPECT
+    return None
+
+
+def _with_paid_suspect(suspects, paid, items, order_total):
+    """重算存疑时把实付/优惠这一条补回去，避免重新扫描把它冲掉。"""
+    msg = paid_discount_suspect(paid, items, order_total)
+    kept = [s for s in (suspects or []) if s != PAID_DISCOUNT_SUSPECT]
+    if msg:
+        kept.append(msg)
+    return kept
+
+
+def resolve_paid_total(paid, items, order_total):
+    """实付可空。空则按明细合计。返回 (实付, 存疑提示或 None)。"""
+    total = core.sum_amount(items)
+    if paid is None or paid == "":
+        paid = total
+    suspect = paid_discount_suspect(paid, items, order_total)
+    return paid, suspect
+
+
+def _in_candidates(name, candidates):
+    if not name:
+        return False
+    if name in candidates:
+        return True
+    norm = normalize_pin(name)
+    return any(normalize_pin(c) == norm for c in candidates)
+
+
+def match_tentative_to_catalog(raw_name, category, candidates, name_code, model, qty=None, amt=None):
+    """员工餐? 才调用。走现有分层匹配；只有分层结果要求 LLM 时才调模型。
+
+    置信度达到 SYNC_CONF 且不是海天/老抽→生抽时，返回归并结果；否则 None（保持员工餐）。
+    """
+    raw_name = str(raw_name or "").strip()
+    if not raw_name or not candidates or matching_paused() or is_staff_meal_only(raw_name):
+        return None
+    decision = name_match.layered_match(
+        raw_name, list(candidates), category=category or "蔬菜",
+        units=_legal_units, codes=name_code or None)
+    if name_match.forbidden_auto_map(raw_name, decision.get("name")):
+        return None
+    action = decision.get("action")
+    if action == "auto":
+        target = decision.get("name")
+        try:
+            conf = float(decision.get("confidence") or 0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        if (target and conf >= SYNC_CONF and not name_match.forbidden_auto_map(raw_name, target)
+                and _in_candidates(target, candidates)):
+            return {"目标品名": target, "置信度": conf, "来源": decision.get("source") or "variant",
+                    "理由": "本地别名或高分匹配"}
+        return None
+    if action != "llm" or not decision.get("llm_candidates"):
+        return None
+    cands = [c for c in decision["llm_candidates"] if c and not name_match.forbidden_auto_map(raw_name, c)]
+    if not cands:
+        return None
+    try:
+        mp = map_product_name(
+            raw_name, category or "蔬菜", cands, model,
+            qty=qty, amt=amt, candidate_units=_legal_units)
+    except Exception:
+        return None
+    target = str(mp.get("目标品名") or "").strip()
+    try:
+        conf = float(mp.get("置信度") or 0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    if name_match.forbidden_auto_map(raw_name, target):
+        return None
+    if mp.get("来源") in ("mapping", "ai") and conf >= SYNC_CONF and _in_candidates(target, candidates):
+        return {"目标品名": target, "置信度": conf, "来源": mp.get("来源") or "ai",
+                "理由": str(mp.get("理由") or "")}
+    return None
+
+
+def _persist_tentative_alias(category, raw, hit, code=""):
+    """高置信归并写回别名表。海天/老抽→生抽 在 remember / add_variant 里会被拒绝。"""
+    std = str(hit.get("目标品名") or "").strip()
+    raw = str(raw or "").strip()
+    if not std or not raw or std == raw or name_match.forbidden_auto_map(raw, std):
+        return
+    if not remember_material_alias(category, raw, std):
+        name_match.add_variant(category, std, raw, code=code or None)
+    if hit.get("来源") in ("ai", "mapping") and code:
+        _code_map.setdefault(category, {})[raw] = code
+        save_code_map()
+
+
+def promote_tentative_staff_items(items, category, model):
+    """确认时：只有「员工餐?」且未被人工改名、也不是员工区/海底捞，才对物料表归并。"""
+    cat = category or "蔬菜"
+    if cat != "蔬菜" or matching_paused() or not _legal_name_list:
+        return items
+    for it in items:
+        if it.get("品名编辑") or _true_staff_item(it):
+            continue
+        if it.get("归属") != STAFF or not it.get("归属待确认"):
+            continue
+        raw = str(it.get("品名") or "").strip()
+        hit = match_tentative_to_catalog(
+            raw, cat, _legal_name_list, _legal_codes, model,
+            qty=it.get("数量"), amt=it.get("金额"))
+        if not hit:
+            continue
+        if not it.get("原品名"):
+            it["原品名"] = raw
+        it["品名"] = hit["目标品名"]
+        it["归属"] = MATERIAL
+        it["归属待确认"] = False
+        it["归属依据"] = f"员工餐? 按同步置信度归入「{hit['目标品名']}」"
+        it["纠正来源"] = hit.get("来源") or ""
+        _persist_tentative_alias(cat, raw, hit, _legal_codes.get(hit["目标品名"], ""))
+    return items
+
+
+def _cache_sheet(twb, sheet_cache, sheet_name):
+    if sheet_name not in sheet_cache:
+        ws = twb[sheet_name]
+        date_cols, name_rows, name_units, code_rows, name_code = _parse_target(ws)
+        sheet_cache[sheet_name] = (ws, date_cols, name_rows, name_units, code_rows, name_code)
+    return sheet_cache[sheet_name]
+
+
+def _promote_land_row(row, model, twb, sheet_cache):
+    """同步时把「员工餐?」再对一次目标表。成功则改写 row['name'] 并返回 True。"""
+    raw = row.get("name") or ""
+    primary = CATEGORY_SHEET.get(row.get("cat"))
+    alt = "日物料采购" if primary == "肉类采购" else ("肉类采购" if primary == "日物料采购" else None)
+    sheets = [s for s in (primary, alt) if s and s in twb.sheetnames]
+    for sheet_name in sheets:
+        try:
+            _ws, _dates, _rows, _units, _codes, name_code = _cache_sheet(twb, sheet_cache, sheet_name)
+        except Exception:
+            continue
+        hit = match_tentative_to_catalog(
+            raw, row.get("cat"), list(name_code), name_code, model,
+            qty=row.get("qty"), amt=row.get("amt"))
+        if not hit:
+            continue
+        code = name_code.get(hit["目标品名"], "")
+        _persist_tentative_alias(row.get("cat") or "蔬菜", raw, hit, code)
+        row["promoted_from"] = raw
+        row["name"] = hit["目标品名"]
+        return True
+    return False
+
+
+def _numbers_equal(got, want):
+    if want is None:
+        return got is None
+    try:
+        return abs(float(got) - float(want)) < 0.001
+    except (TypeError, ValueError):
+        return False
+
+
+def _validate_material_write(material, expected):
+    """回读刚写入的数量/金额。对不上就失败，调用方保留财务中间表并还原物料表。"""
+    from openpyxl import load_workbook
+    wb = load_workbook(material, data_only=False)
+    try:
+        for sheet, row, col, want in expected:
+            if sheet not in wb.sheetnames:
+                raise ValueError(f"缺少工作表「{sheet}」")
+            got = wb[sheet].cell(row, col).value
+            if not _numbers_equal(got, want):
+                raise ValueError(f"{sheet} 第{row}行第{col}列期望 {want}，实际 {got}")
+    finally:
+        wb.close()
+
+
+def _restore_material_backup(backup, material):
+    if backup and os.path.exists(backup):
+        shutil.copy2(backup, material)
+
+
+def _delete_finance_intermediate():
+    """物料明细已经写完并且回读通过之后，删掉财务目录下的落地表。删不掉要报错，不能当成成功。"""
+    path = land_file()
+    if not path or not os.path.exists(path):
+        return
+    try:
+        os.remove(path)
+    except OSError as e:
+        raise HTTPException(
+            500,
+            "物料明细已写入并通过校验，但财务中间表删除失败，请关闭占用后重试："
+            f"{os.path.basename(path)}（{e}）",
+        )
+
+
 def _row_amount(row):
     """明细金额转 Decimal。空金额返回 None，调用方不得按 0 计入。"""
     value = row.get("amt")
@@ -1189,6 +1446,8 @@ def sync_to_material(model):
     col = {str(h).strip(): i for i, h in enumerate(header) if h}
     raw_col = col.get("原品名")
     attr_col = col.get("归属")
+    edited_col = col.get("品名编辑")
+    zone_col = col.get("员工区")
     rows = []
     cur_date = ""
     cur_cat = ""
@@ -1236,13 +1495,17 @@ def sync_to_material(model):
         # 归并以「品名」（用户确认后的最终值）为准，「原品名」仅作追溯/回流学习，
         # 不再作为归并输入，否则会忽略用户手动修正的品名（如把「牛肉」误归成「牛骨」）
         merge_name = str(name).strip() if name else (str(raw).strip() if raw else "")
-        # 实付：确认时必填，写在「实付合计」；更早的落地表没有该列时回退到「合计」
+        # 实付可空：空着时同步按本单合计（明细金额之和）计，不把上一张单的实付带过来
         paid = cur_paid if cur_paid not in (None, "") else (cur_total if cur_total not in (None, "") else None)
         attr = r[attr_col] if attr_col is not None and attr_col < len(r) else None
+        name_edited = _as_bool(r[edited_col]) if edited_col is not None and edited_col < len(r) else False
+        staff_zone = _as_bool(r[zone_col]) if zone_col is not None and zone_col < len(r) else False
         rows.append({"date": cur_date, "cat": cur_cat, "name": merge_name,
                      "qty": qty, "price": price, "amt": amt, "paid": paid,
                      "src": src, "detail_total": cur_total,
-                     "attr": str(attr).strip() if attr not in (None, "") else ""})
+                     "attr": str(attr).strip() if attr not in (None, "") else "",
+                     "name_edited": name_edited, "staff_zone": staff_zone})
+    lwb.close()
     if not rows:
         raise HTTPException(400, "落地表没有可同步的数据")
 
@@ -1257,7 +1520,7 @@ def sync_to_material(model):
     # 员工餐 sheet（用户已确认的口径）：
     #   日物料(H) = 实际写入日物料/肉类表的明细金额；
     #   员工餐(D) = 蔬菜单实付 − 本单日物料（优惠、手写小计与明细的差额都归员工餐）；
-    #   总计(I)  = 实付（复核页必填）。
+    #   总计(I)  = 实付；实付空着时按本单明细合计。
     # 每张单（来源图片）单独算再按日期相加；非蔬菜单（肉类、缺类别）沿用「未落地金额计员工餐」。
     # 空日期没有自己的日期行，不能记到别的日期上，否则会把另一天的员工餐抬高。
     staff = {}
@@ -1325,25 +1588,40 @@ def sync_to_material(model):
             if rec["paid"] is None and row.get("paid") not in (None, ""):
                 rec["paid"] = Decimal(str(row["paid"]))
 
+    def _staff_result(row, reason, conf=1):
+        _add_meal(row)
+        results.append({"日期": row["date"], "落地品名": row.get("promoted_from") or row["name"],
+                        "目标品名": "员工餐", "置信度": conf, "来源": "staff_meal",
+                        "数量": row["qty"], "金额": row["amt"], "理由": reason})
+
     for row in dated_rows:
-        # 员工餐行（确认时判定：员工分区之后 / 物料表没有的品名）不调大模型、不写物料表
+        # 已确认的员工餐（含旧落地表没有「归属」列时按品名回退）不调大模型。
+        # 「员工餐?」不在这里短路，下面会先走分层匹配（必要时才调模型）。
         attr = row.get("attr") or ""
         if not attr and row["cat"] == "蔬菜" and _legal_names:
             # 旧落地表没有「归属」列：按品名回退判定（拿不到员工分区信息）
             attr = classify_item(row["name"], row["cat"])[0]
-        if attr == STAFF and not is_staff_meal_only(row["name"]):
-            _add_meal(row)
-            results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": "员工餐",
-                            "置信度": 1, "来源": "staff_meal", "数量": row["qty"], "金额": row["amt"],
-                            "理由": "员工餐行，只计入员工餐总额，不写入日物料采购"})
+        # 海底捞、员工区：固定员工餐，不调大模型
+        if is_staff_meal_only(row["name"]) or row.get("staff_zone"):
+            why = ("海底捞只计入员工餐，不写入日物料采购" if is_staff_meal_only(row["name"])
+                   else "员工餐行，只计入员工餐总额，不写入日物料采购")
+            _staff_result(row, why)
             continue
-        # 海底捞只进员工餐，不参与日物料，也不写进肉类采购。
-        if is_staff_meal_only(row["name"]):
-            _add_meal(row)
-            results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": "员工餐",
-                            "置信度": 1, "来源": "staff_meal", "数量": row["qty"], "金额": row["amt"],
-                            "理由": "海底捞只计入员工餐，不写入日物料采购"})
+        # 复核页改过的品名以人工为准，模型不能覆盖
+        if row.get("name_edited") and attr in (STAFF, STAFF_QUERY):
+            _staff_result(row, "人工修改的品名保持原样，不按模型覆盖，仍计入员工餐")
             continue
+        if attr == STAFF:
+            _staff_result(row, "员工餐行，只计入员工餐总额，不写入日物料采购")
+            continue
+        if attr == STAFF_QUERY:
+            if not _promote_land_row(row, model, twb, sheet_cache):
+                _staff_result(
+                    row,
+                    f"员工餐? 未达到同步置信度(低于{SYNC_CONF:g})，仍计入员工餐",
+                    conf=0,
+                )
+                continue
         primary = CATEGORY_SHEET.get(row["cat"])
         alt = "日物料采购" if primary == "肉类采购" else ("肉类采购" if primary == "日物料采购" else None)
         sheets_to_try = [s for s in (primary, alt) if s and s in twb.sheetnames]
@@ -1368,10 +1646,13 @@ def sync_to_material(model):
                 map_cache[key] = mp
             if not mp.get("物料代码") or mp["物料代码"] not in code_rows:
                 continue  # 该 sheet 匹配不上，试备选
-            # 置信度不足（<0.8）不落地，避免错误品名被放入错误位置
-            if mp["置信度"] < 0.8:
-                results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": mp["目标品名"],
-                                "置信度": mp["置信度"], "理由": f"置信度不足(低于0.8)，跳过不落地：{mp['理由']}", "来源": mp["来源"]})
+            # 置信度不足不落地，避免错误品名被放入错误位置。门槛就是 SYNC_CONF。
+            if mp["置信度"] < SYNC_CONF:
+                results.append({"日期": row["date"], "落地品名": row.get("promoted_from") or row["name"],
+                                "目标品名": mp["目标品名"],
+                                "置信度": mp["置信度"],
+                                "理由": f"置信度不足(低于{SYNC_CONF:g})，跳过不落地：{mp['理由']}",
+                                "来源": mp["来源"]})
                 if row["cat"] == "蔬菜":
                     _add_meal(row)
                 placed = True
@@ -1400,8 +1681,13 @@ def sync_to_material(model):
             if row["amt"] is not None and (sheet_name == "日物料采购" or row["cat"] == "蔬菜"):
                 if row["cat"] == "蔬菜" or row["date"] in staff:
                     _add_material(row)
-            results.append({"日期": row["date"], "落地品名": row["name"], "目标品名": mp["目标品名"],
-                            "置信度": mp["置信度"], "理由": mp["理由"], "来源": mp["来源"],
+            reason = mp["理由"]
+            landed_name = row["name"]
+            if row.get("promoted_from"):
+                landed_name = row["promoted_from"]
+                reason = f"员工餐?「{row['promoted_from']}」归入「{mp['目标品名']}」；{reason}"
+            results.append({"日期": row["date"], "落地品名": landed_name, "目标品名": mp["目标品名"],
+                            "置信度": mp["置信度"], "理由": reason, "来源": mp["来源"],
                             "数量": row["qty"], "金额": row["amt"]})
             placed = True
             break
@@ -1411,21 +1697,28 @@ def sync_to_material(model):
             if row["cat"] == "蔬菜":
                 _add_meal(row)
 
+    expected = []
     for (_sheet, tr, col_qty), bucket in cell_sums.items():
         ws = bucket["ws"]
         if bucket["qty"] is not None:
-            ws.cell(tr, col_qty).value = _cell_number(bucket["qty"])
+            qv = _cell_number(bucket["qty"])
+            ws.cell(tr, col_qty).value = qv
+            expected.append((_sheet, tr, col_qty, qv))
         if bucket["amt"] is not None:
-            ws.cell(tr, col_qty + 2).value = _cell_number(bucket["amt"])
+            av = _cell_number(bucket["amt"])
+            ws.cell(tr, col_qty + 2).value = av
+            expected.append((_sheet, tr, col_qty + 2, av))
 
     # 写入员工餐sheet：日物料金额 = 实际写入物料表的金额；
     # 员工餐金额 = 未写入物料表的金额（海底捞、对不上的蔬菜行、缺类别等）。
-    # 总计列仍写蔬菜单实付（优惠后）；没有实付时用两侧金额之和。
+    # 总计列仍写蔬菜单实付（优惠后）；没有实付时用明细合计。
+    staff_parse_failed = False
     if "员工餐" in twb.sheetnames:
         try:
             staff_ws = twb["员工餐"]
             date_row_map, staff_amt_col, daily_amt_col, daily_total_col = _parse_staff_sheet(staff_ws)
         except Exception as e:
+            staff_parse_failed = True
             results.append({"日期": "", "落地品名": "", "目标品名": "", "置信度": 0,
                             "理由": f"员工餐sheet解析失败：{e}", "来源": "error"})
         else:
@@ -1448,9 +1741,15 @@ def sync_to_material(model):
                 material_sum = material_sum.quantize(CENT, rounding=ROUND_HALF_UP)
                 staff_amt = staff_amt.quantize(CENT, rounding=ROUND_HALF_UP)
                 total_cell = material_sum + staff_amt
-                staff_ws.cell(r, daily_amt_col).value = float(material_sum)   # H 日物料 = 已落物料表的明细
-                staff_ws.cell(r, daily_total_col).value = float(total_cell)   # I 总计 = 实付
-                staff_ws.cell(r, staff_amt_col).value = float(staff_amt)      # D 员工餐 = 实付 − 日物料
+                daily_v = float(material_sum)
+                total_v = float(total_cell)
+                staff_v = float(staff_amt)
+                staff_ws.cell(r, daily_amt_col).value = daily_v    # H 日物料 = 已落物料表的明细
+                staff_ws.cell(r, daily_total_col).value = total_v  # I 总计 = 实付（空则合计）
+                staff_ws.cell(r, staff_amt_col).value = staff_v    # D 员工餐 = 实付 − 日物料
+                expected.append(("员工餐", r, daily_amt_col, daily_v))
+                expected.append(("员工餐", r, daily_total_col, total_v))
+                expected.append(("员工餐", r, staff_amt_col, staff_v))
                 note = ""
                 if staff_amt < 0:
                     note += "，注意：员工餐金额为负（请人工核对）"
@@ -1458,7 +1757,24 @@ def sync_to_material(model):
                                 "置信度": 1, "来源": "mapping",
                                 "理由": f"日物料金额={float(material_sum):.2f}，实付总计={float(total_cell):.2f}，员工餐金额={float(staff_amt):.2f}（实付−日物料）{note}"})
 
-    twb.save(material)
+    if staff_parse_failed:
+        # 还没落盘。物料表保持原样，财务中间表留下，方便修好员工餐表后重试。
+        raise HTTPException(500, "同步校验未通过：员工餐表解析失败，财务中间表已保留，请修正后重试")
+
+    try:
+        twb.save(material)
+        twb.close()
+        _validate_material_write(material, expected)
+    except PermissionError:
+        _restore_material_backup(backup, material)
+        raise
+    except HTTPException:
+        _restore_material_backup(backup, material)
+        raise
+    except Exception as e:
+        _restore_material_backup(backup, material)
+        raise HTTPException(500, f"同步校验未通过，财务中间表已保留，请修正后重试：{e}")
+    _delete_finance_intermediate()
     return results, backup
 
 
@@ -1496,7 +1812,7 @@ def _merge_by_source(ws):
 
 def append_land(filename, date, category, total, paid_total, items):
     os.makedirs(_paths["output_dir"], exist_ok=True)
-    HEADERS = ["日期", "类别", "品名", "数量", "单价", "金额", "来源图片", "合计", "实付合计", "归属"]
+    HEADERS = ["日期", "类别", "品名", "数量", "单价", "金额", "来源图片", "合计", "实付合计", "归属", "品名编辑", "员工区"]
     land = land_file()
     with _land_lock:
         if os.path.exists(land):
@@ -1513,6 +1829,8 @@ def append_land(filename, date, category, total, paid_total, items):
             ws.cell(1, 8).value = "合计"
             ws.cell(1, 9).value = "实付合计"
             ws.cell(1, 10).value = "归属"
+            ws.cell(1, 11).value = "品名编辑"
+            ws.cell(1, 12).value = "员工区"
             # 按来源图片去重：先删掉该图片已有的旧行，再覆盖式写入
             for r in range(ws.max_row, 1, -1):
                 if ws.cell(r, 7).value == filename:
@@ -1527,7 +1845,9 @@ def append_land(filename, date, category, total, paid_total, items):
             ws.append([
                 date, category, it.get("品名"), it.get("数量"),
                 it.get("单价"), it.get("金额"), filename, total, paid_total,
-                it.get("归属") or "",
+                excel_attr(it),
+                bool(it.get("品名编辑")),
+                bool(it.get("员工区") or it.get("人工补录")),
             ])
         _merge_by_source(ws)
         wb.save(land)
@@ -1620,12 +1940,18 @@ def confirm(filename: str, payload: ConfirmPayload):
     category = str(payload.category or "").strip()
     if category not in CATEGORY_SHEET:
         raise HTTPException(400, "请选择类别（蔬菜或肉类）后再确认；缺少类别时不会默认写成蔬菜")
-    # 实付必须人工按票面填写（优惠后），员工餐 = 实付 − 日物料，不能拿明细合计或 OCR 合计顶替
-    if payload.paid_total is None:
-        raise HTTPException(400, "请对照票面填写实付总额（优惠后）再确认；本次未写入 Excel")
     items = [normalize_item(it, category) for it in payload.items]
     # 归属以确认时的最终品名重新判定（人工改过品名也生效）；员工区标记来自识别或人工补录
     assign_attribution(items, category)
+    # 员工餐? 在落地前按同步置信度归物料。人工改过的名字、员工区和海底捞不会进这里。
+    promote_tentative_staff_items(items, category, "DeepSeek-V4-Pro")
+    order_total = None
+    for inv in _state["invoices"]:
+        if inv["filename"] == filename:
+            order_total = inv.get("order_total")
+            break
+    # 实付可空：空着按明细合计。票面合计更低时只标存疑，不替用户把优惠填进去。
+    paid, paid_suspect = resolve_paid_total(payload.paid_total, items, order_total)
     # 回流学习：用户在复核页把 OCR 名改成物料标准名并确认后，写入纠错字典和别名表
     # （带物料代码）。下次同类票同一 OCR 名走固定别名，不再靠模糊分。
     # 海天/老抽 → 生抽 不学习。
@@ -1651,8 +1977,6 @@ def confirm(filename: str, payload: ConfirmPayload):
         save_code_map()
     # 合计 = 所有品名金额累加（不再区分员工餐/物料），所有明细行都落地
     total = core.sum_amount(items)
-    # 实付总额（优惠后）：上面已校验必填
-    paid = payload.paid_total
     for inv in _state["invoices"]:
         if inv["filename"] == filename:
             # 先写落地表，成功后再标已确认。WPS 占用导致写入失败时保持未确认，
@@ -1668,7 +1992,8 @@ def confirm(filename: str, payload: ConfirmPayload):
             inv["total"] = total
             inv["paid_total"] = paid
             inv["items"] = items
-            inv["suspects"] = []   # 已确认，清除存疑标记
+            # 其它存疑在确认后清掉。实付按合计入账会盖住优惠时，这条留下给人看。
+            inv["suspects"] = [paid_suspect] if paid_suspect else []
             inv["status"] = "confirmed"
             save_state()
             return {"ok": True}
