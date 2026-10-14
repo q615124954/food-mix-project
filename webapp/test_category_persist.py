@@ -122,7 +122,7 @@ def test_normalize_item_keeps_chosen_category_and_does_not_invent_vegetable():
 def test_confirm_persists_category_for_reopen(isolated):
     app._state["invoices"] = [_pending()]
     payload = app.ConfirmPayload(
-        date=DATE, category=" 肉类 ",
+        date=DATE, category=" 肉类 ", paid_total=60,
         items=[{"品名": "牛腩", "原品名": "牛腩", "数量": 2, "单价": 30, "金额": 60}],
     )
     assert app.confirm("meat.jpg", payload) == {"ok": True}
@@ -215,7 +215,7 @@ def test_sync_confirm_roundtrip_keeps_meat_on_meat_sheet(isolated, monkeypatch):
         "品名": "牛骨", "原品名": "牛骨", "数量": 1, "单价": 20, "金额": 20, "类别": "蔬菜",
     })
     app.confirm("meat.jpg", app.ConfirmPayload(
-        date=DATE, category="肉类",
+        date=DATE, category="肉类", paid_total=80,
         items=[
             {"品名": "牛腩", "原品名": "牛腩", "数量": 2, "单价": 30, "金额": 60},
             {"品名": "牛骨", "原品名": "牛骨", "数量": 1, "单价": 20, "金额": 20},

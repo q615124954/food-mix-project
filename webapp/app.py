@@ -1074,8 +1074,8 @@ def sync_to_material(model):
         # 归并以「品名」（用户确认后的最终值）为准，「原品名」仅作追溯/回流学习，
         # 不再作为归并输入，否则会忽略用户手动修正的品名（如把「牛肉」误归成「牛骨」）
         merge_name = str(name).strip() if name else (str(raw).strip() if raw else "")
-        # 实付：只认人工填的「实付合计」；没填为 None，员工餐按明细加总并提示「未扣优惠」
-        paid = cur_paid if cur_paid not in (None, "") else None
+        # 实付：确认时必填，写在「实付合计」；更早的落地表没有该列时回退到「合计」
+        paid = cur_paid if cur_paid not in (None, "") else (cur_total if cur_total not in (None, "") else None)
         attr = r[attr_col] if attr_col is not None and attr_col < len(r) else None
         rows.append({"date": cur_date, "cat": cur_cat, "name": merge_name,
                      "qty": qty, "price": price, "amt": amt, "paid": paid,
@@ -1095,7 +1095,7 @@ def sync_to_material(model):
     # 员工餐 sheet（用户已确认的口径）：
     #   日物料(H) = 实际写入日物料/肉类表的明细金额；
     #   员工餐(D) = 蔬菜单实付 − 本单日物料（优惠、手写小计与明细的差额都归员工餐）；
-    #   总计(I)  = 实付。实付没填时按明细加总，并提示「未扣优惠」。
+    #   总计(I)  = 实付（复核页必填）。
     # 每张单（来源图片）单独算再按日期相加；非蔬菜单（肉类、缺类别）沿用「未落地金额计员工餐」。
     # 空日期没有自己的日期行，不能记到别的日期上，否则会把另一天的员工餐抬高。
     staff = {}
@@ -1276,15 +1276,10 @@ def sync_to_material(model):
                     continue
                 material_sum = Decimal("0")
                 staff_amt = Decimal("0")
-                no_paid = False
                 for rec in v["srcs"].values():
                     material_sum += rec["material"]
                     if rec["veg"]:
-                        if rec["paid"] is not None:
-                            paid_eff = rec["paid"]
-                        else:
-                            paid_eff = rec["detail"]
-                            no_paid = True
+                        paid_eff = rec["paid"] if rec["paid"] is not None else rec["detail"]
                         staff_amt += paid_eff - rec["material"]
                     else:
                         staff_amt += rec["meal"]
@@ -1295,8 +1290,6 @@ def sync_to_material(model):
                 staff_ws.cell(r, daily_total_col).value = float(total_cell)   # I 总计 = 实付
                 staff_ws.cell(r, staff_amt_col).value = float(staff_amt)      # D 员工餐 = 实付 − 日物料
                 note = ""
-                if no_paid:
-                    note = "，未扣优惠：复核页没填实付，按明细加总计算"
                 if staff_amt < 0:
                     note += "，注意：员工餐金额为负（请人工核对）"
                 results.append({"日期": d, "落地品名": "", "目标品名": "员工餐",
@@ -1463,6 +1456,9 @@ def confirm(filename: str, payload: ConfirmPayload):
     category = str(payload.category or "").strip()
     if category not in CATEGORY_SHEET:
         raise HTTPException(400, "请选择类别（蔬菜或肉类）后再确认；缺少类别时不会默认写成蔬菜")
+    # 实付必须人工按票面填写（优惠后），员工餐 = 实付 − 日物料，不能拿明细合计或 OCR 合计顶替
+    if payload.paid_total is None:
+        raise HTTPException(400, "请对照票面填写实付总额（优惠后）再确认；本次未写入 Excel")
     items = [normalize_item(it, category) for it in payload.items]
     # 归属以确认时的最终品名重新判定（人工改过品名也生效）；员工区标记来自识别或人工补录
     assign_attribution(items, category)
@@ -1483,17 +1479,14 @@ def confirm(filename: str, payload: ConfirmPayload):
         save_code_map()
     # 合计 = 所有品名金额累加（不再区分员工餐/物料），所有明细行都落地
     total = core.sum_amount(items)
-    # 实付总额（优惠后）：用户未填或为空时按明细加总（即无优惠）。
-    # 落地表「实付合计」只写人工填的数，没填留空，同步时据此提示「未扣优惠」。
-    paid_given = payload.paid_total not in (None, "")
-    paid = payload.paid_total if paid_given else total
+    # 实付总额（优惠后）：上面已校验必填
+    paid = payload.paid_total
     for inv in _state["invoices"]:
         if inv["filename"] == filename:
             # 先写落地表，成功后再标已确认。WPS 占用导致写入失败时保持未确认，
             # 避免网页显示已确认但 Excel 里没有这张单。
             try:
-                append_land(filename, payload.date, category, total,
-                            paid if paid_given else None, items)
+                append_land(filename, payload.date, category, total, paid, items)
             except PermissionError:
                 raise HTTPException(500, "落地文件被占用，请先关闭 WPS 后重试")
             except Exception as e:

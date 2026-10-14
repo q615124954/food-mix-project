@@ -3,7 +3,7 @@
 
 - 员工餐判定：物料表里没有的品名，或位于票面员工分区之后；海底捞固定算员工餐。
 - 员工餐行不调 map_product_code（大模型），不写日物料。
-- 员工餐 sheet：D = 实付 − 日物料（明细），H = 日物料，I = 实付；没填实付按明细加总并提示「未扣优惠」。
+- 员工餐 sheet：D = 实付 − 日物料（明细），H = 日物料，I = 实付；实付在复核页必填，没填不能确认。
 
 OCR 原文来自 samples/gold/ocr/（真实 HunyuanOCR 返回）。8/12 员工区被阴影遮住没认出来，
 测试里按「人工补录」示例补 3 行（猪肝 18、笋瓜 14、五花肉 21，用户尚未核对，只用于测试）。
@@ -244,14 +244,27 @@ class EndToEnd(_GoldEnv):
         self.assertEqual(got, want)
         self.assertFalse(any(name == "生抽" for (_d, name) in got))
 
-    def test_no_paid_falls_back_with_hint(self):
-        results, _ = self._sync({})
-        got = self._staff_sheet()
-        # 明细加总：8/11 141−100=41，8/12 71+53−58=66，8/13 212−167=45
-        self.assertEqual(got, {"11": (41, 100, 141), "12": (66, 58, 124), "13": (45, 167, 212)})
-        tips = [r["理由"] for r in results if r.get("目标品名") == "员工餐" and r.get("来源") == "mapping"]
-        self.assertEqual(len(tips), 3)
-        self.assertTrue(all("未扣优惠" in t for t in tips))
+    def test_confirm_without_paid_rejected(self):
+        """实付必须手填：没填实付确认被拒，落地表不写"""
+        from fastapi import HTTPException
+        old_save = webapp.save_state
+        webapp.save_state = lambda: None
+        self.addCleanup(setattr, webapp, "save_state", old_save)
+        items, _ = _ocr_items("11")
+        webapp._state = {"invoices": [{"filename": "receipt_2026-08-11.jpg", "status": "pending",
+                                       "ocr_done": True, "items": items}]}
+        payload = webapp.ConfirmPayload(date="2026-08-11", category="蔬菜", items=items)
+        with self.assertRaises(HTTPException) as ctx:
+            webapp.confirm("receipt_2026-08-11.jpg", payload)
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("实付", ctx.exception.detail)
+        self.assertFalse(os.path.exists(webapp.land_file()))
+        self.assertEqual(webapp._state["invoices"][0]["status"], "pending")
+        # 填了实付就能确认落地，实付写进落地表
+        payload = webapp.ConfirmPayload(date="2026-08-11", category="蔬菜", items=items, paid_total=140)
+        self.assertEqual(webapp.confirm("receipt_2026-08-11.jpg", payload), {"ok": True})
+        ws = load_workbook(webapp.land_file()).active
+        self.assertEqual(ws.cell(2, 9).value, 140)
 
 
 if __name__ == "__main__":

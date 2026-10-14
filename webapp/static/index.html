@@ -135,7 +135,7 @@
         </div>
         <div class="totalbar">
           <div>合计：¥<span class="val" id="total-val">0.00</span></div>
-          <div class="paid">实付总额(优惠后) ¥<input id="fld-paid" type="number" step="0.01" min="0" placeholder="默认=明细合计"><span class="paid-hint" id="paid-hint"></span></div>
+          <div class="paid">实付总额(优惠后) ¥<input id="fld-paid" type="number" step="0.01" min="0" placeholder="必填，按票面实付"><span class="paid-hint" id="ocr-total-ref"></span><span class="paid-hint" id="paid-hint"></span></div>
         </div>
         <div class="hint">修改数量或金额时，单价自动 = 金额 ÷ 数量；也可直接改单价。<button type="button" class="gray" id="btn-add-staff">＋补录员工餐行</button></div>
       </div>
@@ -238,8 +238,13 @@ function renderCurrent() {
   if (cw) cw.style.display = catSel.value ? 'none' : 'inline';
   const paidInp = document.getElementById('fld-paid');
   if (paidInp) {
-    const v = inv.paid_total != null ? inv.paid_total : inv.order_total;
-    paidInp.value = (v != null && v !== '') ? v : '';
+    // 实付必须人工按票面填写：只回显已确认过的实付，不拿 OCR 合计预填
+    paidInp.value = (inv.paid_total != null && inv.paid_total !== '') ? inv.paid_total : '';
+  }
+  const ocrRef = document.getElementById('ocr-total-ref');
+  if (ocrRef) {
+    const ot = inv.order_total;
+    ocrRef.textContent = (ot != null && ot !== '') ? `（OCR 认出合计 ¥${ot}，仅供参考）` : '（OCR 未认出合计）';
   }
   recomputeTotal();
   document.getElementById('tbl-title').textContent = inv.filename;
@@ -387,6 +392,12 @@ async function submitConfirm() {
   const category = document.getElementById('fld-category').value;
   if (!category) {
     toast('请先选择类别（不会默认成蔬菜）', true);
+    return;
+  }
+  if (paidValue() == null) {
+    toast('请对照票面填写实付总额（优惠后）再确认', true);
+    const p = document.getElementById('fld-paid');
+    if (p) p.focus();
     return;
   }
   const payload = {
