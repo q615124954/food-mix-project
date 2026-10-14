@@ -47,6 +47,10 @@ _legal_names = set()
 _legal_name_list = []
 # 合法品名单位映射 {品名: 单位}，用于阶段2单位辅助匹配
 _legal_units = {}
+# 合法品名 → 物料代码（日物料采购 B 列）。确认回流时跟别名一起记下。
+_legal_codes = {}
+# 物料明细表这次没加载成功的说明；空字符串表示没配置或已加载。
+_catalog_error = ""
 # 品名各日期单价 {品名: {Excel日期序列号: 金额÷数量}}，来自物料表，用于数量/金额存疑判定
 _hist_prices = {}
 # 剔除离群值：与中位数相差超过这个倍数的历史单价不参与（如原表把 5.8 斤记成 58 斤）
@@ -131,39 +135,90 @@ def normalize_pin(name):
 
 def load_legal_names():
     """从物料明细表的「日物料采购」sheet 读取合法品名（每次路径变更/启动时刷新）。
-    同时维护：归一化集合（归属判定）+ 原始品名有序列表（模糊匹配候选集）+ 单位映射。"""
-    global _legal_names, _legal_name_list, _legal_units, _hist_prices
+    同时维护：归一化集合（归属判定）+ 原始品名有序列表（模糊匹配候选集）+ 单位映射 + 物料代码。
+
+    路径没填不算失败（沿用「不按品名判员工餐」）。路径填了但文件缺失、打不开、
+    没有「日物料采购」或读不到品名：记下 _catalog_error，清空品名表，复核页直接显示。
+    """
+    global _legal_names, _legal_name_list, _legal_units, _hist_prices, _legal_codes, _catalog_error
     _legal_names = set()
     _legal_name_list = []
     _legal_units = {}
     _hist_prices = {}
-    material = _paths.get("material_file", "")
-    if not material or not os.path.exists(material):
+    _legal_codes = {}
+    _catalog_error = ""
+    material = _paths.get("material_file", "") or ""
+    if not material:
+        return
+    if not os.path.exists(material):
+        _catalog_error = (
+            f"物料明细表加载失败：文件不存在（{material}）。"
+            "已暂停按品名归员工餐，请检查物料明细表后重新应用路径。"
+        )
         return
     try:
         from openpyxl import load_workbook
         wb = load_workbook(material, read_only=True, data_only=True)
-        if "日物料采购" in wb.sheetnames:
-            ws = wb["日物料采购"]
-            # read_only 模式下 ws.cell 逐格随机访问很慢，历史单价一次性按行读出
-            header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
-            row_vals = {i: row for i, row in enumerate(
-                ws.iter_rows(min_row=3, values_only=True), start=3)}
-            for r in range(3, ws.max_row + 1):
-                v = ws.cell(r, 4).value
-                if v and str(v).strip():
-                    raw = str(v).strip()
-                    _legal_name_list.append(raw)
-                    _legal_names.add(normalize_pin(raw))
-                    unit = str(ws.cell(r, 5).value or "").strip()
-                    if unit:
-                        _legal_units[raw] = unit
-                    hp = _row_day_prices(header, row_vals.get(r, ()))
-                    if hp:
-                        _hist_prices[raw] = hp
+        if "日物料采购" not in wb.sheetnames:
+            wb.close()
+            _catalog_error = (
+                "物料明细表加载失败：缺少「日物料采购」表。"
+                "已暂停按品名归员工餐，请检查物料明细表后重新应用路径。"
+            )
+            return
+        ws = wb["日物料采购"]
+        # read_only 模式下 ws.cell 逐格随机访问很慢，历史单价一次性按行读出
+        header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
+        row_vals = {i: row for i, row in enumerate(
+            ws.iter_rows(min_row=3, values_only=True), start=3)}
+        for _r, vals in row_vals.items():
+            v = vals[3] if len(vals) > 3 else None
+            if v and str(v).strip():
+                raw = str(v).strip()
+                _legal_name_list.append(raw)
+                _legal_names.add(normalize_pin(raw))
+                unit = str(vals[4] or "").strip() if len(vals) > 4 and vals[4] else ""
+                if unit:
+                    _legal_units[raw] = unit
+                code = str(vals[1] or "").strip() if len(vals) > 1 and vals[1] else ""
+                if code:
+                    _legal_codes[raw] = code
+                hp = _row_day_prices(header, vals)
+                if hp:
+                    _hist_prices[raw] = hp
         wb.close()
     except Exception:
-        pass
+        _legal_names = set()
+        _legal_name_list = []
+        _legal_units = {}
+        _hist_prices = {}
+        _legal_codes = {}
+        _catalog_error = (
+            "物料明细表加载失败：文件已损坏或无法读取。"
+            "已暂停按品名归员工餐，请检查物料明细表后重新应用路径。"
+        )
+        return
+    if not _legal_name_list:
+        _catalog_error = (
+            "物料明细表加载失败：没有读到品名。"
+            "已暂停按品名归员工餐，请检查「日物料采购」后重新应用路径。"
+        )
+
+
+def catalog_status_messages():
+    """复核页要展示的加载失败。物料表没配路径时不报；变体表读失败必报。"""
+    msgs = []
+    if _catalog_error:
+        msgs.append(_catalog_error)
+    variant_err = name_match.variants_load_error()
+    if variant_err:
+        msgs.append(variant_err)
+    return msgs
+
+
+def matching_paused():
+    """物料表或变体表没加载成功。此时不能按「不在表里」把行打成员工餐。"""
+    return bool(_catalog_error) or bool(name_match.variants_load_error())
 
 
 def _date_key(v):
@@ -220,25 +275,36 @@ STAFF = "员工餐"
 MATERIAL = "物料"
 
 
-def classify_item(name, category, in_staff_zone=False):
+def classify_item(name, category, in_staff_zone=False, suggestion=""):
     """行级归属，返回 (归属, 归属依据, 是否需人工确认)。
 
     规则（用户已确认）：
     - 海底捞固定算员工餐；
     - 7 列蔬菜单上位于员工分区之后（物料小计 /「员工：」之后）→ 员工餐；
       若这行品名恰好在物料表里，仍按员工区归员工餐，但提示人工确认；
-    - 物料段里品名不在物料表 → 默认员工餐，提示人工确认（可能是新物料）；
-    - 其余 → 物料。肉类单全部算物料。没加载物料表时不按品名判，避免全部被当成员工餐。"""
+    - 物料段里品名不在物料表、且匹配分很低 → 默认员工餐，提示人工确认（可能是新物料）；
+    - 中分只建议一个标准名时，先不要打成员工餐，等人确认是不是这个物料；
+    - 其余 → 物料。肉类单全部算物料。
+    物料表或变体表没加载成功时，不按品名把行打成员工餐（员工区和海底捞仍算）。"""
     nm = str(name or "").strip()
     if is_staff_meal_only(nm):
         return STAFF, "海底捞固定计员工餐", False
     if category not in (None, "", "蔬菜"):
+        return MATERIAL, "", False
+    if matching_paused():
+        if in_staff_zone:
+            return STAFF, "位于票面员工分区之后", False
         return MATERIAL, "", False
     legal = bool(nm) and normalize_pin(nm) in _legal_names
     if in_staff_zone:
         if legal:
             return STAFF, "位于票面员工分区之后（该品名在物料表里，请确认是否员工餐）", True
         return STAFF, "位于票面员工分区之后", False
+    if legal:
+        return MATERIAL, "", False
+    sug = str(suggestion or "").strip()
+    if sug and normalize_pin(sug) in _legal_names:
+        return MATERIAL, f"模糊匹配建议「{sug}」，请确认", True
     if nm and _legal_names and not legal:
         return STAFF, "物料段品名不在物料表，默认计员工餐（请确认是否新物料）", True
     return MATERIAL, "", False
@@ -249,7 +315,10 @@ def assign_attribution(items, category=None):
     for it in items:
         cat = category if category not in (None, "") else (it.get("类别") or "蔬菜")
         zone = bool(it.get("员工区"))
-        attr, why, need = classify_item(it.get("品名", ""), cat, zone)
+        suggestion = ""
+        if it.get("匹配动作") == "suggest":
+            suggestion = str(it.get("建议品名") or "").strip()
+        attr, why, need = classify_item(it.get("品名", ""), cat, zone, suggestion)
         it["归属"] = attr
         it["归属依据"] = why
         it["归属待确认"] = need
@@ -297,6 +366,38 @@ def collect_valid_names():
     names.update(_legal_names)
     names.discard("")
     return names
+
+
+def resolve_catalog_name(name):
+    """确认后的品名若是物料表里的标准名，返回 (标准名, 物料代码)；否则 (None, "")。"""
+    text = str(name or "").strip()
+    if not text:
+        return None, ""
+    norm = normalize_pin(text)
+    for raw in _legal_name_list:
+        if raw == text or normalize_pin(raw) == norm:
+            return raw, _legal_codes.get(raw, "")
+    return None, ""
+
+
+def remember_material_alias(category, wrong, right):
+    """把复核页确认的「OCR 名 → 标准名 / 物料代码」写进变体别名表。
+
+    只在右边是物料表标准名时写入。一个物料名改成另一个物料名不学（避免香菜↔香葱）。
+    海天/老抽 → 生抽 不学。变体表没加载成功时 add_variant 自己会拒绝写盘。
+    """
+    wrong = str(wrong or "").strip()
+    right = str(right or "").strip()
+    if not wrong or not right or wrong == right:
+        return False
+    if name_match.forbidden_auto_map(wrong, right):
+        return False
+    std, code = resolve_catalog_name(right)
+    if not std:
+        return False
+    if normalize_pin(wrong) in _legal_names and normalize_pin(wrong) != normalize_pin(std):
+        return False
+    return name_match.add_variant(category, std, wrong, code=code or None)
 
 
 def learn_name(category, wrong, right):
@@ -359,6 +460,8 @@ def compute_suspects(date, items):
     同时给每个 item 打上字段级存疑标记「品名存疑 / 数量存疑 / 金额存疑」，
     供前端在对应字段后显示红色感叹号，快速定位问题数据。"""
     suspects = []
+    for msg in catalog_status_messages():
+        suspects.append(msg)
     if not date:
         suspects.append("日期未识别")
     if not items:
@@ -408,9 +511,11 @@ def compute_suspects(date, items):
             not_legal = False
             if it.get("归属待确认"):
                 staff_confirm.append(nm)
-        sg = name_match.suggest(nm, _legal_name_list) if (
-            fmt_bad or not_legal or machine_fixed or it.get("归属待确认")) else None
-        it["品名存疑"] = fmt_bad or not_legal or machine_fixed or bool(sg)
+        # 分层匹配已经给出的中分建议优先保留；否则才查内置建议（腊肉→猪腱子肉）
+        preset = str(it.get("建议品名") or "").strip()
+        sg = preset or (name_match.suggest(nm, _legal_name_list) if (
+            fmt_bad or not_legal or machine_fixed or it.get("归属待确认")) else None)
+        it["品名存疑"] = fmt_bad or not_legal or machine_fixed or bool(sg) or it.get("匹配动作") == "suggest"
         it["建议品名"] = sg or ""
         if sg:
             suggest_tips.append(f"{nm}→{sg}")
@@ -500,33 +605,78 @@ def _count_missing_rows(rows):
 
 
 def apply_veg_name_correction(raw, unit=None, qty=None, amt=None):
-    """字典未命中时，用变体/拼音/单位给蔬菜品名纠错。
+    """字典未命中时，按分层规则给蔬菜品名纠错。
 
-    返回 (corrected, src)。src 为 fuzzy / needs_review / llm / ""。
+    返回 (corrected, src, suggestion, action)。
+    action 为 auto / suggest / llm / review / keep / paused。
     高分弱相似（香菜与香葱同首字母，单位再加成 0.9）不替换，src=needs_review。
+    只有 2～3 个中分接近时才调 LLM；单个中分只写入 suggestion，不改品名。
+    变体表或物料表没加载成功时原样返回，不在这里猜。
     """
-    if not _legal_name_list:
-        return raw, ""
-    best, conf, match_src, top = name_match.match(
+    if matching_paused() or not _legal_name_list:
+        return raw, "", "", "paused"
+    decision = name_match.layered_match(
         raw, _legal_name_list, category="蔬菜",
-        units=_legal_units, unit=unit)
-    adopted, review = name_match.correction_action(raw, best, conf, match_src)
-    if review:
-        return raw, name_match.REVIEW_SOURCE
-    if best and conf >= name_match.AUTO_CONF:
-        return adopted, "fuzzy"
-    if best and conf >= name_match.SUGGEST_CONF:
-        # 中置信歧义：LLM 在 top 候选里定夺（带数量/金额/单位上下文）
+        units=_legal_units, unit=unit, codes=_legal_codes)
+    action = decision["action"]
+    if action == "auto":
+        src = decision["source"]
+        if src in ("pinyin_exact", "fuzzy"):
+            src = "fuzzy"
+        return decision["name"], src, "", "auto"
+    if action == "review":
+        return raw, name_match.REVIEW_SOURCE, decision.get("suggestion") or "", "review"
+    if action == "llm":
+        # 只把这 2～3 个接近的中分候选交给模型，不把整张物料表塞进去
+        cands = decision.get("llm_candidates") or []
         try:
             mp = map_product_name(
-                raw, "蔬菜", [t[0] for t in top], "DeepSeek-V4-Pro",
+                raw, "蔬菜", cands, "DeepSeek-V4-Pro",
                 qty=qty, amt=amt,
                 candidate_units=_legal_units)
-            if mp.get("来源") in ("mapping", "ai") and mp.get("目标品名") in _legal_name_list:
-                return mp["目标品名"], "llm"
+            target = mp.get("目标品名")
+            if (mp.get("来源") in ("mapping", "ai") and target in cands
+                    and not name_match.forbidden_auto_map(raw, target)):
+                return target, "llm", "", "llm"
         except Exception:
-            pass  # LLM 失败则保留 OCR 原值，交人工
-    return raw, ""
+            pass  # LLM 失败则退回建议，不静默改名，也不当成员工餐
+        return raw, "suggest", decision.get("suggestion") or (cands[0] if cands else ""), "suggest"
+    if action == "suggest":
+        return raw, "suggest", decision.get("suggestion") or "", "suggest"
+    return raw, "", "", "keep"
+
+
+def correct_item_names(items):
+    """OCR 解析之后的品名层：字典 → 分层匹配。不调 OCR。
+
+    中分建议写在「建议品名」上，品名先留 OCR 原文，等人在复核页确认。
+    """
+    for it in items:
+        raw = it.get("品名", "")
+        cat = it.get("类别") or "蔬菜"
+        corrected, hit = core.correct_name(raw, cat, _name_dict)
+        if hit and name_match.forbidden_auto_map(raw, corrected):
+            hit = False
+            corrected = raw
+        suggestion = ""
+        action = ""
+        if hit:
+            src = "dict"
+        elif cat == "蔬菜" and raw and _legal_name_list and not matching_paused():
+            corrected, src, suggestion, action = apply_veg_name_correction(
+                raw, unit=it.get("单位"), qty=it.get("数量"), amt=it.get("金额"))
+        else:
+            corrected, src = raw, ""
+        it["原品名"] = raw
+        it["品名"] = corrected
+        it["纠正来源"] = src
+        if suggestion:
+            it["建议品名"] = suggestion
+        if action == "suggest" or src == "suggest":
+            it["匹配动作"] = "suggest"
+        elif action:
+            it["匹配动作"] = action
+    return items
 
 
 def ocr_one(filename):
@@ -552,17 +702,7 @@ def ocr_one(filename):
     order_total = core.extract_order_total(rows)
     for it in items:
         it["日期"] = date
-        raw = it.get("品名", "")
-        cat = it.get("类别", "蔬菜")
-        corrected, _ = core.correct_name(raw, cat, _name_dict)
-        src = "dict" if corrected != raw else ""
-        # 纠错字典未命中时，对蔬菜走「变体表+拼音+单位」模糊匹配（阶段1+2）
-        if corrected == raw and cat == "蔬菜" and _legal_name_list:
-            corrected, src = apply_veg_name_correction(
-                raw, unit=it.get("单位"), qty=it.get("数量"), amt=it.get("金额"))
-        it["原品名"] = raw
-        it["品名"] = corrected
-        it["纠正来源"] = src
+    correct_item_names(items)
     suspects = compute_suspects(date, items)
     missing = _count_missing_rows(rows)
     staff_missing = core.count_staff_zone_missing(rows)
@@ -833,11 +973,13 @@ def map_product_code(raw_name, category, name_code, model, qty=None, amt=None):
     返回 dict：物料代码 / 目标品名 / 置信度 / 理由 / 来源。
     来源=="ai" 且置信度>=0.8 时写回 code_map 持久化，供重复同步零 LLM 复用。"""
     code_map_cat = _code_map.get(category, {})
-    # 1) code_map 命中（且代码仍在当前候选 sheet 中）
+    # 1) code_map 命中（且代码仍在当前候选 sheet 中）。海天/老抽→生抽 的旧映射不沿用。
     if raw_name in code_map_cat and code_map_cat[raw_name] in set(name_code.values()):
         code = code_map_cat[raw_name]
-        return {"物料代码": code, "目标品名": _code_name_lookup(code, name_code),
-                "置信度": 1.0, "理由": "代码映射表命中", "来源": "code_map"}
+        target_name = _code_name_lookup(code, name_code)
+        if not name_match.forbidden_auto_map(raw_name, target_name):
+            return {"物料代码": code, "目标品名": target_name,
+                    "置信度": 1.0, "理由": "代码映射表命中", "来源": "code_map"}
     # 2) 品名精确/归一化命中候选标准品名
     if raw_name in name_code:
         return {"物料代码": name_code[raw_name], "目标品名": raw_name,
@@ -848,14 +990,31 @@ def map_product_code(raw_name, category, name_code, model, qty=None, amt=None):
         if normalize_pin(c) == norm:
             return {"物料代码": name_code[c], "目标品名": c,
                     "置信度": 1.0, "理由": "品名归一化匹配", "来源": "exact"}
-    # 3) name_match 本地召回 top5 候选，缩短 prompt 后喂 LLM
+    # 3) 本地分层：固定别名或高分直接定，不调 LLM。只有中分难分才把 top 交给模型。
     top_names = candidates[:5]
     try:
-        _best, _conf, _src, top = name_match.match(raw_name, candidates, category=category)
-        if top:
-            top_names = [t[0] for t in top]
+        decision = name_match.layered_match(
+            raw_name, candidates, category=category, codes=name_code)
+        if decision["action"] == "auto" and decision["name"] in name_code:
+            code = name_code[decision["name"]]
+            return {"物料代码": code, "目标品名": decision["name"],
+                    "置信度": decision["confidence"], "理由": "本地别名或高分匹配",
+                    "来源": decision["source"]}
+        if decision["action"] == "llm" and decision.get("llm_candidates"):
+            top_names = decision["llm_candidates"]
+        elif decision.get("suggestion"):
+            top_names = [decision["suggestion"]]
+        else:
+            _best, _conf, _src, top = name_match.match(
+                raw_name, candidates, category=category, codes=name_code)
+            if top:
+                top_names = [t[0] for t in top if t[1] > 0] or top_names
     except Exception:
         pass
+    top_names = [n for n in top_names if n and not name_match.forbidden_auto_map(raw_name, n)]
+    if not top_names:
+        return {"物料代码": "", "目标品名": raw_name, "置信度": 0.0,
+                "理由": "海天/老抽不能自动归到生抽", "来源": "ai_invalid"}
     cand_str = "、".join(top_names)
     system = (
         "你是餐饮采购品名归并助手。把采购单上的品名归并到给定的标准品名之一。"
@@ -899,6 +1058,9 @@ def map_product_code(raw_name, category, name_code, model, qty=None, amt=None):
         conf = float(obj.get("置信度", 0))
     except (TypeError, ValueError):
         conf = 0.0
+    if name_match.forbidden_auto_map(raw_name, target):
+        return {"物料代码": "", "目标品名": raw_name, "置信度": 0.0,
+                "理由": "海天/老抽不能自动归到生抽", "来源": "ai_invalid"}
     code = name_code[target]
     # 高置信 LLM 归并写回持久化（一次归并永久复用）
     if conf >= 0.8:
@@ -1379,6 +1541,7 @@ async def lifespan(app: FastAPI):
     load_name_map()
     load_code_map()
     load_legal_names()
+    name_match.load_variants()
     load_state()
     build_invoice_index()
     threading.Thread(target=ocr_worker, daemon=True).start()
@@ -1423,6 +1586,7 @@ def get_state():
         "summary": {"total": total, "ocr_done": ocr_done, "confirmed": confirmed},
         "paths": {"input_dir": _paths["input_dir"], "output_dir": _paths["output_dir"],
                   "material_file": _paths["material_file"]},
+        "catalog_errors": catalog_status_messages(),
     }
 
 
@@ -1462,10 +1626,18 @@ def confirm(filename: str, payload: ConfirmPayload):
     items = [normalize_item(it, category) for it in payload.items]
     # 归属以确认时的最终品名重新判定（人工改过品名也生效）；员工区标记来自识别或人工补录
     assign_attribution(items, category)
-    # 回流学习：仅当用户手动编辑过品名时，才把「OCR 原品名 → 确认后品名」写入纠错字典
+    # 回流学习：用户在复核页把 OCR 名改成物料标准名并确认后，写入纠错字典和别名表
+    # （带物料代码）。下次同类票同一 OCR 名走固定别名，不再靠模糊分。
+    # 海天/老抽 → 生抽 不学习。
     for it in items:
-        if it.get("品名编辑"):
-            learn_name(category, it.get("原品名", ""), it.get("品名", ""))
+        if not it.get("品名编辑"):
+            continue
+        raw_name = it.get("原品名", "")
+        right_name = it.get("品名", "")
+        if name_match.forbidden_auto_map(raw_name, right_name):
+            continue
+        learn_name(category, raw_name, right_name)
+        remember_material_alias(category, raw_name, right_name)
     # code_map 联动：本次确认的全部品名集合之外/品名被改动的旧映射条目失效，
     # 避免人工纠正品名后，旧的「旧品名→代码」映射继续误同步到新单据。
     confirmed_names = {str(it.get("品名", "")).strip() for it in items}
@@ -1531,6 +1703,7 @@ def set_paths(payload: PathsPayload):
         _state = {"invoices": []}
     save_settings()
     load_legal_names()
+    name_match.load_variants()
     try:
         if os.path.exists(STATE_FILE):
             os.remove(STATE_FILE)
@@ -1543,6 +1716,9 @@ def set_paths(payload: PathsPayload):
 
 @app.post("/api/rescan")
 def rescan():
+    # 变体表或物料表修好之后，重新扫描会再读一次，复核页上的加载失败随之消失
+    load_legal_names()
+    name_match.load_variants()
     build_invoice_index()
     threading.Thread(target=ocr_worker, daemon=True).start()
     return {"ok": True}
@@ -1559,6 +1735,8 @@ def reset():
             os.remove(STATE_FILE)
     except OSError:
         pass
+    load_legal_names()
+    name_match.load_variants()
     build_invoice_index()
     threading.Thread(target=ocr_worker, daemon=True).start()
     return {"ok": True}
