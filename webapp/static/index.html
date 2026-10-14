@@ -542,12 +542,18 @@ async function doSync() {
 
 function renderSyncResult(data) {
   const rows = (data.results || []).map(it => {
-    let cls = 'ok', conf = it['置信度'];
-    if (conf == null) conf = '';
-    if (it['来源'] === 'error' || it['来源'] === 'ai_error' || it['来源'] === 'ai_invalid') cls = 'err';
-    else if (conf < 0.9) cls = 'warn';
+    const raw = it['置信度'];
+    const noScore = raw == null || raw === '';
+    let cls = 'ok';
+    let conf = raw;
+    if (noScore) {
+      // 没跑匹配（真员工餐 / 员工区 / 人工改名）不显示 0 或 1。
+      conf = it['来源'] === 'staff_meal' ? 'N/A' : '';
+      cls = '';
+    } else if (it['来源'] === 'error' || it['来源'] === 'ai_error' || it['来源'] === 'ai_invalid') cls = 'err';
+    else if (Number(raw) < 0.9) cls = 'warn';
     return '<tr><td>' + esc(it['日期'] || '') + '</td><td>' + esc(it['落地品名']) +
-      '</td><td>' + esc(it['目标品名'] || '') + '</td><td class="' + cls + '">' + conf +
+      '</td><td>' + esc(it['目标品名'] || '') + '</td><td class="' + cls + '">' + esc(conf) +
       '</td><td>' + esc(it['理由'] || '') + '</td></tr>';
   }).join('');
   document.getElementById('sync-meta').textContent =
