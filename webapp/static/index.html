@@ -62,6 +62,7 @@
   .tag-staff.confirm { background: #ef4444; }
   .field-warn { color: #ef4444; font-weight: bold; margin-left: 3px; flex-shrink: 0; cursor: help; }
   .empty { padding: 30px; text-align: center; color: #999; font-size: 13px; }
+  .catalog-alert { display: none; margin: 0; padding: 10px 16px; background: #fef2f2; color: #b91c1c; border-bottom: 1px solid #fecaca; font-size: 13px; line-height: 1.5; white-space: pre-wrap; }
   .totalbar { padding: 10px 14px; font-size: 15px; font-weight: 600; border-top: 1px solid #eee; }
   .totalbar .val { color: #2563eb; }
   .totalbar .paid { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 14px; font-weight: 600; }
@@ -123,6 +124,7 @@
       <button type="button" class="gray" id="btn-rescan">重新扫描</button>
       <button type="button" class="gray" id="btn-reset">重置</button>
     </div>
+    <div id="catalog-alert" class="catalog-alert"></div>
     <div class="content">
       <div class="img-panel" id="img-panel"><div class="empty">加载中…</div></div>
       <div class="table-panel">
@@ -168,9 +170,23 @@ async function refresh() {
   state = data;
   if (cur < 0 && state.invoices.length > 0) cur = 0;
   renderPaths(data.paths);
+  renderCatalogAlert();
   renderSummary();
   renderList();
   renderCurrent();
+}
+
+function renderCatalogAlert() {
+  const el = document.getElementById('catalog-alert');
+  if (!el) return;
+  const errs = state.catalog_errors || [];
+  if (!errs.length) {
+    el.style.display = 'none';
+    el.textContent = '';
+    return;
+  }
+  el.style.display = 'block';
+  el.textContent = errs.join('\n');
 }
 
 function renderPaths(p) {

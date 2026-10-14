@@ -56,7 +56,7 @@ class NameMatchConfusableTests(unittest.TestCase):
         # 候选里没有香菜，但保留下来的原名仍视为合法，存疑只能来自提示标志
         self._use_catalog(candidates)
         webapp._legal_names.add(webapp.normalize_pin("香菜"))
-        corrected, src = webapp.apply_veg_name_correction("香菜", unit="斤")
+        corrected, src, _suggestion, _action = webapp.apply_veg_name_correction("香菜", unit="斤")
         self.assertEqual(corrected, "香菜")
         self.assertNotEqual(corrected, "香葱")
         self.assertEqual(src, name_match.REVIEW_SOURCE)
@@ -89,7 +89,7 @@ class NameMatchConfusableTests(unittest.TestCase):
         self.assertNotEqual(source, name_match.REVIEW_SOURCE)
 
         self._use_catalog(["芥蓝"])
-        corrected, src = webapp.apply_veg_name_correction("芥兰", unit="斤")
+        corrected, src, _suggestion, _action = webapp.apply_veg_name_correction("芥兰", unit="斤")
         self.assertEqual(corrected, "芥蓝")
         self.assertEqual(src, "fuzzy")
         item = {"品名": corrected, "纠正来源": src, "勾稽": ""}
