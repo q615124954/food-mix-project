@@ -169,7 +169,11 @@ class StaffMealUnlandedTest(unittest.TestCase):
         self.assertEqual(got["员工餐"], 40)
         self.assertNotIn("海底捞", [name for name, _cat in self.calls])
 
-        # 再同步一次仍然是 50/40，海底捞行不被写上
+        # 成功同步会删掉中间表。用同一份落地表再写一次，确认不会把 50/40 加成 100/80。
+        _build_land(os.path.join(webapp._paths["output_dir"], webapp.LAND_FILENAME), [
+            (DATE, "蔬菜", "青菜", 5, 10, 50, "veg.jpg", 90, 90),
+            (DATE, "蔬菜", "海底捞", 1, 40, 40, "veg.jpg", 90, 90),
+        ])
         webapp.sync_to_material("unused-model")
         got = self._read()
         self.assertEqual(got["青菜"], (5, 50))
