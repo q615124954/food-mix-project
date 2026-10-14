@@ -261,10 +261,17 @@ class TentativeStaffMatch(_Env):
         try:
             hit = webapp.match_tentative_to_catalog(
                 "海天老抽", "蔬菜", ["生抽"], {"生抽": "S-SOY"}, "m")
+            detail = webapp.describe_tentative_match(
+                "海天老抽", "蔬菜", ["生抽"], {"生抽": "S-SOY"}, "m")
         finally:
             name_match.layered_match = layered_restore(self)
         self.assertIsNone(hit)
         self.assertEqual(self.llm_calls, [])
+        self.assertFalse(detail["land"])
+        self.assertAlmostEqual(detail["置信度"], 0.99)
+        self.assertIn("未调用大模型", detail["理由"])
+        self.assertIn("生抽", detail["理由"])
+        self.assertNotIn("低于", detail["理由"])
 
         self._sync([("海天老抽", 1, 13, "员工餐?", False, False)])
         got = self._read()
@@ -292,6 +299,131 @@ class TentativeStaffMatch(_Env):
         ws = load_workbook(webapp.land_file()).active
         self.assertEqual(ws.cell(2, 3).value, "大蒜头")
         self.assertEqual(ws.cell(2, 10).value, "员工餐")
+
+    def _add_product(self, code, name):
+        wb = load_workbook(self.material)
+        veg = wb["日物料采购"]
+        row = veg.max_row + 1
+        veg.cell(row, 2, code)
+        veg.cell(row, 4, name)
+        veg.cell(row, 5, "斤")
+        veg.cell(row, 6, 99)
+        veg.cell(row, 8, 999)
+        wb.save(self.material)
+        wb.close()
+
+    def test_mid_score_suggestion_keeps_real_confidence(self):
+        """腱子肉对猪腱子肉约 0.86：只建议、不落地，结果表记这个分数，而不是 0 / 低于 0.8。"""
+        self._add_product("M-PORK", "猪腱子肉")
+        catalog = ["蒜头", "去皮蒜米", "生抽", "青菜", "猪腱子肉"]
+        expected = name_match.layered_match("腱子肉", catalog, category="蔬菜")
+        self.assertEqual(expected["action"], "suggest")
+        self.assertGreater(expected["confidence"], 0.84)
+        self.assertLess(expected["confidence"], 0.88)
+        results, _backup = self._sync([("腱子肉", 1, 16, "员工餐?", False, False)])
+        row = _product_result(results, "腱子肉")
+        self.assertAlmostEqual(row["置信度"], expected["confidence"])
+        self.assertEqual(row["目标品名"], "员工餐")
+        self.assertIn("猪腱子肉", row["理由"])
+        self.assertIn("建议", row["理由"])
+        self.assertIn("未调用大模型", row["理由"])
+        self.assertNotIn("低于", row["理由"])
+        self.assertNotIn("未达到同步置信度", row["理由"])
+        self.assertEqual(self.llm_calls, [])
+        got = self._read()
+        self.assertEqual(got["员工餐"], 16)
+        self.assertEqual(got["日物料"], 0)
+        wb = load_workbook(self.material, data_only=True)
+        self.assertEqual(_cell(wb["日物料采购"], "猪腱子肉"), (99, 999))
+        wb.close()
+
+    def test_success_records_score_that_caused_landing(self):
+        """别名落地记 0.95，模型落地记模型分；本来就精确的品名才记 1。"""
+        results, _backup = self._sync([
+            ("大蒜头", 3, 18, "员工餐?", False, False),
+            ("怪蒜", 2, 12, "员工餐?", False, False),
+            ("青菜", 1, 8, "物料", False, False),
+        ])
+        garlic = _product_result(results, "大蒜头")
+        self.assertEqual(garlic["目标品名"], "蒜头")
+        self.assertAlmostEqual(garlic["置信度"], 0.95)
+        self.assertNotEqual(garlic["置信度"], 1)
+        self.assertIn("别名", garlic["理由"])
+        model_hit = _product_result(results, "怪蒜")
+        self.assertEqual(model_hit["目标品名"], "蒜头")
+        self.assertAlmostEqual(model_hit["置信度"], 0.91)
+        self.assertNotEqual(model_hit["置信度"], 1)
+        exact = _product_result(results, "青菜")
+        self.assertEqual(exact["目标品名"], "青菜")
+        self.assertEqual(exact["置信度"], 1)
+        self.assertIn("精确", exact["理由"])
+
+    def test_llm_below_threshold_records_model_score(self):
+        results, _backup = self._sync([("怪蒜低", 1, 4, "员工餐?", False, False)])
+        row = _product_result(results, "怪蒜低")
+        self.assertAlmostEqual(row["置信度"], 0.5)
+        self.assertEqual(row["目标品名"], "员工餐")
+        self.assertIn("大模型", row["理由"])
+        self.assertIn("0.5", row["理由"])
+        self.assertIn("0.8", row["理由"])
+        self.assertNotIn("未达到同步置信度", row["理由"])
+        self.assertEqual(self._read()["员工餐"], 4)
+        self.assertEqual(self._read()["蒜头"], (99, 999))
+
+    def test_no_close_candidate_is_not_blanket_below_threshold(self):
+        results, _backup = self._sync([("野草", 1, 7, "员工餐?", False, False)])
+        row = _product_result(results, "野草")
+        expected = name_match.layered_match(
+            "野草", ["蒜头", "去皮蒜米", "生抽", "青菜"], category="蔬菜")
+        self.assertEqual(expected["action"], "keep")
+        self.assertAlmostEqual(row["置信度"], expected["confidence"])
+        self.assertIn("没有接近的候选", row["理由"])
+        self.assertIn("未调用大模型", row["理由"])
+        self.assertNotIn("低于", row["理由"])
+        self.assertEqual(self.llm_calls, [])
+
+    def test_blocked_soy_keeps_rejected_score(self):
+        results, _backup = self._sync([("海天老抽", 1, 13, "员工餐?", False, False)])
+        row = _product_result(results, "海天老抽")
+        self.assertAlmostEqual(row["置信度"], 0.99)
+        self.assertEqual(row["目标品名"], "员工餐")
+        self.assertIn("生抽", row["理由"])
+        self.assertIn("未采纳", row["理由"])
+        self.assertNotIn("低于", row["理由"])
+        self.assertEqual(self._read()["生抽"], (99, 999))
+        self.assertEqual(self._read()["员工餐"], 13)
+
+    def test_skipped_match_confidence_stays_blank(self):
+        """真员工餐、员工区、人工改名不跑匹配，置信度留空，不填 0 或 1。"""
+        results, _backup = self._sync([
+            ("海底捞", 1, 40, "员工餐", False, False),
+            ("五花肉", 1, 21, "员工餐?", False, True),
+            ("大蒜头", 3, 18, "员工餐?", True, False),
+            ("青菜", 2, 10, "员工餐", False, False),
+        ])
+        haidilao = _product_result(results, "海底捞")
+        zone = _product_result(results, "五花肉")
+        edited = _product_result(results, "大蒜头")
+        confirmed = _product_result(results, "青菜")
+        self.assertIsNone(haidilao["置信度"])
+        self.assertIn("真员工餐", haidilao["理由"])
+        self.assertIn("海底捞", haidilao["理由"])
+        self.assertIsNone(zone["置信度"])
+        self.assertIn("员工区", zone["理由"])
+        self.assertIsNone(edited["置信度"])
+        self.assertIn("人工", edited["理由"])
+        self.assertIsNone(confirmed["置信度"])
+        self.assertIn("真员工餐", confirmed["理由"])
+        self.assertEqual(self._read()["蒜头"], (99, 999))
+        self.assertEqual(self._read()["青菜"], (99, 999))
+        self.assertEqual(self.llm_calls, [])
+
+
+def _product_result(results, name):
+    matched = [row for row in results if row.get("落地品名") == name]
+    if not matched:
+        raise AssertionError(name)
+    return matched[0]
 
 
 def layered_restore(env):

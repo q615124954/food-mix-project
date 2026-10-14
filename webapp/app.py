@@ -956,16 +956,18 @@ def map_product_name(raw_name, category, candidates, model, qty=None, price=None
     except Exception:
         return {"目标品名": raw_name, "置信度": 0.0, "理由": "AI返回无法解析", "来源": "ai_error"}
     target = str(obj.get("目标品名", "")).strip()
+    try:
+        conf = float(obj.get("置信度", 0))
+    except (TypeError, ValueError):
+        conf = 0.0
     # 容错：模型可能把单位"(斤)"带进品名，剥离括号后再匹配
     target_plain = re.sub(r"[（(].*?[)）]", "", target).strip()
     if target_plain in candidates:
         target = target_plain
     elif target not in candidates:
-        return {"目标品名": raw_name, "置信度": 0.0, "理由": f"目标不在候选集: {target}", "来源": "ai_invalid"}
-    try:
-        conf = float(obj.get("置信度", 0))
-    except (TypeError, ValueError):
-        conf = 0.0
+        # 置信度保留模型原分。拒绝品名留给员工餐? 判断是不是海天/老抽被拦住。
+        return {"目标品名": raw_name, "置信度": conf, "理由": f"目标不在候选集: {target}",
+                "来源": "ai_invalid", "拒绝品名": target}
     return {"目标品名": target, "置信度": conf, "理由": str(obj.get("理由", "")), "来源": "ai"}
 
 
@@ -1250,53 +1252,147 @@ def _in_candidates(name, candidates):
     return any(normalize_pin(c) == norm for c in candidates)
 
 
-def match_tentative_to_catalog(raw_name, category, candidates, name_code, model, qty=None, amt=None):
-    """员工餐? 才调用。走现有分层匹配；只有分层结果要求 LLM 时才调模型。
+def _as_conf(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
-    置信度达到 SYNC_CONF 且不是海天/老抽→生抽时，返回归并结果；否则 None（保持员工餐）。
+
+def _tentative_outcome(attempted, land, conf, reason, source="", action="", target="", suggestion=""):
+    return {
+        "attempted": attempted,
+        "land": land,
+        "目标品名": target,
+        "置信度": conf,
+        "来源": source,
+        "理由": reason,
+        "action": action,
+        "建议": suggestion,
+    }
+
+
+def _auto_land_reason(source):
+    if source in ("exact", "exact_strip"):
+        return "精确匹配"
+    if source in ("variant", "alias", "synonym"):
+        return "固定别名匹配"
+    return "本地高分匹配"
+
+
+def _blocked_soy_reason(called_model):
+    if called_model:
+        return "海天/老抽不能归到生抽，大模型结果未采纳，仍计入员工餐"
+    return "海天/老抽不能归到生抽，未调用大模型，仍计入员工餐"
+
+
+def describe_tentative_match(raw_name, category, candidates, name_code, model, qty=None, amt=None):
+    """员工餐? 的分层匹配。落地与否都带回真实分数和原因。
+
+    land 为真时调用方才改标准名并写入日物料。门槛仍是 SYNC_CONF，
+    中分只建议（哪怕高于 0.8、低于自动线 0.9）也不落地。
+    attempted 为假表示没跑匹配（没品名、没候选、物料表暂停、海底捞），置信度为 None。
     """
     raw_name = str(raw_name or "").strip()
     if not raw_name or not candidates or matching_paused() or is_staff_meal_only(raw_name):
-        return None
+        return _tentative_outcome(False, False, None, "")
     decision = name_match.layered_match(
         raw_name, list(candidates), category=category or "蔬菜",
         units=_legal_units, codes=name_code or None)
-    if name_match.forbidden_auto_map(raw_name, decision.get("name")):
-        return None
-    action = decision.get("action")
+    action = decision.get("action") or ""
+    source = decision.get("source") or ""
+    suggestion = str(decision.get("suggestion") or "").strip()
+    target = str(decision.get("name") or "").strip()
+    conf = _as_conf(decision.get("confidence"))
+
+    def stay(reason, conf_value=conf, source_name=source, action_name=action,
+             target_name=target, suggestion_name=suggestion):
+        return _tentative_outcome(
+            True, False, conf_value, reason, source_name, action_name, target_name, suggestion_name)
+
+    if source == "banned" or name_match.forbidden_auto_map(raw_name, target):
+        return stay(_blocked_soy_reason(False), source_name="banned", action_name=action or "keep")
+
     if action == "auto":
-        target = decision.get("name")
-        try:
-            conf = float(decision.get("confidence") or 0)
-        except (TypeError, ValueError):
-            conf = 0.0
         if (target and conf >= SYNC_CONF and not name_match.forbidden_auto_map(raw_name, target)
                 and _in_candidates(target, candidates)):
-            return {"目标品名": target, "置信度": conf, "来源": decision.get("source") or "variant",
-                    "理由": "本地别名或高分匹配"}
-        return None
+            return _tentative_outcome(
+                True, True, conf, _auto_land_reason(source), source or "variant", action, target, suggestion)
+        if not target or not _in_candidates(target, candidates):
+            return stay("分层匹配没有落在物料表候选上，未调用大模型，仍计入员工餐")
+        return stay(
+            f"分层匹配置信度 {conf:g} 低于同步门槛 {SYNC_CONF:g}，未写入日物料，仍计入员工餐")
+
+    if action == "suggest":
+        shown = suggestion if suggestion and suggestion != raw_name else ""
+        if shown:
+            reason = f"仅建议「{shown}」，中分未自动改名，未调用大模型，仍计入员工餐"
+        else:
+            reason = "仅建议，中分未自动改名，未调用大模型，仍计入员工餐"
+        return stay(reason, source_name=source or "suggest")
+
+    if action == "review":
+        if suggestion and suggestion != raw_name:
+            reason = f"弱相似只建议「{suggestion}」，未自动改名，未调用大模型，仍计入员工餐"
+        else:
+            reason = "弱相似未自动改名，未调用大模型，仍计入员工餐"
+        return stay(reason)
+
     if action != "llm" or not decision.get("llm_candidates"):
-        return None
+        return stay("没有接近的候选，未调用大模型，仍计入员工餐")
+
     cands = [c for c in decision["llm_candidates"] if c and not name_match.forbidden_auto_map(raw_name, c)]
     if not cands:
-        return None
+        return stay(_blocked_soy_reason(False))
     try:
         mp = map_product_name(
             raw_name, category or "蔬菜", cands, model,
             qty=qty, amt=amt, candidate_units=_legal_units)
     except Exception:
+        return stay("大模型调用失败，未写入日物料，仍计入员工餐")
+    llm_target = str(mp.get("目标品名") or "").strip()
+    llm_conf = _as_conf(mp.get("置信度"))
+    llm_source = mp.get("来源") or ""
+    llm_reason = str(mp.get("理由") or "")
+    rejected = str(mp.get("拒绝品名") or "").strip()
+    if rejected and name_match.forbidden_auto_map(raw_name, rejected):
+        return stay(
+            _blocked_soy_reason(True), conf_value=llm_conf, source_name="banned", target_name=rejected)
+    if name_match.forbidden_auto_map(raw_name, llm_target):
+        return stay(
+            _blocked_soy_reason(True), conf_value=llm_conf, source_name="banned", target_name=llm_target)
+    if llm_source in ("mapping", "ai") and llm_conf >= SYNC_CONF and _in_candidates(llm_target, candidates):
+        return _tentative_outcome(
+            True, True, llm_conf, llm_reason or "大模型归并", llm_source, "llm", llm_target, suggestion)
+    if llm_source in ("mapping", "ai") and llm_conf < SYNC_CONF:
+        return stay(
+            f"大模型置信度 {llm_conf:g} 低于同步门槛 {SYNC_CONF:g}，未写入日物料，仍计入员工餐",
+            conf_value=llm_conf, source_name=llm_source, target_name=llm_target)
+    why = llm_reason or "大模型结果不可用"
+    # 调用失败时 map_product_name 会把分数写成 0。结果表沿用分层分数，避免再冒充成 0。
+    shown = conf if llm_source in ("ai_error", "ai_invalid") else llm_conf
+    return stay(
+        f"大模型未给出可落地结果（{why}），仍计入员工餐",
+        conf_value=shown, source_name=llm_source or source, target_name=llm_target)
+
+
+def match_tentative_to_catalog(raw_name, category, candidates, name_code, model, qty=None, amt=None):
+    """员工餐? 才调用。达到同步门槛且不是海天/老抽→生抽时返回归并结果，否则 None。
+
+    失败原因和真实分数在 describe_tentative_match 里，不在这里丢掉。
+    """
+    detail = describe_tentative_match(
+        raw_name, category, candidates, name_code, model, qty=qty, amt=amt)
+    if not detail.get("land"):
         return None
-    target = str(mp.get("目标品名") or "").strip()
-    try:
-        conf = float(mp.get("置信度") or 0)
-    except (TypeError, ValueError):
-        conf = 0.0
-    if name_match.forbidden_auto_map(raw_name, target):
-        return None
-    if mp.get("来源") in ("mapping", "ai") and conf >= SYNC_CONF and _in_candidates(target, candidates):
-        return {"目标品名": target, "置信度": conf, "来源": mp.get("来源") or "ai",
-                "理由": str(mp.get("理由") or "")}
-    return None
+    return {
+        "目标品名": detail["目标品名"],
+        "置信度": detail["置信度"],
+        "来源": detail["来源"],
+        "理由": detail["理由"],
+    }
 
 
 def _persist_tentative_alias(category, raw, hit, code=""):
@@ -1348,27 +1444,49 @@ def _cache_sheet(twb, sheet_cache, sheet_name):
 
 
 def _promote_land_row(row, model, twb, sheet_cache):
-    """同步时把「员工餐?」再对一次目标表。成功则改写 row['name'] 并返回 True。"""
+    """同步时把「员工餐?」再对一次目标表。
+
+    返回 describe_tentative_match 的结果。落地时改写 row['name']，
+    并把导致落地的分数记在 row['promote_conf']。
+    改名之后的精确匹配会得到 1，那不是这次落地的分数。
+    """
     raw = row.get("name") or ""
     primary = CATEGORY_SHEET.get(row.get("cat"))
     alt = "日物料采购" if primary == "肉类采购" else ("肉类采购" if primary == "日物料采购" else None)
     sheets = [s for s in (primary, alt) if s and s in twb.sheetnames]
+    best_fail = None
     for sheet_name in sheets:
         try:
             _ws, _dates, _rows, _units, _codes, name_code = _cache_sheet(twb, sheet_cache, sheet_name)
         except Exception:
             continue
-        hit = match_tentative_to_catalog(
+        detail = describe_tentative_match(
             raw, row.get("cat"), list(name_code), name_code, model,
             qty=row.get("qty"), amt=row.get("amt"))
-        if not hit:
+        if detail.get("land"):
+            hit = {
+                "目标品名": detail["目标品名"],
+                "置信度": detail["置信度"],
+                "来源": detail["来源"],
+                "理由": detail["理由"],
+            }
+            code = name_code.get(hit["目标品名"], "")
+            _persist_tentative_alias(row.get("cat") or "蔬菜", raw, hit, code)
+            row["promoted_from"] = raw
+            row["name"] = hit["目标品名"]
+            row["promote_conf"] = detail["置信度"]
+            row["promote_reason"] = detail["理由"]
+            row["promote_source"] = detail["来源"]
+            return detail
+        if not detail.get("attempted"):
             continue
-        code = name_code.get(hit["目标品名"], "")
-        _persist_tentative_alias(row.get("cat") or "蔬菜", raw, hit, code)
-        row["promoted_from"] = raw
-        row["name"] = hit["目标品名"]
-        return True
-    return False
+        prev = None if best_fail is None else best_fail.get("置信度")
+        cur = detail.get("置信度")
+        if best_fail is None or (cur is not None and (prev is None or cur > prev)):
+            best_fail = detail
+    if best_fail:
+        return best_fail
+    return _tentative_outcome(False, False, None, "")
 
 
 def _numbers_equal(got, want):
@@ -1565,7 +1683,7 @@ def sync_to_material(model):
                 # 金额属于员工餐，但没有日期行可写，不能摊到其他日期。
                 # 落地品名留空：这不是物料写入成功记录，避免被当成已经落表。
                 results.append({"日期": "", "落地品名": "", "目标品名": "员工餐",
-                                "置信度": 1, "来源": "staff_meal", "金额": row["amt"],
+                                "置信度": None, "来源": "staff_meal", "金额": row["amt"],
                                 "理由": f"日期为空，{row['name']}未写入物料表，金额{float(amount):.2f}计入员工餐，但没有日期行，不记入其他日期"})
             continue
         if not str(row.get("cat") or "").strip():
@@ -1588,7 +1706,8 @@ def sync_to_material(model):
             if rec["paid"] is None and row.get("paid") not in (None, ""):
                 rec["paid"] = Decimal(str(row["paid"]))
 
-    def _staff_result(row, reason, conf=1):
+    def _staff_result(row, reason, conf=None):
+        # conf 为 None：这行没跑分层匹配，不填 0 或 1。页面把空显示成 N/A。
         _add_meal(row)
         results.append({"日期": row["date"], "落地品名": row.get("promoted_from") or row["name"],
                         "目标品名": "员工餐", "置信度": conf, "来源": "staff_meal",
@@ -1601,26 +1720,30 @@ def sync_to_material(model):
         if not attr and row["cat"] == "蔬菜" and _legal_names:
             # 旧落地表没有「归属」列：按品名回退判定（拿不到员工分区信息）
             attr = classify_item(row["name"], row["cat"])[0]
-        # 海底捞、员工区：固定员工餐，不调大模型
+        # 海底捞、员工区：固定员工餐，不调大模型，也不编一个 0/1 的置信度。
         if is_staff_meal_only(row["name"]) or row.get("staff_zone"):
-            why = ("海底捞只计入员工餐，不写入日物料采购" if is_staff_meal_only(row["name"])
-                   else "员工餐行，只计入员工餐总额，不写入日物料采购")
+            why = ("真员工餐（海底捞），未做分层匹配，只计入员工餐，不写入日物料采购"
+                   if is_staff_meal_only(row["name"])
+                   else "员工区，未做分层匹配，只计入员工餐，不写入日物料采购")
             _staff_result(row, why)
             continue
         # 复核页改过的品名以人工为准，模型不能覆盖
         if row.get("name_edited") and attr in (STAFF, STAFF_QUERY):
-            _staff_result(row, "人工修改的品名保持原样，不按模型覆盖，仍计入员工餐")
+            _staff_result(row, "人工修改的品名保持原样，未做分层匹配，仍计入员工餐")
             continue
         if attr == STAFF:
-            _staff_result(row, "员工餐行，只计入员工餐总额，不写入日物料采购")
+            _staff_result(row, "真员工餐，未做分层匹配，只计入员工餐，不写入日物料采购")
             continue
         if attr == STAFF_QUERY:
-            if not _promote_land_row(row, model, twb, sheet_cache):
-                _staff_result(
-                    row,
-                    f"员工餐? 未达到同步置信度(低于{SYNC_CONF:g})，仍计入员工餐",
-                    conf=0,
-                )
+            outcome = _promote_land_row(row, model, twb, sheet_cache)
+            if not outcome.get("land"):
+                if outcome.get("attempted"):
+                    reason = outcome.get("理由") or "员工餐? 未归入日物料，仍计入员工餐"
+                    conf = outcome.get("置信度")
+                else:
+                    reason = "没有可对照的物料表，未做分层匹配，仍计入员工餐"
+                    conf = None
+                _staff_result(row, reason, conf=conf)
                 continue
         primary = CATEGORY_SHEET.get(row["cat"])
         alt = "日物料采购" if primary == "肉类采购" else ("肉类采购" if primary == "日物料采购" else None)
@@ -1683,11 +1806,19 @@ def sync_to_material(model):
                     _add_material(row)
             reason = mp["理由"]
             landed_name = row["name"]
+            conf_out = mp["置信度"]
+            source_out = mp["来源"]
             if row.get("promoted_from"):
                 landed_name = row["promoted_from"]
-                reason = f"员工餐?「{row['promoted_from']}」归入「{mp['目标品名']}」；{reason}"
+                # 品名已经改成标准名，后面的精确匹配分数是 1，不能拿来覆盖落地分数。
+                if "promote_conf" in row:
+                    conf_out = row["promote_conf"]
+                if row.get("promote_source"):
+                    source_out = row["promote_source"]
+                why = row.get("promote_reason") or reason
+                reason = f"员工餐?「{row['promoted_from']}」归入「{mp['目标品名']}」；{why}"
             results.append({"日期": row["date"], "落地品名": landed_name, "目标品名": mp["目标品名"],
-                            "置信度": mp["置信度"], "理由": reason, "来源": mp["来源"],
+                            "置信度": conf_out, "理由": reason, "来源": source_out,
                             "数量": row["qty"], "金额": row["amt"]})
             placed = True
             break
