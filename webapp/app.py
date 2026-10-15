@@ -687,25 +687,50 @@ def correct_item_names(items):
     return items
 
 
+def _ticket_from_ocr(text, filename):
+    rows = core.parse_table(text)
+    items, _stat = core.derive_price(core.parse_line_items(rows))
+    return {
+        "text": text,
+        "rows": rows,
+        "items": items,
+        "date": core.extract_date(text, filename),
+    }
+
+
+def _ocr_needs_retry(parsed):
+    """有序号但内容空的行 ≥2，或一行有效明细都没有（空占位不算）。"""
+    if _count_missing_rows(parsed["rows"]) >= 2:
+        return True
+    return core.content_item_score(parsed["items"])[0] == 0
+
+
 def ocr_one(filename):
     path = os.path.join(_paths["input_dir"], filename)
     text = core.call_ocr(path)
-    date = core.extract_date(text, filename)
-    rows = core.parse_table(text)
-    items = core.parse_line_items(rows)
-    items, _stat = core.derive_price(items)
-    # 漏识别兜底：有序号但内容为空的行较多（阴影遮挡/补货段未识别）时，
-    # 用阴影补偿后的增强图重试一次 OCR，解析出更多明细时采用增强结果
-    if _count_missing_rows(rows) >= 2 or not items:
-        try:
-            text2 = core.call_ocr(path, enhance=True)
-            rows2 = core.parse_table(text2)
-            items2, _s2 = core.derive_price(core.parse_line_items(rows2))
-            if len(items2) > len(items):
-                text, rows, items = text2, rows2, items2
-                date = core.extract_date(text2, filename)
-        except Exception:
-            pass  # 增强重试失败则保留原结果，交人工核对
+    chosen = _ticket_from_ocr(text, filename)
+    # 漏识别兜底。已经认出明细、只是空序号偏多：仍只做原来的阴影补偿，避免每张单多打几次 OCR。
+    # 一行内容都没有（粉纸复写 + 手影，表格只剩序号）：按 shadow → red → flat 各识一次，取最全的那次。
+    # 增强把表认丢、或内容不比当前多，都不覆盖。增强没认出日期时留下原图的日期。
+    if _ocr_needs_retry(chosen):
+        strategies = (
+            core.OCR_RETRY_PASSES
+            if core.content_item_score(chosen["items"])[0] == 0
+            else ("shadow",)
+        )
+        for strategy in strategies:
+            try:
+                cand = _ticket_from_ocr(core.call_ocr(path, enhance=strategy), filename)
+            except Exception:
+                continue
+            if core.ocr_parse_richer(cand["items"], cand["rows"], chosen["items"], chosen["rows"]):
+                if chosen.get("date") and not cand.get("date"):
+                    cand["date"] = chosen["date"]
+                chosen = cand
+            if not _ocr_needs_retry(chosen):
+                break
+    text, rows, items = chosen["text"], chosen["rows"], chosen["items"]
+    date = chosen["date"]
     total = core.sum_amount(items)
     order_total = core.extract_order_total(rows)
     for it in items:
@@ -1970,6 +1995,16 @@ def _merge_by_source(ws):
         start = end + 1
 
 
+def _line_has_content(it):
+    """空品名且数量、金额都空：复核页上的待补行，还没填就不写进落地表。
+    有数量或金额（品名可以空）必须落地，避免金额漏账。"""
+    if str(it.get("品名") or "").strip():
+        return True
+    if it.get("数量") not in (None, ""):
+        return True
+    return it.get("金额") not in (None, "")
+
+
 def append_land(filename, date, category, total, paid_total, items):
     os.makedirs(_paths["output_dir"], exist_ok=True)
     HEADERS = ["日期", "类别", "品名", "数量", "单价", "金额", "来源图片", "合计", "实付合计", "归属", "品名编辑", "员工区"]
@@ -2002,6 +2037,8 @@ def append_land(filename, date, category, total, paid_total, items):
             ws.title = "已落地"
             ws.append(HEADERS)
         for it in items:
+            if not _line_has_content(it):
+                continue
             ws.append([
                 date, category, it.get("品名"), it.get("数量"),
                 it.get("单价"), it.get("金额"), filename, total, paid_total,
