@@ -9,7 +9,7 @@ import re
 import html as html_lib
 from decimal import Decimal, ROUND_HALF_UP
 import requests
-from PIL import Image, ImageOps, ImageChops, ImageFilter
+from PIL import Image, ImageOps, ImageChops, ImageFilter, ImageMath
 from openpyxl import Workbook
 
 
@@ -60,9 +60,77 @@ def _shadow_compensate(img):
         return img
 
 
+# 原图一个字都没认出来时，按这个顺序各识一次，取内容最全的结果。
+# shadow：上面的灰度相减（旧行为）。粉纸上的蓝笔在亮度里几乎看不见，相减还会把
+# 整块手影压成黑，所以后面两档改成「除以背景」平场。
+# red：蓝笔在红通道最暗、粉纸最亮；红减蓝有反差时用它，否则退回红通道。
+# flat：不看颜色，直接把亮度除掉大块阴影。黑笔被手影压扁时用。
+OCR_RETRY_PASSES = ("shadow", "red", "flat")
+
+# 红减蓝几乎是一张空图（黑笔、或照片已经是灰度）时不要拿噪声当墨水。
+_INK_PLANE_VAR = 100
+
+
+def _channel_variance(channel):
+    hist = channel.histogram()
+    total = sum(hist) or 1
+    mean = sum(i * hist[i] for i in range(256)) / total
+    return sum(hist[i] * (i - mean) ** 2 for i in range(256)) / total
+
+
+def _flat_field(channel):
+    """除以模糊背景，消掉手/手机投影。笔画比纸面窄，半径盖过笔画、盖不住整块阴影。"""
+    w, h = channel.size
+    radius = max(12, min(24, min(w, h) // 24))
+    bg = channel.filter(ImageFilter.GaussianBlur(radius=radius))
+    flat = ImageMath.lambda_eval(
+        lambda a: a["convert"](
+            a["min"](a["ch"] * 255 / a["max"](a["bg"], 1), 255), "L"),
+        ch=channel,
+        bg=bg,
+    )
+    return flat
+
+
+def _ink_plane(img):
+    """粉/紫复写纸上的蓝笔：红减蓝。差值没有反差时退回红通道（黑笔、灰度图）。"""
+    red, _green, blue = img.convert("RGB").split()
+    diff = ImageChops.subtract(red, blue)
+    if _channel_variance(diff) < _INK_PLANE_VAR:
+        return red
+    return diff
+
+
+def _red_ink_enhance(img):
+    plane = _flat_field(_ink_plane(img))
+    plane = plane.filter(ImageFilter.UnsharpMask(radius=1.2, percent=140, threshold=2))
+    return plane.convert("RGB")
+
+
+def _flat_field_enhance(img):
+    plane = _flat_field(ImageOps.grayscale(img))
+    plane = plane.filter(ImageFilter.SHARPEN)
+    return plane.convert("RGB")
+
+
+def enhance_image(img, strategy):
+    """strategy：True/'shadow' 原阴影补偿；'red' 粉纸蓝笔；'flat' 亮度平场。
+    不认识的值原图返回，避免一次预处理失败把图涂掉。"""
+    try:
+        if strategy in (True, "shadow"):
+            return _shadow_compensate(img)
+        if strategy == "red":
+            return _red_ink_enhance(img)
+        if strategy == "flat":
+            return _flat_field_enhance(img)
+    except Exception:
+        return img
+    return img
+
+
 def prepare_image(path, enhance=False):
     """按 EXIF 方向旋转校正 + 超限等比缩小，返回 (字节流, 文件名)。
-    enhance=True 时先做阴影补偿（用于阴影遮挡导致漏识别后的重试）。"""
+    enhance 为 True/'shadow'/'red'/'flat' 时先做对应预处理（漏识别后的重试）。"""
     img = Image.open(path)
     img = ImageOps.exif_transpose(img)  # 依据 EXIF Orientation 自动摆正
     w, h = img.size
@@ -70,7 +138,7 @@ def prepare_image(path, enhance=False):
         scale = MAX_SIZE / max(w, h)
         img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
     if enhance:
-        img = _shadow_compensate(img)
+        img = enhance_image(img, enhance)
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="JPEG", quality=92)
     buf.seek(0)
@@ -186,7 +254,8 @@ def parse_line_items(rows):
     - 蔬菜单：4 列（品名/数量/单价/金额），只取品名、数量、金额；
     - 肉类单(复合数量)：5 列（序号/品名/空/"n×p"/金额），数量取复合数量前段、金额取金额列；
     - 肉类单(分开列)：5 列（序号/品名/数量/单价/金额），数量取数量列、金额取金额列。
-    跳过重复表头、合计/件数等脏行。
+    肉类品名为空仍保留：有数量或金额时交人工补品名；只剩印刷序号（粉纸+手影整格认空）
+    也留空行，复核页才能对照原图填。跳过重复表头、合计/件数等脏行。
     """
     items = []
     staff_zone = False   # 7 列蔬菜单：物料小计 /「员工：」分区之后的行都在员工区
@@ -222,8 +291,6 @@ def parse_line_items(rows):
         # 注：OCR 偶把数据行序号"1"识别成"序号"，故 first=="序号" 也按数据行处理
         if re.fullmatch(r"\d+", first) or first == "序号":
             name = name_or_raw(cells[1]) if len(cells) > 1 else ""
-            if not name:
-                continue
             amount = extract_num(cells[4]) if len(cells) > 4 else None
             # 数量：优先识别「复合数量」(数字×数字，如 11.9×33 / 20×44)，可能落在
             # 数量列或品名列后一列；否则按「分开列」取数量列。
@@ -238,6 +305,8 @@ def parse_line_items(rows):
                         break
             if qty is None and len(cells) > 2:
                 qty = extract_num(cells[2])
+            # 品名为空不丢行。有数量/金额时跟 7 列蔬菜一样留给人工补品名；
+            # 数量金额也空、只剩序号时同样留空行（粉纸复写被手影盖住，OCR 只框住表格）。
             items.append({"品名": name, "数量": qty, "金额": amount, "类别": "肉类"})
             continue
         # 品名开头的单据（蔬菜单）：4 列，品名在 cells[0]，数量 cells[1]，金额 cells[3]
@@ -268,6 +337,32 @@ def is_staff_marker(cells):
         return True
     has_num = any(extract_num((c or "").strip()) is not None for c in cells[5:])
     return has_num and (not name or _is_total_label(name))
+
+
+def content_item_score(items):
+    """(有内容的行数, 已填字段数)。品名、数量、金额都空的占位行不计。"""
+    rows_with = 0
+    fields = 0
+    for it in items or []:
+        name = str(it.get("品名") or "").strip()
+        has_qty = it.get("数量") not in (None, "")
+        has_amt = it.get("金额") not in (None, "")
+        n = int(bool(name)) + int(has_qty) + int(has_amt)
+        if n:
+            rows_with += 1
+            fields += n
+    return rows_with, fields
+
+
+def ocr_parse_richer(new_items, new_rows, old_items, old_rows):
+    """增强结果是否比当前结果更值得采用。
+
+    先比有内容的明细行，再比填上的字段。两边都没有内容时，保留还认得出表格的那次：
+    增强把整张表认丢时，不要盖掉只有序号的骨架（骨架会留成可手填的空行）。
+    """
+    new_key = content_item_score(new_items) + (1 if new_rows else 0,)
+    old_key = content_item_score(old_items) + (1 if old_rows else 0,)
+    return new_key > old_key
 
 
 def count_staff_zone_missing(rows):
