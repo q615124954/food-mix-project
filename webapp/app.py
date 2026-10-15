@@ -1288,11 +1288,26 @@ def _blocked_soy_reason(called_model):
     return "海天/老抽不能归到生抽，未调用大模型，仍计入员工餐"
 
 
+def _suggest_land_target(raw_name, suggestion, conf, candidates):
+    """中分建议里，分数达到同步门槛、且建议名在物料表上的，可以落地。
+
+    海天/老抽 → 生抽 即使分数不低于 0.8 也不落地。建议名不在候选里也不落地。
+    """
+    shown = suggestion if suggestion and suggestion != raw_name else ""
+    if not shown or conf < SYNC_CONF or not _in_candidates(shown, candidates):
+        return ""
+    if name_match.forbidden_auto_map(raw_name, shown):
+        return ""
+    return shown
+
+
 def describe_tentative_match(raw_name, category, candidates, name_code, model, qty=None, amt=None):
     """员工餐? 的分层匹配。落地与否都带回真实分数和原因。
 
-    land 为真时调用方才改标准名并写入日物料。门槛仍是 SYNC_CONF，
-    中分只建议（哪怕高于 0.8、低于自动线 0.9）也不落地。
+    land 为真时调用方才改标准名并写入日物料。
+    自动改名，以及中分只建议但分数达到 SYNC_CONF（0.8，含 0.8）的，都按标准名落地。
+    低于 0.8 的建议仍计员工餐，并记下真实分数。弱相似（needs_review，如腊肉）不落地。
+    海天/老抽不得归到生抽。
     attempted 为假表示没跑匹配（没品名、没候选、物料表暂停、海底捞），置信度为 None。
     """
     raw_name = str(raw_name or "").strip()
@@ -1327,8 +1342,22 @@ def describe_tentative_match(raw_name, category, candidates, name_code, model, q
 
     if action == "suggest":
         shown = suggestion if suggestion and suggestion != raw_name else ""
-        if shown:
-            reason = f"仅建议「{shown}」，中分未自动改名，未调用大模型，仍计入员工餐"
+        if shown and name_match.forbidden_auto_map(raw_name, shown):
+            return stay(
+                _blocked_soy_reason(False), source_name="banned",
+                action_name=action or "keep", target_name=shown, suggestion_name=shown)
+        land_name = _suggest_land_target(raw_name, shown, conf, candidates)
+        if land_name:
+            return _tentative_outcome(
+                True, True, conf, _auto_land_reason(source), source or "suggest",
+                action, land_name, land_name)
+        if shown and conf < SYNC_CONF:
+            reason = (
+                f"仅建议「{shown}」，分层匹配置信度 {conf:g} 低于同步门槛 {SYNC_CONF:g}，"
+                "未写入日物料，未调用大模型，仍计入员工餐"
+            )
+        elif shown:
+            reason = f"仅建议「{shown}」，未落在物料表候选上，未调用大模型，仍计入员工餐"
         else:
             reason = "仅建议，中分未自动改名，未调用大模型，仍计入员工餐"
         return stay(reason, source_name=source or "suggest")
