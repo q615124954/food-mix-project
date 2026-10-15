@@ -280,6 +280,25 @@ class TentativeStaffMatch(_Env):
         self.assertEqual(got["日物料"], 0)
         self.assertFalse(name_match.add_variant("蔬菜", "生抽", "海天老抽", code="S-SOY"))
 
+        def suggest_soy(raw, candidates, **kwargs):
+            return {"action": "suggest", "name": raw, "suggestion": "生抽", "source": "suggest",
+                    "confidence": 0.86, "llm_candidates": []}
+
+        name_match.layered_match = suggest_soy
+        try:
+            detail = webapp.describe_tentative_match(
+                "老抽", "蔬菜", ["生抽"], {"生抽": "S-SOY"}, "m")
+            hit = webapp.match_tentative_to_catalog(
+                "老抽", "蔬菜", ["生抽"], {"生抽": "S-SOY"}, "m")
+        finally:
+            name_match.layered_match = layered_restore(self)
+        self.assertIsNone(hit)
+        self.assertFalse(detail["land"])
+        self.assertAlmostEqual(detail["置信度"], 0.86)
+        self.assertIn("生抽", detail["理由"])
+        self.assertIn("未调用大模型", detail["理由"])
+        self.assertNotIn("低于", detail["理由"])
+
     def test_human_edited_name_is_not_overwritten(self):
         self._sync([("大蒜头", 3, 18, "员工餐?", True, False)])
         got = self._read()
@@ -312,29 +331,140 @@ class TentativeStaffMatch(_Env):
         wb.save(self.material)
         wb.close()
 
-    def test_mid_score_suggestion_keeps_real_confidence(self):
-        """腱子肉对猪腱子肉约 0.86：只建议、不落地，结果表记这个分数，而不是 0 / 低于 0.8。"""
+    def test_mid_score_at_or_above_sync_conf_lands_with_real_score(self):
+        """腱子肉对猪腱子肉约 0.86：中分但已过同步门槛 0.8，改标准名进日物料，记下真实分数。"""
         self._add_product("M-PORK", "猪腱子肉")
         catalog = ["蒜头", "去皮蒜米", "生抽", "青菜", "猪腱子肉"]
         expected = name_match.layered_match("腱子肉", catalog, category="蔬菜")
         self.assertEqual(expected["action"], "suggest")
         self.assertGreater(expected["confidence"], 0.84)
-        self.assertLess(expected["confidence"], 0.88)
+        self.assertLess(expected["confidence"], name_match.AUTO_CONF)
+        self.assertGreaterEqual(expected["confidence"], webapp.SYNC_CONF)
         results, _backup = self._sync([("腱子肉", 1, 16, "员工餐?", False, False)])
         row = _product_result(results, "腱子肉")
         self.assertAlmostEqual(row["置信度"], expected["confidence"])
-        self.assertEqual(row["目标品名"], "员工餐")
+        self.assertNotEqual(row["置信度"], 1)
+        self.assertEqual(row["目标品名"], "猪腱子肉")
         self.assertIn("猪腱子肉", row["理由"])
-        self.assertIn("建议", row["理由"])
-        self.assertIn("未调用大模型", row["理由"])
         self.assertNotIn("低于", row["理由"])
         self.assertNotIn("未达到同步置信度", row["理由"])
         self.assertEqual(self.llm_calls, [])
         got = self._read()
-        self.assertEqual(got["员工餐"], 16)
+        self.assertEqual(got["员工餐"], 0)
+        self.assertEqual(got["日物料"], 16)
+        wb = load_workbook(self.material, data_only=True)
+        self.assertEqual(_cell(wb["日物料采购"], "猪腱子肉"), (1, 16))
+        wb.close()
+        pork = name_match.variants_for("蔬菜").get("猪腱子肉") or []
+        self.assertIn("腱子肉", pork)
+
+    def test_suggest_on_sync_threshold_lands(self):
+        """中分刚好 0.8（猪腱 → 猪腱子肉）同样落地，不另等 0.9 自动线。"""
+        self._add_product("M-PORK", "猪腱子肉")
+        catalog = ["蒜头", "去皮蒜米", "生抽", "青菜", "猪腱子肉"]
+        expected = name_match.layered_match("猪腱", catalog, category="蔬菜")
+        self.assertEqual(expected["action"], "suggest")
+        self.assertAlmostEqual(expected["confidence"], webapp.SYNC_CONF)
+        results, _backup = self._sync([("猪腱", 2, 11, "员工餐?", False, False)])
+        row = _product_result(results, "猪腱")
+        self.assertAlmostEqual(row["置信度"], expected["confidence"])
+        self.assertEqual(row["目标品名"], "猪腱子肉")
+        self.assertEqual(self.llm_calls, [])
+        got = self._read()
+        self.assertEqual(got["日物料"], 11)
+        self.assertEqual(got["员工餐"], 0)
+        wb = load_workbook(self.material, data_only=True)
+        self.assertEqual(_cell(wb["日物料采购"], "猪腱子肉"), (2, 11))
+        wb.close()
+
+    def test_suggest_below_sync_conf_stays_staff_with_real_score(self):
+        """猪肉对猪腱子肉约 0.67：中分但低于 0.8，仍计员工餐，结果表记真实分数。"""
+        self._add_product("M-PORK", "猪腱子肉")
+        catalog = ["蒜头", "去皮蒜米", "生抽", "青菜", "猪腱子肉"]
+        expected = name_match.layered_match("猪肉", catalog, category="蔬菜")
+        self.assertEqual(expected["action"], "suggest")
+        self.assertGreaterEqual(expected["confidence"], name_match.SUGGEST_CONF)
+        self.assertLess(expected["confidence"], webapp.SYNC_CONF)
+        results, _backup = self._sync([("猪肉", 1, 9, "员工餐?", False, False)])
+        row = _product_result(results, "猪肉")
+        self.assertAlmostEqual(row["置信度"], expected["confidence"])
+        self.assertEqual(row["目标品名"], "员工餐")
+        self.assertIn("猪腱子肉", row["理由"])
+        self.assertIn(f"{expected['confidence']:g}", row["理由"])
+        self.assertIn("0.8", row["理由"])
+        self.assertIn("未调用大模型", row["理由"])
+        self.assertNotIn("未达到同步置信度", row["理由"])
+        self.assertEqual(self.llm_calls, [])
+        got = self._read()
+        self.assertEqual(got["员工餐"], 9)
         self.assertEqual(got["日物料"], 0)
         wb = load_workbook(self.material, data_only=True)
         self.assertEqual(_cell(wb["日物料采购"], "猪腱子肉"), (99, 999))
+        wb.close()
+        pork = name_match.variants_for("蔬菜").get("猪腱子肉") or []
+        self.assertNotIn("猪肉", pork)
+
+    def test_needs_review_above_sync_conf_stays_staff(self):
+        """腊肉对猪腱子肉是弱相似 0.85，只建议不落地，即使分数不低于同步门槛。"""
+        self._add_product("M-PORK", "猪腱子肉")
+        catalog = ["蒜头", "去皮蒜米", "生抽", "青菜", "猪腱子肉"]
+        expected = name_match.layered_match("腊肉", catalog, category="蔬菜")
+        self.assertEqual(expected["action"], "review")
+        self.assertGreaterEqual(expected["confidence"], webapp.SYNC_CONF)
+        self.assertLess(expected["confidence"], name_match.AUTO_CONF)
+        results, _backup = self._sync([("腊肉", 1, 20, "员工餐?", False, False)])
+        row = _product_result(results, "腊肉")
+        self.assertAlmostEqual(row["置信度"], expected["confidence"])
+        self.assertEqual(row["目标品名"], "员工餐")
+        self.assertIn("猪腱子肉", row["理由"])
+        self.assertIn("未调用大模型", row["理由"])
+        self.assertEqual(self.llm_calls, [])
+        got = self._read()
+        self.assertEqual(got["员工餐"], 20)
+        self.assertEqual(got["日物料"], 0)
+        self.assertNotIn("腊肉", name_match.variants_for("蔬菜").get("猪腱子肉") or [])
+
+    def test_confirm_applies_mid_score_catalog_name(self):
+        """确认时员工餐? 的中分达到 0.8，写成标准名再落地，不调模型。"""
+        self._add_product("M-PORK", "猪腱子肉")
+        webapp.load_legal_names()
+        webapp._state = {"invoices": [{
+            "filename": "pork.jpg", "status": "pending", "ocr_done": True, "items": [],
+        }]}
+        items = [{"品名": "腱子肉", "原品名": "腱子肉", "数量": 1, "金额": 16}]
+        payload = webapp.ConfirmPayload(date=DATE, category="蔬菜", items=items, paid_total=16)
+        self.assertEqual(webapp.confirm("pork.jpg", payload), {"ok": True})
+        saved = webapp._state["invoices"][0]["items"][0]
+        self.assertEqual(saved["品名"], "猪腱子肉")
+        self.assertEqual(saved["原品名"], "腱子肉")
+        self.assertEqual(saved["归属"], webapp.MATERIAL)
+        self.assertFalse(saved["归属待确认"])
+        self.assertEqual(self.llm_calls, [])
+        wb = load_workbook(webapp.land_file())
+        ws = wb.active
+        self.assertEqual(ws.cell(2, 3).value, "猪腱子肉")
+        self.assertEqual(ws.cell(2, 10).value, webapp.MATERIAL)
+        wb.close()
+        self.assertIn("腱子肉", name_match.variants_for("蔬菜").get("猪腱子肉") or [])
+
+    def test_confirm_below_sync_conf_stays_staff_query(self):
+        self._add_product("M-PORK", "猪腱子肉")
+        webapp.load_legal_names()
+        webapp._state = {"invoices": [{
+            "filename": "pork-low.jpg", "status": "pending", "ocr_done": True, "items": [],
+        }]}
+        items = [{"品名": "猪肉", "原品名": "猪肉", "数量": 1, "金额": 9}]
+        payload = webapp.ConfirmPayload(date=DATE, category="蔬菜", items=items, paid_total=9)
+        self.assertEqual(webapp.confirm("pork-low.jpg", payload), {"ok": True})
+        saved = webapp._state["invoices"][0]["items"][0]
+        self.assertEqual(saved["品名"], "猪肉")
+        self.assertEqual(saved["归属"], webapp.STAFF)
+        self.assertTrue(saved["归属待确认"])
+        self.assertEqual(self.llm_calls, [])
+        wb = load_workbook(webapp.land_file())
+        ws = wb.active
+        self.assertEqual(ws.cell(2, 3).value, "猪肉")
+        self.assertEqual(ws.cell(2, 10).value, "员工餐?")
         wb.close()
 
     def test_success_records_score_that_caused_landing(self):
