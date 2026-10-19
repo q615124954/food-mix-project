@@ -129,6 +129,7 @@
       <div class="img-panel" id="img-panel"><div class="empty">加载中…</div></div>
       <div class="table-panel">
         <div class="head" id="tbl-title">明细</div>
+        <div class="hint" id="tbl-note" style="display:none"></div>
         <div class="table-wrap">
           <table>
             <thead><tr><th style="width:32%">品名</th><th style="width:22%">数量</th><th style="width:22%">单价</th><th style="width:24%">金额</th></tr></thead>
@@ -226,6 +227,7 @@ function renderList() {
     let badge, bt;
     if (inv.error) { badge = '失败'; bt = 'b-err'; }
     else if (inv.status === 'confirmed') { badge = '已确认'; bt = 'b-done'; }
+    else if (inv.status === 'merged') { badge = '已合并'; bt = 'b-pending'; }
     else if (inv.ocr_done) { badge = '待确认'; bt = 'b-pending'; }
     else { badge = '识别中'; bt = 'b-ocr'; }
     d.innerHTML = `<div class="name">${inv.filename}</div>
@@ -262,7 +264,13 @@ function renderCurrent() {
   }
   recomputeTotal();
   document.getElementById('tbl-title').textContent = inv.filename;
-  document.getElementById('btn-confirm').disabled = !inv.ocr_done;
+  const noteEl = document.getElementById('tbl-note');
+  if (noteEl) {
+    const note = inv.note || '';
+    noteEl.textContent = note;
+    noteEl.style.display = note ? 'block' : 'none';
+  }
+  document.getElementById('btn-confirm').disabled = !inv.ocr_done || inv.status === 'merged';
 
   const panel = document.getElementById('img-panel');
   panel.innerHTML = `<img src="/images/${encodeURIComponent(inv.filename)}" onclick="this.style.cursor='zoom-out';this.style.maxWidth='none';this.style.maxHeight='none'" title="点击放大/还原">`;
@@ -271,7 +279,8 @@ function renderCurrent() {
   tb.innerHTML = '';
   if (!inv.items || inv.items.length === 0) {
     let msg;
-    if (inv.error) msg = inv.error;
+    if (inv.status === 'merged') msg = inv.note || '已并入同配送日的美菜单';
+    else if (inv.error) msg = inv.error;
     else if (inv.ocr_done) msg = '未识别到内容';
     else msg = '识别中…';
     tb.innerHTML = `<tr><td colspan="4" class="empty" style="text-align:center">${msg}</td></tr>`;
@@ -448,7 +457,7 @@ async function submitConfirm() {
     date: document.getElementById('fld-date').value.trim(),
     category: category,
     paid_total: paidValue(),
-    items: inv.items.map(it => ({ '品名': it['品名'], '原品名': it['原品名'], '品名编辑': it['品名编辑'], '数量': it['数量'], '单价': it['单价'], '金额': it['金额'], '员工区': !!it['员工区'], '人工补录': !!it['人工补录'] }))
+    items: inv.items.map(it => ({ '品名': it['品名'], '原品名': it['原品名'], '品名编辑': it['品名编辑'], '数量': it['数量'], '单价': it['单价'], '金额': it['金额'], '员工区': !!it['员工区'], '人工补录': !!it['人工补录'], '渠道': it['渠道'] || '', '订单号': it['订单号'] || '', '单位': it['单位'] || '' }))
   };
   try {
     const r = await fetch(`/api/invoice/${encodeURIComponent(inv.filename)}/confirm`, {
