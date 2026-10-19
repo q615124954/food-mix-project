@@ -744,6 +744,7 @@ def parse_meicai_text(text):
     明细只认货品的「收」行。直降、历史欠款、补差不单独成行；
     补差已经含在实收金额里。没有「收」就空着数量和金额，标实收缺失，
     不用订货数填。品名单独一行、金额在下一行时也留下品名。
+    连续几段都是这样时，下一条品名先把上一段交出去，不盖掉前面的品名。
     「收」单独一行、下一行是「￥金额/数量」时，与「收 ￥…」同样算实收。
     """
     date = extract_meicai_date(text)
@@ -752,6 +753,8 @@ def parse_meicai_text(text):
     items = []
     current = None
     pending_name = ""
+    # 当前挂着的品名后面已经出现过纯标价（没有「收」）。下一条新品名要先交上一段。
+    pending_priced = False
     current_oid = order_ids[0] if order_ids else ""
     # 只有出现过订单号 / 订 / 收 / 带价格的品名行，才把落单的品名行交给人工补实收。
     # 避免手写单抬头里的中文被误收成一行。
@@ -783,8 +786,10 @@ def parse_meicai_text(text):
             continue
         if kind == "price":
             # 品名下一行的标价 / 订货价。不新开一行，也不把已经看到的品名清掉。
+            # 只记账：这段品名后面有标价。数量金额仍等「收」，没有「收」就空着。
             if pending_name:
                 seen_goods = True
+                pending_priced = True
             i += 1
             continue
         if kind == "oid":
@@ -799,8 +804,18 @@ def parse_meicai_text(text):
         if kind == "name":
             # 美菜品名行以单位结尾（「大娃娃菜 优质 斤」）。后面这条盖住前面的广告文案，
             # 广告不再粘进品名；没有单位的说明行仍接在当前品名后面。
+            # 上一段已是「品名 + 下行标价」且还没有「收」时，先交出行再换品名。
+            if pending_priced and pending_name and _MEICAI_UNIT_TAIL_RE.search(payload):
+                name = _clean_meicai_name(pending_name)
+                pending_name = ""
+                pending_priced = False
+                if name:
+                    _push(current)
+                    current = None
+                    _push(_blank_meicai_item(name, current_oid))
             if _MEICAI_UNIT_TAIL_RE.search(payload):
                 pending_name = payload
+                pending_priced = False
             else:
                 pending_name = (pending_name + " " + payload).strip() if pending_name else payload
             i += 1
@@ -810,6 +825,7 @@ def parse_meicai_text(text):
             if pending_name:
                 name = _clean_meicai_name(pending_name)
                 pending_name = ""
+                pending_priced = False
                 if name:
                     _push(current)
                     current = None
@@ -819,6 +835,7 @@ def parse_meicai_text(text):
             unit = parsed[2] if parsed else ""
             current = _blank_meicai_item(_clean_meicai_name(payload), current_oid, unit)
             pending_name = ""
+            pending_priced = False
             i += 1
             continue
         if kind == "recv":
@@ -842,6 +859,7 @@ def parse_meicai_text(text):
                 name = _clean_meicai_name(pending_name) if pending_name else ""
                 current = _blank_meicai_item(name, current_oid)
                 pending_name = ""
+                pending_priced = False
             if not parsed:
                 current["实收缺失"] = True
                 current["数量"] = None
