@@ -38,6 +38,8 @@ SHOT_OCR = {
     "shot1": os.path.join(ROOT, "samples", "gold", "ocr", "meicai_shot1.ocr.txt"),
     "shot2": os.path.join(ROOT, "samples", "gold", "ocr", "meicai_shot2.ocr.txt"),
 }
+SHOT3_OCR = os.path.join(ROOT, "samples", "gold", "ocr", "meicai_shot3.ocr.txt")
+SHOT3_TILED_OCR = os.path.join(ROOT, "samples", "gold", "ocr", "meicai_shot3.tiled.ocr.txt")
 
 
 def _ocr_text():
@@ -357,9 +359,87 @@ class LongScreenshot(unittest.TestCase):
             webapp._paths.clear()
             webapp._paths.update(old_paths)
         self.assertEqual(seen["tiled"], 1)
-        self.assertEqual(seen["full"], 0)
+        # 长图会再打一次整图，但整图不是美菜实收，分数更低，仍用分条原文。
+        self.assertEqual(seen["full"], 1)
         self.assertEqual(res["kind"], "meicai")
         self.assertEqual(len(res["items"]), 7)
+        self.assertAlmostEqual(res["items"][0]["数量"], 3.08, places=2)
+
+    def test_ocr_one_prefers_full_when_it_has_more_recv(self):
+        """分条几乎没有可用「收」、整图有实收时，用整图原文。不把订货数写成实收。"""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path_dir = tmp.name
+        Image.new("RGB", (1080, 3000), "white").save(os.path.join(path_dir, "long.png"))
+        old_paths = dict(webapp._paths)
+        old_call = webapp.core.call_ocr
+        old_tiled = webapp.core.call_ocr_tiled
+        webapp._paths["input_dir"] = path_dir
+
+        def tiled(path, timeout=600, overlap=0.15):
+            return "\n".join([
+                "美菜",
+                "送达时间 2026-09-09 06:35:03",
+                "订单号：3002160333 复制",
+                "(56,141),(117,169)已完成",
+                "美菜配送-已送达",
+                "鸡毛菜 斤",
+                "￥14.55/3.00斤",
+                "订",
+                "￥14.55/3.00斤",
+                "付款信息",
+                "商品多退少补合计￥163.25",
+            ])
+
+        def full(path, timeout=600, enhance=False):
+            return _ocr_text()
+
+        webapp.core.call_ocr_tiled = tiled
+        webapp.core.call_ocr = full
+        try:
+            res = webapp.ocr_one("long.png")
+        finally:
+            webapp.core.call_ocr = old_call
+            webapp.core.call_ocr_tiled = old_tiled
+            webapp._paths.clear()
+            webapp._paths.update(old_paths)
+        self.assertEqual(res["kind"], "meicai")
+        self.assertEqual(len(res["items"]), 7)
+        self.assertAlmostEqual(res["items"][0]["数量"], 3.08, places=2)
+        self.assertAlmostEqual(res["items"][0]["金额"], 19.59, places=2)
+
+    def test_long_handwriting_stays_on_tiled_text(self):
+        """两份都不像美菜时不换文本。手写单仍走原来的表解析。"""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path_dir = tmp.name
+        Image.new("RGB", (1080, 3000), "white").save(os.path.join(path_dir, "long.png"))
+        old_paths = dict(webapp._paths)
+        old_call = webapp.core.call_ocr
+        old_tiled = webapp.core.call_ocr_tiled
+        webapp._paths["input_dir"] = path_dir
+        with open(HAND_TXT, encoding="utf-8") as f:
+            hand = f.read()
+
+        def tiled(path, timeout=600, overlap=0.15):
+            return hand
+
+        def full(path, timeout=600, enhance=False):
+            return "<table><tr><td>1</td><td>不该用这份</td><td>9</td><td>9</td><td>9</td></tr></table>"
+
+        webapp.core.call_ocr_tiled = tiled
+        webapp.core.call_ocr = full
+        try:
+            res = webapp.ocr_one("long.png")
+        finally:
+            webapp.core.call_ocr = old_call
+            webapp.core.call_ocr_tiled = old_tiled
+            webapp._paths.clear()
+            webapp._paths.update(old_paths)
+        self.assertEqual(res["kind"], "handwriting")
+        names = [it["品名"] for it in res["items"]]
+        self.assertIn("薄荷叶", names)
+        self.assertNotIn("不该用这份", names)
 
 
 def _read_json(path):
@@ -539,6 +619,195 @@ class ShotGoldTargets(unittest.TestCase):
                 _assert_missing_receive_not_invented(self, parsed, gold, text)
         if not ran:
             self.skipTest("shot1/shot2 的 OCR 文本还没放进 samples/gold/ocr/")
+
+
+def _read_text(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+class MeicaiBareRecvAndNoise(unittest.TestCase):
+    """长图分条 OCR：收和金额拆行、坐标贴在文案上、标价单独一行。"""
+
+    def test_bare_recv_merges_next_line_qty(self):
+        text = "\n".join([
+            "美菜",
+            "送达时间 2026-09-04 07:12:48",
+            "订单号：2998060810 复制",
+            "促 大娃娃菜 优质 斤",
+            "￥6.90/3.00斤",
+            "订",
+            "￥6.90/3.00斤",
+            "收",
+            "￥6.99/3.04斤",
+            "付款信息",
+            "商品多退少补合计￥6.99",
+        ])
+        parsed = core.parse_meicai_text(text)
+        self.assertEqual(len(parsed["items"]), 1)
+        it = parsed["items"][0]
+        self.assertEqual(it["品名"], "大娃娃菜")
+        self.assertAlmostEqual(it["数量"], 3.04, places=2)
+        self.assertAlmostEqual(it["金额"], 6.99, places=2)
+        self.assertEqual(it["单位"], "斤")
+        self.assertFalse(it["实收缺失"])
+        self.assertNotAlmostEqual(it["数量"], 3.00, places=2)
+        self.assertNotAlmostEqual(it["金额"], 6.90, places=2)
+
+    def test_bare_recv_allows_spaces_and_fullwidth_yen(self):
+        text = "\n".join([
+            "订单号：2998060810 复制",
+            "送达时间 2026-09-04 07:12:48",
+            "美菜",
+            "鸡毛菜 普通 斤",
+            "  收  ",
+            "¥6.54/3.00斤",
+        ])
+        it = core.parse_meicai_text(text)["items"][0]
+        self.assertEqual(it["品名"], "鸡毛菜")
+        self.assertAlmostEqual(it["数量"], 3.0, places=2)
+        self.assertAlmostEqual(it["金额"], 6.54, places=2)
+        self.assertFalse(it["实收缺失"])
+
+    def test_noise_bbox_and_chrome_are_not_names(self):
+        text = "\n".join([
+            "美菜",
+            "订单详情",
+            "(56,141),(117,169)已完成",
+            "(49,217),(537,236)",
+            "美菜配送-已送达",
+            "您的订单被拆分为1个包裹配送，点击查看更多物流信息",
+            "送达时间 2026-09-04 07:12:48",
+            "签收方式 信任签收 | 店门口",
+            "司机姓名：苏师傅 联系司机",
+            "退款详情",
+            "订单号：2998060810 复制",
+            "大娃娃菜 优质 斤",
+            "收",
+            "￥1.50/1.00斤",
+            "付款信息",
+            "商品多退少补合计￥1.50",
+        ])
+        parsed = core.parse_meicai_text(text)
+        names = [it["品名"] for it in parsed["items"]]
+        self.assertEqual(names, ["大娃娃菜"])
+        self.assertAlmostEqual(parsed["items"][0]["数量"], 1.0, places=2)
+        blob = "\n".join(names)
+        for word in ("已完成", "美菜配送", "退款详情", "送达时间", "信任签收", "查看更多物流", "司机姓名", "订单详情"):
+            self.assertNotIn(word, blob)
+        self.assertIsNone(re.search(r"\(\s*\d+\s*,\s*\d+\s*\)", blob))
+        self.assertEqual(parsed["date"], "2026-09-04")
+
+    def test_missing_recv_keeps_name_when_price_is_on_next_line(self):
+        text = "\n".join([
+            "美菜",
+            "送达时间 2026-09-04 07:12:48",
+            "￥6.90",
+            "订单号：2998060810 复制",
+            "大娃娃菜 优质 斤",
+            "￥6.90/3.00斤",
+            "订",
+            "￥6.90/3.00斤",
+            "付款信息",
+            "商品多退少补合计￥6.90",
+        ])
+        parsed = core.parse_meicai_text(text)
+        self.assertEqual(len(parsed["items"]), 1)
+        it = parsed["items"][0]
+        self.assertEqual(it["品名"], "大娃娃菜")
+        self.assertIsNone(it["数量"])
+        self.assertIsNone(it["金额"])
+        self.assertTrue(it["实收缺失"])
+        self.assertTrue(any("实收" in s for s in parsed["suspects"]))
+        self.assertNotEqual(it["数量"], 3.0)
+        self.assertNotEqual(it["金额"], 6.9)
+
+    def test_shot3_tiled_fixture_fills_recv_and_drops_noise(self):
+        text = _read_text(SHOT3_TILED_OCR)
+        parsed = core.parse_meicai_text(text)
+        self.assertTrue(core.is_meicai_ocr(text))
+        self.assertEqual(parsed["date"], "2026-09-04")
+        self.assertEqual(parsed["paid"], 87.34)
+        cabbage = next(it for it in parsed["items"] if it["品名"] == "大娃娃菜")
+        self.assertAlmostEqual(cabbage["数量"], 3.04, places=2)
+        self.assertAlmostEqual(cabbage["金额"], 6.99, places=2)
+        self.assertFalse(cabbage["实收缺失"])
+        greens = next(it for it in parsed["items"] if it["品名"] == "鸡毛菜")
+        self.assertAlmostEqual(greens["数量"], 3.0, places=2)
+        self.assertAlmostEqual(greens["金额"], 6.54, places=2)
+        egg = next(it for it in parsed["items"] if it["品名"] == "鲜鸡蛋 红壳")
+        self.assertAlmostEqual(egg["数量"], 1.0, places=2)
+        self.assertAlmostEqual(egg["金额"], 20.08, places=2)
+        self.assertEqual(egg["单位"], "托")
+        claw = next(it for it in parsed["items"] if it["品名"] == "冻鸡爪 L号 大爪/长爪")
+        self.assertAlmostEqual(claw["数量"], 1.0, places=2)
+        self.assertAlmostEqual(claw["金额"], 28.69, places=2)
+        self.assertEqual(claw["单位"], "袋")
+        herb = next(it for it in parsed["items"] if it["品名"] == "鱼腥草")
+        self.assertAlmostEqual(herb["数量"], 1.0, places=2)
+        self.assertAlmostEqual(herb["金额"], 6.18, places=2)
+        beans = [it for it in parsed["items"] if it["品名"] == "优质黄豆" and it["金额"] == 4.66]
+        self.assertEqual(len(beans), 1)
+        self.assertEqual(beans[0]["单位"], "袋")
+        names = [it["品名"] for it in parsed["items"]]
+        blob = "\n".join(names)
+        for word in ("已完成", "美菜配送", "退款详情", "送达时间", "信任签收", "查看更多物流", "司机姓名"):
+            self.assertNotIn(word, blob)
+        self.assertIsNone(re.search(r"\(\s*\d+\s*,\s*\d+\s*\)", blob))
+        # 订货价 6.90/3.00 不是大娃娃菜的实收
+        self.assertFalse(any(
+            it["品名"] == "大娃娃菜" and it["金额"] == 6.9 and it["数量"] == 3.0
+            for it in parsed["items"]
+        ))
+
+    def test_shot3_full_image_does_not_invent_recv(self):
+        text = _read_text(SHOT3_OCR)
+        parsed = core.parse_meicai_text(text)
+        self.assertTrue(core.is_meicai_ocr(text))
+        self.assertEqual(parsed["date"], "2026-09-04")
+        self.assertEqual(parsed["paid"], 87.34)
+        self.assertGreaterEqual(len(parsed["items"]), 8)
+        self.assertTrue(any("大娃娃菜" in it["品名"] for it in parsed["items"]))
+        self.assertNotIn("共9类", [it["品名"] for it in parsed["items"]])
+        for it in parsed["items"]:
+            self.assertTrue(it["品名"])
+            self.assertIsNone(it["数量"])
+            self.assertIsNone(it["金额"])
+            self.assertTrue(it["实收缺失"])
+
+    def test_quality_prefers_tiled_shot3_and_more_recv(self):
+        tiled = _read_text(SHOT3_TILED_OCR)
+        full = _read_text(SHOT3_OCR)
+        self.assertGreater(core.meicai_ocr_quality(tiled), core.meicai_ocr_quality(full))
+        self.assertIs(core.choose_meicai_ocr_text([tiled, full]), tiled)
+        # 同分留前面的；整图实收更多时选整图。选的是原文，金额仍由解析读「收」。
+        self.assertIs(core.choose_meicai_ocr_text([full, full]), full)
+        weak = "\n".join([
+            "美菜配送",
+            "送达时间 2026-09-04 07:12:48",
+            "订单号：2998060810 复制",
+            "(1,2),(3,4)",
+            "大娃娃菜 斤",
+            "￥6.90/3.00斤",
+            "多退少补",
+        ])
+        rich = "\n".join([
+            "美菜",
+            "送达时间 2026-09-04 07:12:48",
+            "订单号：2998060810 复制",
+            "大娃娃菜 斤 ￥6.90/3.00斤",
+            "订 ￥6.90/3.00斤",
+            "收 ￥6.99/3.04斤",
+            "鸡毛菜 斤 ￥6.54/3.00斤",
+            "收 ￥6.54/3.00斤",
+            "商品多退少补合计￥13.53",
+        ])
+        self.assertGreater(core.meicai_ocr_quality(rich), core.meicai_ocr_quality(weak))
+        chosen = core.choose_meicai_ocr_text([weak, rich])
+        self.assertIs(chosen, rich)
+        item = next(it for it in core.parse_meicai_text(chosen)["items"] if it["品名"] == "大娃娃菜")
+        self.assertAlmostEqual(item["金额"], 6.99, places=2)
+        self.assertAlmostEqual(item["数量"], 3.04, places=2)
 
 
 if __name__ == "__main__":
