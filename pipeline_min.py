@@ -516,7 +516,8 @@ def extract_order_total(rows):
 
 
 # ===== 3.5 美菜 App 截图（纯文本，无 HTML 表） =====
-# 实收行：收 ￥金额/数量单位。订/下单数只是对照，缺「收」时不拿它填数量。
+# 实收行：同一行「收 ￥金额/数量单位」，或单独一行「收」且下一行是「￥金额/数量」。
+# 订/下单数只是对照。品名已经看到但没有实收时，留下品名，数量和金额空着。
 _MEICAI_AMT_QTY_RE = re.compile(
     r"[￥¥]\s*(\d+(?:\.\d+)?)\s*[/／]\s*(\d+(?:\.\d+)?)\s*"
     r"(斤|公斤|千克|kg|KG|托|件|箱|包|袋|盒|个|份|板|只|条|瓶|桶|提)?"
@@ -526,14 +527,23 @@ _MEICAI_PRICE_TAIL_RE = re.compile(
     r"[斤公斤千克kgKG托件箱包袋盒个份板只条瓶桶提]*"
 )
 _MEICAI_UNIT_TAIL_RE = re.compile(
-    r"(?:斤|公斤|千克|kg|KG|托(?:\s*[（(][^)）]{0,24}[)）])?|件|箱|包|袋|盒|个|份|板|只|条|瓶|桶|提)\s*$"
+    r"(?:斤|公斤|千克|kg|KG|托|件|箱|包|袋|盒|个|份|板|只|条|瓶|桶|提)"
+    r"(?:\s*[（(][^)）]{0,24}[)）])?\s*$"
 )
-_MEICAI_COORD_RE = re.compile(r"^\(\d+\s*,\s*\d+\)\s*,\s*\(\d+\s*,\s*\d+\)$")
+# 坐标只要出现在行内就丢掉。整行恰好是两对坐标的旧式 OCR，以及
+# 「(56,141),(117,169)已完成」这种贴在界面文案上的框，都不是品名。
+_MEICAI_BBOX_RE = re.compile(r"\(\s*\d+\s*,\s*\d+\s*\)")
+# 界面套话。整行含这些词就不当品名（送达时间仍从全文提日期）。
+_MEICAI_CHROME = (
+    "已完成", "美菜配送", "退款详情", "送达时间", "信任签收",
+    "查看更多物流", "司机姓名", "订单详情", "签收方式",
+)
 # 一级/二级留在品名里（Shot2 落地名是「黄瓜 二级」）。中码/大码仍是规格，会去掉。
+# 「促」是促销角标，不是品名。
 _MEICAI_SPEC_TOKENS = {
     "普通", "带皮", "去皮", "纯瘦", "优质", "水洗", "中码", "大码", "小码",
     "中号", "大号", "小号", "精品", "特级", "精选", "带泥",
-    "新鲜", "鲜", "带叶", "去根",
+    "新鲜", "鲜", "带叶", "去根", "促",
 }
 _MEICAI_PAY_WORDS = (
     "下单", "支付", "合计", "欠款", "直降", "优惠", "补交", "补款", "补足",
@@ -578,6 +588,7 @@ def _clean_meicai_name(raw):
     s = str(raw or "")
     s = re.sub(r"[\[【][^\]】]{0,40}[\]】]", "", s)
     s = _MEICAI_PRICE_TAIL_RE.sub(" ", s)
+    s = re.sub(r"\s*等额收货\s*", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     s = _MEICAI_UNIT_TAIL_RE.sub("", s).strip()
     tokens = [t for t in s.split() if t]
@@ -606,7 +617,7 @@ def _clean_meicai_name(raw):
 
 
 def _meicai_goods_cutoff(line):
-    s = line.strip()
+    s = re.sub(r"^#+\s*", "", (line or "").strip())
     if "付款信息" in s:
         return True
     if re.match(r"共\s*\d+\s*类", s):
@@ -677,11 +688,36 @@ def _blank_meicai_item(name, order_id, unit=""):
     }
 
 
+def _meicai_norm_line(line):
+    return re.sub(r"^#+\s*", "", (line or "").strip())
+
+
+def _meicai_is_noise_line(s):
+    """坐标框、界面套话、补差标签。不当品名。"""
+    if not s:
+        return True
+    if _MEICAI_BBOX_RE.search(s):
+        return True
+    if any(k in s for k in _MEICAI_CHROME):
+        return True
+    if s in ("复制", "等额收货", "已完成", "补", "退", "美菜", "美菜商城") or s.startswith("您的订单"):
+        return True
+    if s.startswith("+") or re.match(r"^-\s*[￥¥]", s):
+        return True
+    return False
+
+
+def _meicai_price_only_line(line):
+    """只有「￥金额/数量单位」，没有品名。标价或订货价，不是新的一行货。"""
+    s = _meicai_norm_line(line)
+    if _meicai_is_noise_line(s) or not _parse_meicai_amt_qty(s):
+        return False
+    return not _clean_meicai_name(s)
+
+
 def _meicai_line_kind(line):
-    s = re.sub(r"^#+\s*", "", (line or "").strip())
-    if not s or _MEICAI_COORD_RE.match(s):
-        return "noise", s
-    if s in ("复制", "等额收货", "已完成") or s.startswith("您的订单"):
+    s = _meicai_norm_line(line)
+    if _meicai_is_noise_line(s):
         return "noise", s
     oid = re.search(r"订单号\s*[:：]\s*(\d{6,})", s)
     if oid:
@@ -690,12 +726,12 @@ def _meicai_line_kind(line):
         return "order", s
     if s.startswith("收"):
         return "recv", s
-    if s.startswith("+"):
-        return "noise", s
     if any(k in s for k in _MEICAI_PAY_WORDS) and _parse_meicai_amt_qty(s) is None:
         return "pay", s
     if _parse_meicai_amt_qty(s):
-        return "title", s
+        if _clean_meicai_name(s):
+            return "title", s
+        return "price", s
     if re.search(r"[\u4e00-\u9fff]", s):
         return "name", s
     return "noise", s
@@ -707,7 +743,8 @@ def parse_meicai_text(text):
     一图里多个订单号仍是一张单，订单号只作溯源。
     明细只认货品的「收」行。直降、历史欠款、补差不单独成行；
     补差已经含在实收金额里。没有「收」就空着数量和金额，标实收缺失，
-    不用订货数填。
+    不用订货数填。品名单独一行、金额在下一行时也留下品名。
+    「收」单独一行、下一行是「￥金额/数量」时，与「收 ￥…」同样算实收。
     """
     date = extract_meicai_date(text)
     paid = extract_meicai_paid(text)
@@ -723,40 +760,85 @@ def parse_meicai_text(text):
     def _push(item):
         if item is None:
             return
+        name = str(item.get("品名") or "").strip()
         if item.get("数量") is None or item.get("金额") is None:
+            # 缺实收只清数量和金额，品名留着给人工对原图。
             item["数量"] = None
             item["金额"] = None
             item["实收缺失"] = True
+        if not name and item.get("数量") is None and item.get("金额") is None:
+            return
         items.append(item)
 
-    for raw_line in str(text or "").splitlines():
+    raw_lines = str(text or "").splitlines()
+    i = 0
+    n = len(raw_lines)
+    while i < n:
+        raw_line = raw_lines[i]
         if _meicai_goods_cutoff(raw_line):
             break
         kind, payload = _meicai_line_kind(raw_line)
         if kind in ("noise", "pay"):
+            i += 1
+            continue
+        if kind == "price":
+            # 品名下一行的标价 / 订货价。不新开一行，也不把已经看到的品名清掉。
+            if pending_name:
+                seen_goods = True
+            i += 1
             continue
         if kind == "oid":
             seen_goods = True
             current_oid = payload
+            i += 1
             continue
         if kind == "order":
             seen_goods = True
+            i += 1
             continue
         if kind == "name":
-            pending_name = (pending_name + " " + payload).strip() if pending_name else payload
+            # 美菜品名行以单位结尾（「大娃娃菜 优质 斤」）。后面这条盖住前面的广告文案，
+            # 广告不再粘进品名；没有单位的说明行仍接在当前品名后面。
+            if _MEICAI_UNIT_TAIL_RE.search(payload):
+                pending_name = payload
+            else:
+                pending_name = (pending_name + " " + payload).strip() if pending_name else payload
+            i += 1
             continue
         if kind == "title":
             seen_goods = True
+            if pending_name:
+                name = _clean_meicai_name(pending_name)
+                pending_name = ""
+                if name:
+                    _push(current)
+                    current = None
+                    _push(_blank_meicai_item(name, current_oid))
             _push(current)
             parsed = _parse_meicai_amt_qty(payload)
             unit = parsed[2] if parsed else ""
             current = _blank_meicai_item(_clean_meicai_name(payload), current_oid, unit)
             pending_name = ""
+            i += 1
             continue
         if kind == "recv":
             seen_goods = True
             parsed = _parse_meicai_amt_qty(payload)
-            if current is None:
+            # 分条 OCR 常把「收」和金额拆成两行。只合并紧挨着的纯金额行。
+            if parsed is None and payload == "收" and i + 1 < n:
+                nxt = raw_lines[i + 1]
+                if not _meicai_goods_cutoff(nxt) and _meicai_price_only_line(nxt):
+                    parsed = _parse_meicai_amt_qty(nxt)
+                    i += 1
+            # 上一条已经写下实收时，这个「收」属于下一件货，不能把上一条的数量盖掉。
+            closed = (
+                current is not None
+                and current.get("数量") is not None
+                and current.get("金额") is not None
+                and not current.get("实收缺失")
+            )
+            if pending_name or current is None or closed:
+                _push(current)
                 name = _clean_meicai_name(pending_name) if pending_name else ""
                 current = _blank_meicai_item(name, current_oid)
                 pending_name = ""
@@ -764,6 +846,7 @@ def parse_meicai_text(text):
                 current["实收缺失"] = True
                 current["数量"] = None
                 current["金额"] = None
+                i += 1
                 continue
             amt, qty, unit = parsed
             current["金额"] = amt
@@ -771,13 +854,15 @@ def parse_meicai_text(text):
             if unit:
                 current["单位"] = unit
             current["实收缺失"] = False
+            i += 1
             continue
+        i += 1
     if current is not None:
         _push(current)
-    elif pending_name and seen_goods:
-        orphan = _blank_meicai_item(_clean_meicai_name(pending_name), current_oid)
-        orphan["实收缺失"] = True
-        items.append(orphan)
+    if pending_name and seen_goods:
+        name = _clean_meicai_name(pending_name)
+        if name:
+            _push(_blank_meicai_item(name, current_oid))
 
     suspects = []
     missing = sum(1 for it in items if it.get("实收缺失"))
@@ -796,6 +881,82 @@ def parse_meicai_text(text):
         "items": items,
         "suspects": suspects,
     }
+
+
+def meicai_ocr_quality(text):
+    """同一张美菜长图的两份 OCR 怎么比。只打分，不改、不编金额。
+
+    score = 可用实收数 × 100 + 干净货品行 × 5 − 噪声行 × 2
+
+    可用实收：去掉空白后整行就是「收」，且这一行或下一行能解析出
+    「￥金额/数量单位」；或者「收」和金额写在同一行。订货行不算。
+    干净货品行：品名和标价在同一行，或品名的下一行是纯标价（没有品名的金额行）。
+    噪声行：行内出现「(数字,数字)」坐标，或界面套话（已完成、美菜配送、退款详情、
+    送达时间、信任签收、查看更多物流、司机姓名等）。
+    只统计「付款信息 / 共N类」之前的行。实收权重最高，避免整图品名整齐但没有「收」
+    盖过有实收的分条结果。
+    """
+    lines = []
+    for raw in str(text or "").splitlines():
+        if _meicai_goods_cutoff(raw):
+            break
+        s = _meicai_norm_line(raw)
+        if s:
+            lines.append(s)
+    recv = 0
+    goods = 0
+    noise = 0
+    i = 0
+    while i < len(lines):
+        s = lines[i]
+        if _meicai_is_noise_line(s):
+            noise += 1
+            i += 1
+            continue
+        if any(k in s for k in _MEICAI_PAY_WORDS) and _parse_meicai_amt_qty(s) is None:
+            i += 1
+            continue
+        parsed = _parse_meicai_amt_qty(s)
+        if s == "收" or (s.startswith("收") and parsed):
+            got = parsed
+            if got is None and s == "收" and i + 1 < len(lines) and _meicai_price_only_line(lines[i + 1]):
+                got = _parse_meicai_amt_qty(lines[i + 1])
+                i += 1
+            if got:
+                recv += 1
+            i += 1
+            continue
+        if s.startswith("订"):
+            i += 1
+            continue
+        if parsed and _clean_meicai_name(s):
+            goods += 1
+        elif re.search(r"[\u4e00-\u9fff]", s) and i + 1 < len(lines) and _meicai_price_only_line(lines[i + 1]):
+            goods += 1
+        i += 1
+    return recv * 100 + goods * 5 - noise * 2
+
+
+def choose_meicai_ocr_text(texts):
+    """在同一张长图的多份 OCR 原文里选一份。不改数字。
+
+    有任一份像美菜时，只在这些里面比 meicai_ocr_quality，
+    避免把认成手写表的那份选上来把实收丢掉。
+    都不像美菜时比同一分数；分数相同留前面的那份（调用方把分条放前面）。
+    """
+    usable = [t for t in texts or [] if str(t or "").strip()]
+    if not usable:
+        return ""
+    meicai = [t for t in usable if is_meicai_ocr(t)]
+    pool = meicai or usable
+    best = pool[0]
+    best_score = meicai_ocr_quality(best)
+    for text in pool[1:]:
+        score = meicai_ocr_quality(text)
+        if score > best_score:
+            best = text
+            best_score = score
+    return best
 
 
 def _meicai_line_sig(items):

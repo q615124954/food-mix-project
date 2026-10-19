@@ -732,13 +732,25 @@ def _ocr_needs_retry(parsed):
 
 
 def _ocr_text_for_path(path):
-    """长截图先分条识别。失败或空结果再整图识一次。短图只整图。"""
+    """长截图分条识别，再和整图 OCR 比哪份更能用。短图只整图。
+
+    两份都有字、且至少一份像美菜时，用 meicai_ocr_quality 选：
+    可用「收」更多优先，其次噪声更少、干净货品行更多。分数相同留分条结果。
+    都不像美菜时仍用分条结果（手写单不因多打一次整图而换文本）。
+    分条失败或为空，才退回整图。选中的是 OCR 原文，不在这里填金额。
+    """
     if core.looks_like_long_screenshot(path):
         try:
             tiled = core.call_ocr_tiled(path) or ""
         except Exception:
             tiled = ""
         if str(tiled).strip():
+            try:
+                full = core.call_ocr(path) or ""
+            except Exception:
+                full = ""
+            if str(full).strip() and (core.is_meicai_ocr(tiled) or core.is_meicai_ocr(full)):
+                return core.choose_meicai_ocr_text([tiled, full])
             return tiled
     return core.call_ocr(path)
 
