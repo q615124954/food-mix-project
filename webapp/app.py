@@ -10,6 +10,7 @@ import json
 import re
 import shutil
 import time
+import copy
 import threading
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
@@ -321,6 +322,12 @@ def classify_item(name, category, in_staff_zone=False, suggestion=""):
 def assign_attribution(items, category=None):
     """给每行打「归属 / 归属依据 / 归属待确认」，返回 items。"""
     for it in items:
+        # 美菜明细是货品。对不上物料表时标品名存疑，不默认打成员工餐。
+        if it.get("渠道") == "美菜" and not it.get("员工区") and not is_staff_meal_only(it.get("品名")):
+            it["归属"] = MATERIAL
+            it["归属依据"] = ""
+            it["归属待确认"] = False
+            continue
         cat = category if category not in (None, "") else (it.get("类别") or "蔬菜")
         zone = bool(it.get("员工区"))
         suggestion = ""
@@ -547,7 +554,8 @@ def compute_suspects(date, items):
         if nm:
             name_counts[nm] = name_counts.get(nm, 0) + 1
     dups = [nm for nm, c in name_counts.items() if c > 1]
-    if dups:
+    # 美菜同一天多张截图按顺序拼接，同名货品是两行，不是误识别。
+    if dups and not any(it.get("渠道") == "美菜" for it in items):
         for it in items:
             nm = str(it.get("品名", "")).strip()
             if name_counts.get(nm, 0) > 1:
@@ -688,6 +696,20 @@ def correct_item_names(items):
 
 
 def _ticket_from_ocr(text, filename):
+    if core.is_meicai_ocr(text):
+        parsed = core.parse_meicai_text(text)
+        items, _stat = core.derive_price(parsed["items"])
+        return {
+            "text": text,
+            "rows": [],
+            "items": items,
+            "date": parsed["date"] or core.extract_date(text, filename),
+            "order_total": parsed.get("paid"),
+            "order_ids": parsed.get("order_ids") or [],
+            "note": parsed.get("note") or "",
+            "kind": "meicai",
+            "meicai_suspects": parsed.get("suspects") or [],
+        }
     rows = core.parse_table(text)
     items, _stat = core.derive_price(core.parse_line_items(rows))
     return {
@@ -695,24 +717,98 @@ def _ticket_from_ocr(text, filename):
         "rows": rows,
         "items": items,
         "date": core.extract_date(text, filename),
+        "kind": "handwriting",
     }
 
 
 def _ocr_needs_retry(parsed):
-    """有序号但内容空的行 ≥2，或一行有效明细都没有（空占位不算）。"""
+    """有序号但内容空的行 ≥2，或一行有效明细都没有（空占位不算）。
+    美菜截图不做阴影/平场增强，那几档是给粉纸手写单的。"""
+    if parsed.get("kind") == "meicai":
+        return False
     if _count_missing_rows(parsed["rows"]) >= 2:
         return True
     return core.content_item_score(parsed["items"])[0] == 0
 
 
+def _ocr_text_for_path(path):
+    """长截图先分条识别。失败或空结果再整图识一次。短图只整图。"""
+    if core.looks_like_long_screenshot(path):
+        try:
+            tiled = core.call_ocr_tiled(path) or ""
+        except Exception:
+            tiled = ""
+        if str(tiled).strip():
+            return tiled
+    return core.call_ocr(path)
+
+
+def _annotate_meicai_missing(items):
+    for it in items:
+        if it.get("渠道") != "美菜":
+            continue
+        if not it.get("实收缺失") and it.get("数量") is not None and it.get("金额") is not None:
+            continue
+        it["实收缺失"] = True
+        it["数量存疑"] = True
+        it["金额存疑"] = True
+        it["存疑说明"] = core.MEICAI_MISSING_RECV
+
+
+def _meicai_review_suspects(date, items, order_total, extra, paid=None):
+    suspects = compute_suspects(date, items)
+    total = core.sum_amount(items)
+    tip = order_total_suspect(total, order_total)
+    if tip and tip not in suspects:
+        suspects.append(tip)
+    _annotate_meicai_missing(items)
+    for s in extra or []:
+        if s and s not in suspects:
+            suspects.append(s)
+    # 美菜实付就是结算后合计。明细没齐时合计会对不上，上面的 tip 已经提示，不把实付改成下单实付。
+    if paid is None:
+        paid = order_total
+    return _with_paid_suspect(suspects, paid, items, order_total)
+
+
+def _pack_meicai(chosen, items, date):
+    order_total = chosen.get("order_total")
+    order_ids = list(chosen.get("order_ids") or [])
+    note = chosen.get("note") or ""
+    correct_item_names(items)
+    suspects = _meicai_review_suspects(date, items, order_total, chosen.get("meicai_suspects"))
+    total = core.sum_amount(items)
+    part = {
+        "date": date,
+        "paid": order_total,
+        "order_ids": order_ids,
+        "items": copy.deepcopy(items),
+        "note": note,
+        "suspects": list(chosen.get("meicai_suspects") or []),
+    }
+    return {
+        "date": date,
+        "total": total,
+        "order_total": order_total,
+        "paid_total": order_total,
+        "items": items,
+        "suspects": suspects,
+        "order_ids": order_ids,
+        "note": note,
+        "kind": "meicai",
+        "meicai_part": part,
+    }
+
+
 def ocr_one(filename):
     path = os.path.join(_paths["input_dir"], filename)
-    text = core.call_ocr(path)
+    text = _ocr_text_for_path(path)
     chosen = _ticket_from_ocr(text, filename)
     # 漏识别兜底。已经认出明细、只是空序号偏多：仍只做原来的阴影补偿，避免每张单多打几次 OCR。
     # 一行内容都没有（粉纸复写 + 手影，表格只剩序号）：按 shadow → red → flat 各识一次，取最全的那次。
     # 增强把表认丢、或内容不比当前多，都不覆盖。增强没认出日期时留下原图的日期。
-    if _ocr_needs_retry(chosen):
+    # 美菜截图不走这几档：增强会把界面文字涂掉，而且缺「收」时应留给人工填，不能靠重试编数量。
+    if chosen.get("kind") != "meicai" and _ocr_needs_retry(chosen):
         strategies = (
             core.OCR_RETRY_PASSES
             if core.content_item_score(chosen["items"])[0] == 0
@@ -723,18 +819,21 @@ def ocr_one(filename):
                 cand = _ticket_from_ocr(core.call_ocr(path, enhance=strategy), filename)
             except Exception:
                 continue
-            if core.ocr_parse_richer(cand["items"], cand["rows"], chosen["items"], chosen["rows"]):
+            if cand.get("kind") == "meicai" or core.ocr_parse_richer(
+                    cand["items"], cand["rows"], chosen["items"], chosen["rows"]):
                 if chosen.get("date") and not cand.get("date"):
                     cand["date"] = chosen["date"]
                 chosen = cand
-            if not _ocr_needs_retry(chosen):
+            if chosen.get("kind") == "meicai" or not _ocr_needs_retry(chosen):
                 break
-    text, rows, items = chosen["text"], chosen["rows"], chosen["items"]
+    rows, items = chosen["rows"], chosen["items"]
     date = chosen["date"]
-    total = core.sum_amount(items)
-    order_total = core.extract_order_total(rows)
     for it in items:
         it["日期"] = date
+    if chosen.get("kind") == "meicai":
+        return _pack_meicai(chosen, items, date)
+    total = core.sum_amount(items)
+    order_total = core.extract_order_total(rows)
     correct_item_names(items)
     suspects = compute_suspects(date, items)
     missing = _count_missing_rows(rows)
@@ -749,7 +848,7 @@ def ocr_one(filename):
         suspects.append(f"疑似漏识别 {missing} 行（有序号但内容为空，可能补货段未识别，请人工核对补录）")
     # 实付还没填，打开复核页会按合计预填。票面合计更低时先标出来，等人手改实付。
     suspects = _with_paid_suspect(suspects, None, items, order_total)
-    return {"date": date, "total": total, "order_total": order_total, "items": items, "suspects": suspects}
+    return {"date": date, "total": total, "order_total": order_total, "items": items, "suspects": suspects, "kind": "handwriting"}
 
 
 def build_invoice_index():
@@ -762,11 +861,14 @@ def build_invoice_index():
             # 旧状态可能没有 total，用明细金额补算
             if inv.get("total") in (None, ""):
                 inv["total"] = core.sum_amount(inv.get("items", []))
-            # 每次重算 suspects（基于现有明细），保证规则更新后重启即生效
-            if inv.get("ocr_done") and inv.get("items"):
+            # 每次重算 suspects（基于现有明细），保证规则更新后重启即生效。
+            # 带 meicai_part 的美菜单交给下面的按日合并重算，避免把订单号冲突提示冲掉。
+            if inv.get("ocr_done") and inv.get("items") and not (
+                    inv.get("kind") == "meicai" and inv.get("meicai_part")):
                 suspects = compute_suspects(inv.get("date", ""), inv.get("items", []))
                 inv["suspects"] = _with_paid_suspect(
                     suspects, inv.get("paid_total"), inv.get("items", []), inv.get("order_total"))
+                _annotate_meicai_missing(inv.get("items", []))
             elif "suspects" not in inv:
                 inv["suspects"] = []
             invoices.append(inv)
@@ -782,6 +884,7 @@ def build_invoice_index():
                 "error": "",
                 "suspects": [],
             })
+    apply_meicai_day_merge(invoices)
     with _lock:
         _state["invoices"] = invoices
     save_state()
@@ -799,6 +902,16 @@ def _ocr_one_inv(inv):
             inv["order_total"] = res.get("order_total")
             inv["items"] = res["items"]
             inv["suspects"] = res.get("suspects", [])
+            inv["kind"] = res.get("kind") or "handwriting"
+            if inv["kind"] == "meicai":
+                inv["paid_total"] = res.get("paid_total")
+                inv["order_ids"] = res.get("order_ids") or []
+                inv["note"] = res.get("note") or ""
+                inv["meicai_part"] = res.get("meicai_part")
+            else:
+                inv["order_ids"] = []
+                inv["note"] = ""
+                inv["meicai_part"] = None
             inv["ocr_done"] = True
             inv["error"] = ""
             return True
@@ -807,6 +920,101 @@ def _ocr_one_inv(inv):
             time.sleep(3)
     inv["error"] = last_err
     return False
+
+
+def apply_meicai_day_merge(invoices):
+    """同一配送日的美菜截图并成一张待复核单。已确认的不拆开重并。
+
+    货品行来自每张截图自己的 meicai_part（识别原文），不按品名合并。
+    文件集合没变时不覆盖复核页上已经改过的行。
+    """
+    pending = []
+    confirmed_dates = set()
+    for inv in invoices or []:
+        if inv.get("kind") != "meicai":
+            continue
+        if inv.get("status") == "confirmed":
+            if inv.get("date"):
+                confirmed_dates.add(str(inv.get("date")))
+            continue
+        if inv.get("ocr_done") and inv.get("meicai_part"):
+            pending.append(inv)
+    groups = {}
+    order = []
+    for inv in pending:
+        part = inv.get("meicai_part") or {}
+        date = str(part.get("date") or inv.get("date") or "")
+        if not date:
+            continue
+        if date not in groups:
+            groups[date] = []
+            order.append(date)
+        groups[date].append(inv)
+    for date in order:
+        group = sorted(groups[date], key=lambda x: x.get("filename") or "")
+        names = [g.get("filename") for g in group]
+        if date in confirmed_dates:
+            msg = f"配送日 {date} 已有确认过的美菜单，本张未自动合并，请核对是否重复"
+            for g in group:
+                if g.get("status") == "merged":
+                    continue
+                sus = list(g.get("suspects") or [])
+                if msg not in sus:
+                    sus.append(msg)
+                g["suspects"] = sus
+            continue
+        primary = group[0]
+        docs = []
+        for g in group:
+            part = dict(g.get("meicai_part") or {})
+            part.setdefault("date", date)
+            docs.append(part)
+        merged_list = core.merge_meicai_docs(docs)
+        merged = merged_list[0] if merged_list else {
+            "items": [], "order_ids": [], "note": "", "paid": None, "suspects": [],
+        }
+        unchanged = (
+            primary.get("status") != "merged"
+            and list(primary.get("meicai_merged_from") or []) == names
+            and bool(primary.get("items"))
+        )
+        if not unchanged:
+            items = copy.deepcopy(merged.get("items") or [])
+            for it in items:
+                it["日期"] = date
+            note = merged.get("note") or ""
+            if len(names) > 1:
+                shot = "截图 " + "、".join(names)
+                note = (note + "；" + shot) if note else shot
+            primary["items"] = items
+            primary["date"] = date
+            primary["order_ids"] = list(merged.get("order_ids") or [])
+            primary["note"] = note
+            primary["order_total"] = merged.get("paid")
+            primary["paid_total"] = merged.get("paid")
+            primary["total"] = core.sum_amount(items)
+            primary["kind"] = "meicai"
+            primary["status"] = "pending"
+            primary["meicai_merged_from"] = list(names)
+            primary["source_files"] = list(names)
+            primary["merged_into"] = ""
+        items = primary.get("items") or []
+        paid = primary.get("paid_total")
+        if paid in ("", None):
+            paid = primary.get("order_total")
+        primary["suspects"] = _meicai_review_suspects(
+            date, items, primary.get("order_total"), merged.get("suspects"), paid=paid)
+        for other in group[1:]:
+            other["status"] = "merged"
+            other["merged_into"] = primary.get("filename")
+            other["items"] = []
+            other["total"] = None
+            other["order_total"] = None
+            other["paid_total"] = None
+            other["note"] = f"已并入 {primary.get('filename')}（配送日 {date}）"
+            other["suspects"] = [other["note"]]
+            other["meicai_merged_from"] = list(names)
+    return invoices
 
 
 def ocr_worker():
@@ -830,6 +1038,8 @@ def ocr_worker():
                 except Exception:
                     pass
                 save_state()       # 每完成一张即落一次状态，前端轮询可及时看到
+        apply_meicai_day_merge(_state["invoices"])
+        save_state()
     finally:
         _ocr_lock.release()
 
@@ -856,6 +1066,12 @@ def normalize_item(it, category=None):
         "金额": _num(it.get("金额")),
         "员工区": bool(it.get("员工区")),
     }
+    if it.get("渠道"):
+        out["渠道"] = str(it.get("渠道"))
+    if it.get("订单号"):
+        out["订单号"] = str(it.get("订单号"))
+    if it.get("单位"):
+        out["单位"] = str(it.get("单位"))
     if it.get("人工补录"):
         out["人工补录"] = True
     if category not in (None, ""):
@@ -2005,9 +2221,9 @@ def _line_has_content(it):
     return it.get("金额") not in (None, "")
 
 
-def append_land(filename, date, category, total, paid_total, items):
+def append_land(filename, date, category, total, paid_total, items, note=""):
     os.makedirs(_paths["output_dir"], exist_ok=True)
-    HEADERS = ["日期", "类别", "品名", "数量", "单价", "金额", "来源图片", "合计", "实付合计", "归属", "品名编辑", "员工区"]
+    HEADERS = ["日期", "类别", "品名", "数量", "单价", "金额", "来源图片", "合计", "实付合计", "归属", "品名编辑", "员工区", "溯源"]
     land = land_file()
     with _land_lock:
         if os.path.exists(land):
@@ -2026,6 +2242,7 @@ def append_land(filename, date, category, total, paid_total, items):
             ws.cell(1, 10).value = "归属"
             ws.cell(1, 11).value = "品名编辑"
             ws.cell(1, 12).value = "员工区"
+            ws.cell(1, 13).value = "溯源"
             # 按来源图片去重：先删掉该图片已有的旧行，再覆盖式写入
             for r in range(ws.max_row, 1, -1):
                 if ws.cell(r, 7).value == filename:
@@ -2045,6 +2262,7 @@ def append_land(filename, date, category, total, paid_total, items):
                 excel_attr(it),
                 bool(it.get("品名编辑")),
                 bool(it.get("员工区") or it.get("人工补录")),
+                note or "",
             ])
         _merge_by_source(ws)
         wb.save(land)
@@ -2139,6 +2357,18 @@ def confirm(filename: str, payload: ConfirmPayload):
         raise HTTPException(400, "请选择类别（蔬菜或肉类）后再确认；缺少类别时不会默认写成蔬菜")
     items = [normalize_item(it, category) for it in payload.items]
     # 归属以确认时的最终品名重新判定（人工改过品名也生效）；员工区标记来自识别或人工补录
+    note = ""
+    kind = ""
+    for inv in _state["invoices"]:
+        if inv["filename"] == filename:
+            if inv.get("status") == "merged":
+                raise HTTPException(400, "这张截图已并入同配送日的美菜单，请在合并后的那张上确认")
+            note = inv.get("note") or ""
+            kind = inv.get("kind") or ""
+            break
+    if kind == "meicai":
+        for it in items:
+            it["渠道"] = "美菜"
     assign_attribution(items, category)
     # 员工餐? 在落地前按同步置信度归物料。人工改过的名字、员工区和海底捞不会进这里。
     promote_tentative_staff_items(items, category, "DeepSeek-V4-Pro")
@@ -2179,7 +2409,7 @@ def confirm(filename: str, payload: ConfirmPayload):
             # 先写落地表，成功后再标已确认。WPS 占用导致写入失败时保持未确认，
             # 避免网页显示已确认但 Excel 里没有这张单。
             try:
-                append_land(filename, payload.date, category, total, paid, items)
+                append_land(filename, payload.date, category, total, paid, items, note=note)
             except PermissionError:
                 raise HTTPException(500, "落地文件被占用，请先关闭 WPS 后重试")
             except Exception as e:

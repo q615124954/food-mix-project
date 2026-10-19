@@ -145,10 +145,20 @@ def prepare_image(path, enhance=False):
     return buf, os.path.basename(path)
 
 
-def call_ocr(image_path, timeout=600, enhance=False):
-    """调用 HunyuanOCR 专用接口识别图片，返回 HTML 表格文本。
-    注：模力方舟 OCR 平台侧偶发极慢（实测 400+ 秒/张），超时须放宽到 10 分钟。"""
-    buf, name = prepare_image(image_path, enhance)
+def _image_to_jpeg_buf(img, name="image.jpg"):
+    """最长边超过 MAX_SIZE 时等比缩小，返回 (JPEG 字节流, 文件名)。"""
+    img = img.convert("RGB")
+    w, h = img.size
+    if max(w, h) > MAX_SIZE:
+        scale = MAX_SIZE / float(max(w, h))
+        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=92)
+    buf.seek(0)
+    return buf, name
+
+
+def _post_ocr_buf(buf, name, timeout):
     files = {"image": (name, buf, "image/jpeg")}
     data = {"model": MODEL}
     r = requests.post(
@@ -160,7 +170,90 @@ def call_ocr(image_path, timeout=600, enhance=False):
     )
     if r.status_code != 200:
         raise RuntimeError(f"OCR失败 {r.status_code}: {r.text[:200]}")
-    return r.json().get("text_result") or r.json().get("text") or ""
+    body = r.json()
+    return body.get("text_result") or body.get("text") or ""
+
+
+def call_ocr(image_path, timeout=600, enhance=False):
+    """调用 HunyuanOCR 专用接口识别图片，返回 HTML 表格文本。
+    注：模力方舟 OCR 平台侧偶发极慢（实测 400+ 秒/张），超时须放宽到 10 分钟。"""
+    buf, name = prepare_image(image_path, enhance)
+    return _post_ocr_buf(buf, name, timeout)
+
+
+def looks_like_long_screenshot(path):
+    """手机长截图：窄、且高度超过 OCR 最长边。手写单照片通常更宽，不走这里。
+
+    打不开文件时返回 False，调用方继续用整图 OCR。"""
+    try:
+        img = Image.open(path)
+        img = ImageOps.exif_transpose(img)
+        w, h = img.size
+    except Exception:
+        return False
+    if w <= 0 or h <= 0:
+        return False
+    return w <= 1600 and h > MAX_SIZE and (h / float(w)) >= 2.4
+
+
+def iter_vertical_slices(img, max_edge=None, overlap=0.15):
+    """把长图切成竖向重叠条，每条最长边不超过 max_edge，避免整图缩成一条窄图。"""
+    max_edge = MAX_SIZE if max_edge is None else int(max_edge)
+    w, h = img.size
+    if w <= 0 or h <= 0:
+        return
+    slice_h = h if w > max_edge else min(h, max_edge)
+    if h <= slice_h:
+        yield img
+        return
+    step = max(1, int(slice_h * (1 - overlap)))
+    y = 0
+    while y < h:
+        if h - y < slice_h and y > 0:
+            y = h - slice_h
+        bottom = min(h, y + slice_h)
+        yield img.crop((0, y, w, bottom))
+        if bottom >= h:
+            break
+        y += step
+
+
+def join_ocr_slices(texts):
+    """按切片顺序拼接 OCR 文本。相邻切片若有完全相同的行重叠，只保留一份。"""
+    acc = []
+    for text in texts or []:
+        lines = [ln.strip() for ln in str(text or "").splitlines() if ln.strip()]
+        if not lines:
+            continue
+        if not acc:
+            acc = lines
+            continue
+        max_k = min(len(acc), len(lines), 12)
+        cut = 0
+        for k in range(max_k, 0, -1):
+            if acc[-k:] == lines[:k]:
+                cut = k
+                break
+        acc.extend(lines[cut:])
+    deduped = []
+    for ln in acc:
+        if deduped and deduped[-1] == ln:
+            continue
+        deduped.append(ln)
+    return "\n".join(deduped)
+
+
+def call_ocr_tiled(image_path, timeout=600, overlap=0.15):
+    """长截图分条识别再拼接。某一条失败则整次抛出，调用方回退整图 OCR。
+
+    只拼接模型返回的文字，不根据原图像素补数量或金额。"""
+    img = Image.open(image_path)
+    img = ImageOps.exif_transpose(img)
+    texts = []
+    for i, crop in enumerate(iter_vertical_slices(img, overlap=overlap)):
+        buf, name = _image_to_jpeg_buf(crop, f"slice-{i}.jpg")
+        texts.append(_post_ocr_buf(buf, name, timeout))
+    return join_ocr_slices(texts)
 
 
 # ===== 2.5 文本 LLM 调用（品名归并等） =====
@@ -420,6 +513,390 @@ def extract_order_total(rows):
             if m:
                 found = round(float(m.group(1)), 2)
     return found
+
+
+# ===== 3.5 美菜 App 截图（纯文本，无 HTML 表） =====
+# 实收行：收 ￥金额/数量单位。订/下单数只是对照，缺「收」时不拿它填数量。
+_MEICAI_AMT_QTY_RE = re.compile(
+    r"[￥¥]\s*(\d+(?:\.\d+)?)\s*[/／]\s*(\d+(?:\.\d+)?)\s*"
+    r"(斤|公斤|千克|kg|KG|托|件|箱|包|袋|盒|个|份|板|只|条|瓶|桶|提)?"
+)
+_MEICAI_PRICE_TAIL_RE = re.compile(
+    r"[￥¥]\s*\d+(?:\.\d+)?\s*[/／]\s*\d+(?:\.\d+)?\s*"
+    r"[斤公斤千克kgKG托件箱包袋盒个份板只条瓶桶提]*"
+)
+_MEICAI_UNIT_TAIL_RE = re.compile(
+    r"(?:斤|公斤|千克|kg|KG|托(?:\s*[（(][^)）]{0,24}[)）])?|件|箱|包|袋|盒|个|份|板|只|条|瓶|桶|提)\s*$"
+)
+_MEICAI_COORD_RE = re.compile(r"^\(\d+\s*,\s*\d+\)\s*,\s*\(\d+\s*,\s*\d+\)$")
+# 一级/二级留在品名里（Shot2 落地名是「黄瓜 二级」）。中码/大码仍是规格，会去掉。
+_MEICAI_SPEC_TOKENS = {
+    "普通", "带皮", "去皮", "纯瘦", "优质", "水洗", "中码", "大码", "小码",
+    "中号", "大号", "小号", "精品", "特级", "精选", "带泥",
+    "新鲜", "鲜", "带叶", "去根",
+}
+_MEICAI_PAY_WORDS = (
+    "下单", "支付", "合计", "欠款", "直降", "优惠", "补交", "补款", "补足",
+    "多退少补", "总额", "商品总价", "商品金额", "付款", "实付", "签收",
+    "司机", "物流", "包裹", "复制", "金额",
+)
+MEICAI_MISSING_RECV = "未识别到实收（收），请对照原图填写数量和金额，不要用下单数"
+
+
+def meicai_missing_recv_summary(n):
+    return f"{n} 行未识别到实收，请对照原图补数量和金额（不要用下单数）"
+
+
+def is_meicai_ocr(text):
+    """美菜/订单截图的纯文本。手写单是 HTML 表，关键字对不上，仍走原解析。
+
+    拿不准时看这些词：美菜、订单号、送达/配送时间、订/收 成对出现、多退少补。
+    分数不够就当手写单，不新开入口。"""
+    if not text or not str(text).strip():
+        return False
+    raw = str(text)
+    score = 0
+    if "美菜" in raw:
+        score += 2
+    if re.search(r"订单号\s*[:：]?\s*\d{8,}", raw):
+        score += 2
+    if re.search(r"(?:送达|配送)时间\s*20\d{2}", raw):
+        score += 2
+    if re.search(r"(?:^|\n)\s*收\s*[￥¥]", raw) and re.search(r"(?:^|\n)\s*订\s*[￥¥]", raw):
+        score += 2
+    if "多退少补" in raw or "下单实付" in raw:
+        score += 1
+    return score >= 4
+
+
+def _meicai_money(num):
+    return float(Decimal(str(num)).quantize(CENT, rounding=ROUND_HALF_UP))
+
+
+def _clean_meicai_name(raw):
+    """去掉店铺前缀、规格套话和价格，留下还能对别名的品名。"""
+    s = str(raw or "")
+    s = re.sub(r"[\[【][^\]】]{0,40}[\]】]", "", s)
+    s = _MEICAI_PRICE_TAIL_RE.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = _MEICAI_UNIT_TAIL_RE.sub("", s).strip()
+    tokens = [t for t in s.split() if t]
+    kept = []
+    for t in tokens:
+        if t in _MEICAI_SPEC_TOKENS:
+            continue
+        kept.append(t)
+    if kept:
+        def _suffix(token):
+            core_tok = re.sub(r"[（(].*?[)）]", "", token)
+            return core_tok[-2:] if len(core_tok) >= 2 else core_tok
+        base = _suffix(kept[0])
+        filtered = [kept[0]]
+        for t in kept[1:]:
+            if len(base) >= 2 and _suffix(t) == base:
+                continue
+            filtered.append(t)
+        kept = filtered
+    name = " ".join(kept).strip()
+    if name:
+        return name
+    fallback = re.sub(r"[\[【][^\]】]{0,40}[\]】]", "", str(raw or ""))
+    fallback = _MEICAI_PRICE_TAIL_RE.sub(" ", fallback)
+    return re.sub(r"\s+", " ", fallback).strip()
+
+
+def _meicai_goods_cutoff(line):
+    s = line.strip()
+    if "付款信息" in s:
+        return True
+    if re.match(r"共\s*\d+\s*类", s):
+        return True
+    return False
+
+
+def _parse_meicai_amt_qty(line):
+    m = _MEICAI_AMT_QTY_RE.search(line or "")
+    if not m:
+        return None
+    amt = _meicai_money(m.group(1))
+    qty = _meicai_money(m.group(2))
+    unit = m.group(3) or ""
+    if unit.upper() == "KG":
+        unit = "kg"
+    return amt, qty, unit
+
+
+def extract_meicai_date(text):
+    m = re.search(
+        r"(?:送达|配送)时间\s*(20\d{2})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})",
+        text or "",
+    )
+    if not m:
+        return ""
+    return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+
+
+def extract_meicai_paid(text):
+    """结算后合计。优先「商品多退少补合计」，其次顶栏单独的金额。
+
+    不用下单实付、本单商品支付总额、历史欠款合计。"""
+    raw = text or ""
+    m = re.search(r"商品多退少补合计\s*[￥¥]\s*(\d+(?:\.\d+)?)", raw)
+    if m:
+        return _meicai_money(m.group(1))
+    m = re.search(r"结算后合计\s*[￥¥]\s*(\d+(?:\.\d+)?)", raw)
+    if m:
+        return _meicai_money(m.group(1))
+    head = raw.split("下单实付", 1)[0]
+    m = re.search(r"(?:^|\n)\s*[￥¥]\s*(\d+(?:\.\d+)?)\s*(?:\n|$)", head)
+    if m:
+        return _meicai_money(m.group(1))
+    return None
+
+
+def extract_meicai_order_ids(text):
+    ids = []
+    for m in re.finditer(r"订单号\s*[:：]\s*(\d{6,})", text or ""):
+        oid = m.group(1)
+        if oid not in ids:
+            ids.append(oid)
+    return ids
+
+
+def _blank_meicai_item(name, order_id, unit=""):
+    return {
+        "品名": name or "",
+        "数量": None,
+        "金额": None,
+        "单位": unit or "",
+        "类别": "",
+        "渠道": "美菜",
+        "订单号": order_id or "",
+        "实收缺失": False,
+        "票面单价": None,
+    }
+
+
+def _meicai_line_kind(line):
+    s = re.sub(r"^#+\s*", "", (line or "").strip())
+    if not s or _MEICAI_COORD_RE.match(s):
+        return "noise", s
+    if s in ("复制", "等额收货", "已完成") or s.startswith("您的订单"):
+        return "noise", s
+    oid = re.search(r"订单号\s*[:：]\s*(\d{6,})", s)
+    if oid:
+        return "oid", oid.group(1)
+    if s.startswith("订"):
+        return "order", s
+    if s.startswith("收"):
+        return "recv", s
+    if s.startswith("+"):
+        return "noise", s
+    if any(k in s for k in _MEICAI_PAY_WORDS) and _parse_meicai_amt_qty(s) is None:
+        return "pay", s
+    if _parse_meicai_amt_qty(s):
+        return "title", s
+    if re.search(r"[\u4e00-\u9fff]", s):
+        return "name", s
+    return "noise", s
+
+
+def parse_meicai_text(text):
+    """美菜订单截图 OCR 文本 → 一张采购单。
+
+    一图里多个订单号仍是一张单，订单号只作溯源。
+    明细只认货品的「收」行。直降、历史欠款、补差不单独成行；
+    补差已经含在实收金额里。没有「收」就空着数量和金额，标实收缺失，
+    不用订货数填。
+    """
+    date = extract_meicai_date(text)
+    paid = extract_meicai_paid(text)
+    order_ids = extract_meicai_order_ids(text)
+    items = []
+    current = None
+    pending_name = ""
+    current_oid = order_ids[0] if order_ids else ""
+    # 只有出现过订单号 / 订 / 收 / 带价格的品名行，才把落单的品名行交给人工补实收。
+    # 避免手写单抬头里的中文被误收成一行。
+    seen_goods = False
+
+    def _push(item):
+        if item is None:
+            return
+        if item.get("数量") is None or item.get("金额") is None:
+            item["数量"] = None
+            item["金额"] = None
+            item["实收缺失"] = True
+        items.append(item)
+
+    for raw_line in str(text or "").splitlines():
+        if _meicai_goods_cutoff(raw_line):
+            break
+        kind, payload = _meicai_line_kind(raw_line)
+        if kind in ("noise", "pay"):
+            continue
+        if kind == "oid":
+            seen_goods = True
+            current_oid = payload
+            continue
+        if kind == "order":
+            seen_goods = True
+            continue
+        if kind == "name":
+            pending_name = (pending_name + " " + payload).strip() if pending_name else payload
+            continue
+        if kind == "title":
+            seen_goods = True
+            _push(current)
+            parsed = _parse_meicai_amt_qty(payload)
+            unit = parsed[2] if parsed else ""
+            current = _blank_meicai_item(_clean_meicai_name(payload), current_oid, unit)
+            pending_name = ""
+            continue
+        if kind == "recv":
+            seen_goods = True
+            parsed = _parse_meicai_amt_qty(payload)
+            if current is None:
+                name = _clean_meicai_name(pending_name) if pending_name else ""
+                current = _blank_meicai_item(name, current_oid)
+                pending_name = ""
+            if not parsed:
+                current["实收缺失"] = True
+                current["数量"] = None
+                current["金额"] = None
+                continue
+            amt, qty, unit = parsed
+            current["金额"] = amt
+            current["数量"] = qty
+            if unit:
+                current["单位"] = unit
+            current["实收缺失"] = False
+            continue
+    if current is not None:
+        _push(current)
+    elif pending_name and seen_goods:
+        orphan = _blank_meicai_item(_clean_meicai_name(pending_name), current_oid)
+        orphan["实收缺失"] = True
+        items.append(orphan)
+
+    suspects = []
+    missing = sum(1 for it in items if it.get("实收缺失"))
+    if missing:
+        suspects.append(meicai_missing_recv_summary(missing))
+    if paid is None:
+        suspects.append("未识别到结算后合计（商品多退少补合计），请对照原图填写实付")
+    note = ("订单号 " + "、".join(order_ids)) if order_ids else ""
+    return {
+        "kind": "美菜",
+        "date": date,
+        "paid": paid,
+        "order_total": paid,
+        "order_ids": order_ids,
+        "note": note,
+        "items": items,
+        "suspects": suspects,
+    }
+
+
+def _meicai_line_sig(items):
+    sig = []
+    for it in items or []:
+        sig.append((
+            str(it.get("品名") or ""),
+            it.get("数量"),
+            it.get("金额"),
+            str(it.get("订单号") or ""),
+        ))
+    return tuple(sig)
+
+
+def _meicai_order_sig(items, order_id):
+    rows = [it for it in items or [] if str(it.get("订单号") or "") == str(order_id)]
+    if not rows:
+        rows = list(items or [])
+    return _meicai_line_sig(rows)
+
+
+def merge_meicai_docs(docs):
+    """同一配送日的多张美菜截图并成一张采购单。
+
+    货品行按截图顺序拼接，不按品名合并。
+    实付 = 各张「结算后合计」之和。
+    订单号去重。完全相同的一张截图不重复计入。
+    同一订单号明细对不上时保留两边的行，并记入 suspects。
+    没有配送日的单不和别的单并。
+    """
+    groups = []
+    index = {}
+    for doc in docs or []:
+        doc = doc or {}
+        date = str(doc.get("date") or "")
+        if not date:
+            groups.append({"date": "", "docs": [doc]})
+            continue
+        bucket = index.get(date)
+        if bucket is None:
+            bucket = {"date": date, "docs": []}
+            index[date] = bucket
+            groups.append(bucket)
+        bucket["docs"].append(doc)
+
+    merged = []
+    for group in groups:
+        seen_orders = {}
+        seen_docs = set()
+        items = []
+        order_ids = []
+        suspects = []
+        paid = Decimal("0")
+        has_paid = False
+        for doc in group["docs"]:
+            doc_items = list(doc.get("items") or [])
+            ids = []
+            for oid in doc.get("order_ids") or []:
+                oid = str(oid).strip()
+                if oid and oid not in ids:
+                    ids.append(oid)
+            sig = (tuple(ids), _meicai_line_sig(doc_items), doc.get("paid"))
+            if sig in seen_docs:
+                continue
+            seen_docs.add(sig)
+            conflicts = []
+            for oid in ids:
+                osig = _meicai_order_sig(doc_items, oid)
+                prev = seen_orders.get(oid)
+                if prev is None:
+                    seen_orders[oid] = osig
+                elif prev != osig:
+                    conflicts.append(oid)
+                    seen_orders[oid] = osig
+            if conflicts:
+                suspects.append(
+                    "订单号 " + "、".join(conflicts) + " 在多张截图中明细不一致，请核对是否重复入账"
+                )
+            for oid in ids:
+                if oid not in order_ids:
+                    order_ids.append(oid)
+            items.extend(doc_items)
+            if doc.get("paid") not in (None, ""):
+                paid += Decimal(str(doc["paid"]))
+                has_paid = True
+            for tip in doc.get("suspects") or []:
+                if tip and tip not in suspects:
+                    suspects.append(tip)
+        paid_val = float(paid.quantize(CENT, rounding=ROUND_HALF_UP)) if has_paid else None
+        note = ("订单号 " + "、".join(order_ids)) if order_ids else ""
+        merged.append({
+            "kind": "美菜",
+            "date": group["date"],
+            "paid": paid_val,
+            "order_total": paid_val,
+            "order_ids": order_ids,
+            "note": note,
+            "items": items,
+            "suspects": suspects,
+        })
+    return merged
 
 
 # ===== 4. 单价推导 =====
