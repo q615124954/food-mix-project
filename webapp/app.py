@@ -554,7 +554,8 @@ def compute_suspects(date, items):
         if nm:
             name_counts[nm] = name_counts.get(nm, 0) + 1
     dups = [nm for nm, c in name_counts.items() if c > 1]
-    # 美菜同一天多张截图按顺序拼接，同名货品是两行，不是误识别。
+    # 美菜同名同单位在复核前已经加总。还留着的同名（单位不同，或订单号冲突两边都留）
+    # 不是手写单那种误识别。
     if dups and not any(it.get("渠道") == "美菜" for it in items):
         for it in items:
             nm = str(it.get("品名", "")).strip()
@@ -937,8 +938,8 @@ def _ocr_one_inv(inv):
 def apply_meicai_day_merge(invoices):
     """同一配送日的美菜截图并成一张待复核单。已确认的不拆开重并。
 
-    货品行来自每张截图自己的 meicai_part（识别原文），不按品名合并。
-    文件集合没变时不覆盖复核页上已经改过的行。
+    货品行来自每张截图自己的 meicai_part。拼接后同品名同单位再加总，
+    复核页直接看到合并后的一行。文件集合没变时不覆盖复核页上已经改过的行。
     """
     pending = []
     confirmed_dates = set()

@@ -7,7 +7,7 @@ import os
 import io
 import re
 import html as html_lib
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 import requests
 from PIL import Image, ImageOps, ImageChops, ImageFilter, ImageMath
 from openpyxl import Workbook
@@ -746,6 +746,7 @@ def parse_meicai_text(text):
     不用订货数填。品名单独一行、金额在下一行时也留下品名。
     连续几段都是这样时，下一条品名先把上一段交出去，不盖掉前面的品名。
     「收」单独一行、下一行是「￥金额/数量」时，与「收 ￥…」同样算实收。
+    交出去之前，品名和单位都相同的行加总数量和金额，复核页看到的是合并后的一行。
     """
     date = extract_meicai_date(text)
     paid = extract_meicai_paid(text)
@@ -882,6 +883,7 @@ def parse_meicai_text(text):
         if name:
             _push(_blank_meicai_item(name, current_oid))
 
+    items = aggregate_meicai_items(items)
     suspects = []
     missing = sum(1 for it in items if it.get("实收缺失"))
     if missing:
@@ -996,13 +998,70 @@ def _meicai_order_sig(items, order_id):
     return _meicai_line_sig(rows)
 
 
+def _meicai_decimal(value):
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _sum_meicai_field(left, right):
+    """只加有数字的一边。两边都空则保持空，不写成 0。"""
+    a = _meicai_decimal(left)
+    b = _meicai_decimal(right)
+    if a is None and b is None:
+        return None
+    total = (a or Decimal("0")) + (b or Decimal("0"))
+    return float(total.quantize(CENT, rounding=ROUND_HALF_UP))
+
+
+def _fold_meicai_line(base, extra):
+    base["数量"] = _sum_meicai_field(base.get("数量"), extra.get("数量"))
+    base["金额"] = _sum_meicai_field(base.get("金额"), extra.get("金额"))
+    # 加完仍缺数量或金额：沿用实收缺失，不把缺的那一侧编成 0。
+    base["实收缺失"] = base.get("数量") is None or base.get("金额") is None
+
+
+def aggregate_meicai_items(items, skip_order_ids=None):
+    """美菜复核明细：品名 + 单位相同则合成一行。
+
+    数量、金额只累加已经认出的数字。两边都没有时数量和金额留空，实收缺失仍在。
+    品名为空的行不并，留给人工填。
+    skip_order_ids 是多张截图里明细对不上的订单号，这些行原样留下，方便核对差在哪。
+    单价按合并后的数量和金额重算。手写单不走这里。
+    """
+    skip = {str(oid).strip() for oid in (skip_order_ids or []) if str(oid).strip()}
+    out = []
+    index = {}
+    for src in items or []:
+        row = dict(src)
+        name = str(row.get("品名") or "").strip()
+        unit = str(row.get("单位") or "").strip()
+        oid = str(row.get("订单号") or "").strip()
+        if not name or oid in skip:
+            out.append(row)
+            continue
+        key = (name, unit)
+        slot = index.get(key)
+        if slot is None:
+            index[key] = len(out)
+            out.append(row)
+            continue
+        _fold_meicai_line(out[slot], row)
+    derive_price(out)
+    return out
+
+
 def merge_meicai_docs(docs):
     """同一配送日的多张美菜截图并成一张采购单。
 
-    货品行按截图顺序拼接，不按品名合并。
-    实付 = 各张「结算后合计」之和。
-    订单号去重。完全相同的一张截图不重复计入。
-    同一订单号明细对不上时保留两边的行，并记入 suspects。
+    先按截图顺序拼接。完全相同的一张截图不重复计入。
+    同一订单号明细完全一致时，这些行不重复计入，避免加总时把同一单算两遍。
+    同一订单号明细对不上时保留两边的行，并记入 suspects，且不参与按品名加总。
+    拼接之后，同品名同单位再加总数量和金额，复核页直接是合并后的一行。
+    实付 = 各张「结算后合计」之和。订单号去重。
     没有配送日的单不和别的单并。
     """
     groups = []
@@ -1027,6 +1086,7 @@ def merge_meicai_docs(docs):
         items = []
         order_ids = []
         suspects = []
+        conflict_ids = set()
         paid = Decimal("0")
         has_paid = False
         for doc in group["docs"]:
@@ -1041,6 +1101,7 @@ def merge_meicai_docs(docs):
                 continue
             seen_docs.add(sig)
             conflicts = []
+            identical = []
             for oid in ids:
                 osig = _meicai_order_sig(doc_items, oid)
                 prev = seen_orders.get(oid)
@@ -1048,7 +1109,10 @@ def merge_meicai_docs(docs):
                     seen_orders[oid] = osig
                 elif prev != osig:
                     conflicts.append(oid)
+                    conflict_ids.add(oid)
                     seen_orders[oid] = osig
+                else:
+                    identical.append(oid)
             if conflicts:
                 suspects.append(
                     "订单号 " + "、".join(conflicts) + " 在多张截图中明细不一致，请核对是否重复入账"
@@ -1056,6 +1120,12 @@ def merge_meicai_docs(docs):
             for oid in ids:
                 if oid not in order_ids:
                     order_ids.append(oid)
+            if identical:
+                skip_ids = set(identical)
+                doc_items = [
+                    it for it in doc_items
+                    if str(it.get("订单号") or "").strip() not in skip_ids
+                ]
             items.extend(doc_items)
             if doc.get("paid") not in (None, ""):
                 paid += Decimal(str(doc["paid"]))
@@ -1063,6 +1133,7 @@ def merge_meicai_docs(docs):
             for tip in doc.get("suspects") or []:
                 if tip and tip not in suspects:
                     suspects.append(tip)
+        items = aggregate_meicai_items(items, skip_order_ids=conflict_ids)
         paid_val = float(paid.quantize(CENT, rounding=ROUND_HALF_UP)) if has_paid else None
         note = ("订单号 " + "、".join(order_ids)) if order_ids else ""
         merged.append({
