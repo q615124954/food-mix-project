@@ -337,8 +337,222 @@ def iter_ocr_slices(img, overlap=0.15):
     return iter_vertical_slices(img, overlap=overlap, **kwargs)
 
 
+_JOIN_EXACT_LINE_LIMIT = 12
+_JOIN_NORM_LINE_LIMIT = 24
+
+
+def _norm_join_line(line):
+    """比对重叠行：忽略空白、前导「促」、全角￥。"""
+    s = re.sub(r"^#+\s*", "", (line or "").strip())
+    s = s.replace("¥", "￥").replace("／", "/").replace("＋", "+").replace("－", "-")
+    s = re.sub(r"^促+", "", s)
+    s = re.sub(r"\s+", "", s)
+    return s
+
+
+def _text_looks_meicai(lines):
+    for ln in lines or []:
+        if "美菜" in ln or "订单号" in ln or ln.startswith("收") or ln.startswith("订"):
+            return True
+    return False
+
+
+def _slice_prefix_len(prev, nxt, normalized):
+    """nxt 开头有多长和 prev 的结尾是同一段字。"""
+    limit = _JOIN_NORM_LINE_LIMIT if normalized else _JOIN_EXACT_LINE_LIMIT
+    max_k = min(len(prev), len(nxt), limit)
+    best = 0
+    for k in range(1, max_k + 1):
+        ok = True
+        for left, right in zip(prev[-k:], nxt[:k]):
+            if left == right:
+                continue
+            if not normalized:
+                ok = False
+                break
+            nl, nr = _norm_join_line(left), _norm_join_line(right)
+            if nl and nl == nr:
+                continue
+            ok = False
+            break
+        if ok:
+            best = k
+    return best
+
+
+def _money_same(left, right):
+    if left is None or right is None:
+        return False
+    return round(float(left), 2) == round(float(right), 2)
+
+
+def _same_overlap_row(left, right):
+    """同一件货的重叠：品名、数量、金额相同。单位一边没认出来时仍算同一行。"""
+    if not left["name"] or left["name"] != right["name"]:
+        return False
+    if not _money_same(left["qty"], right["qty"]) or not _money_same(left["amt"], right["amt"]):
+        return False
+    if left["unit"] and right["unit"] and left["unit"] != right["unit"]:
+        return False
+    return True
+
+
+def _join_chrome_kind(line):
+    if _meicai_goods_cutoff(line):
+        return ""
+    kind, _payload = _meicai_line_kind(line)
+    if kind in ("noise", "oid", "pay", "order", "price"):
+        return kind
+    return ""
+
+
+def _prefix_is_join_chrome(lines):
+    return all(_join_chrome_kind(ln) for ln in lines)
+
+
+def _meicai_recv_spans(lines):
+    """带「收」的货品行，以及它在这一片里的起止行号。只用于拼接去重。"""
+    rows = []
+    pending_name = ""
+    pending_start = None
+    i = 0
+    n = len(lines)
+    while i < n:
+        raw = lines[i]
+        if _meicai_goods_cutoff(raw):
+            break
+        kind, payload = _meicai_line_kind(raw)
+        if kind == "name":
+            if _MEICAI_UNIT_TAIL_RE.search(payload):
+                pending_name = payload
+                pending_start = i
+            else:
+                if pending_start is None:
+                    pending_start = i
+                pending_name = (pending_name + " " + payload).strip() if pending_name else payload
+            i += 1
+            continue
+        if kind == "title":
+            pending_name = payload
+            pending_start = i
+            i += 1
+            continue
+        if kind == "recv":
+            parsed = _parse_meicai_amt_qty(payload)
+            end = i + 1
+            if (
+                parsed is None
+                and payload == "收"
+                and i + 1 < n
+                and _meicai_price_only_line(lines[i + 1])
+            ):
+                parsed = _parse_meicai_amt_qty(lines[i + 1])
+                end = i + 2
+                i += 1
+            name = _clean_meicai_name(pending_name)
+            if parsed and name:
+                while end < n and _join_chrome_kind(lines[end]) == "noise":
+                    end += 1
+                amt, qty, unit = parsed
+                rows.append({
+                    "name": name,
+                    "qty": qty,
+                    "amt": amt,
+                    "unit": unit or "",
+                    "start": i if pending_start is None else pending_start,
+                    "end": end,
+                })
+            pending_name = ""
+            pending_start = None
+            i += 1
+            continue
+        i += 1
+    return rows
+
+
+def _overlap_sig_range(prev_rows, nxt_rows):
+    """下一片开头的货，若和上一片结尾是同一实收，返回要删的行区间。"""
+    if not prev_rows or not nxt_rows:
+        return None
+    tail = prev_rows[-4:]
+    limit = min(len(tail), len(nxt_rows))
+    best = 0
+    for k in range(1, limit + 1):
+        if all(_same_overlap_row(tail[-k + i], nxt_rows[i]) for i in range(k)):
+            best = k
+    if not best:
+        return None
+    return nxt_rows[0]["start"], nxt_rows[best - 1]["end"]
+
+
+def _leading_same_recv_end(prev_rows, lines):
+    """下一片一上来就是和上一件相同的「收」，品名没再写一遍。删到这一行为止。"""
+    if not prev_rows:
+        return 0
+    last = prev_rows[-1]
+    i = 0
+    n = len(lines)
+    while i < n and _join_chrome_kind(lines[i]) in ("noise", "oid", "pay"):
+        i += 1
+    if i >= n:
+        return 0
+    kind, payload = _meicai_line_kind(lines[i])
+    if kind != "recv":
+        return 0
+    parsed = _parse_meicai_amt_qty(payload)
+    end = i + 1
+    if parsed is None and payload == "收" and i + 1 < n and _meicai_price_only_line(lines[i + 1]):
+        parsed = _parse_meicai_amt_qty(lines[i + 1])
+        end = i + 2
+    if not parsed:
+        return 0
+    amt, qty, unit = parsed
+    if not _money_same(last["qty"], qty) or not _money_same(last["amt"], amt):
+        return 0
+    if unit and last["unit"] and unit != last["unit"]:
+        return 0
+    while end < n and _join_chrome_kind(lines[end]) == "noise":
+        end += 1
+    return end
+
+
+def _strip_slice_overlap(prev, nxt):
+    """去掉下一片里和上一片结尾重复的那段。
+
+    完全相同的行仍按原来的方式删。美菜长图还会对上「品名 + 实收数量 + 金额」：
+    重叠带里同一行货被认了两遍（字不完全一样）时只留上一片那一遍。
+    数量或金额不同的，是另一行货，留给后面的同名加总。手写单不走这套。
+    """
+    meicai = _text_looks_meicai(prev) or _text_looks_meicai(nxt)
+    prefix = _slice_prefix_len(prev, nxt, normalized=meicai)
+    if not meicai:
+        return nxt[prefix:]
+
+    prev_rows = _meicai_recv_spans(prev)
+    sig = _overlap_sig_range(prev_rows, _meicai_recv_spans(nxt))
+    bare = _leading_same_recv_end(prev_rows, nxt)
+    lo, hi = 0, prefix
+    if sig:
+        sig_lo, sig_hi = sig
+        if sig_hi > hi:
+            if sig_lo <= hi or _prefix_is_join_chrome(nxt[hi:sig_lo]):
+                lo, hi = 0, sig_hi
+            else:
+                lo, hi = sig_lo, sig_hi
+    if bare > hi and lo == 0:
+        hi = bare
+    if lo <= 0:
+        return nxt[hi:]
+    return nxt[prefix:lo] + nxt[hi:]
+
+
 def join_ocr_slices(texts):
-    """按切片顺序拼接 OCR 文本。相邻切片若有完全相同的行重叠，只保留一份。"""
+    """按切片顺序拼接 OCR 文本。
+
+    相邻切片结尾和开头若是同一段字，只留一份。
+    美菜重叠带里同一件货（品名、实收数量、金额相同，行文可以略有差别）也只留一份，
+    避免拼完再按品名加总时把这一行算两遍。数量或金额不同的行不去掉。
+    """
     acc = []
     for text in texts or []:
         lines = [ln.strip() for ln in str(text or "").splitlines() if ln.strip()]
@@ -347,13 +561,7 @@ def join_ocr_slices(texts):
         if not acc:
             acc = lines
             continue
-        max_k = min(len(acc), len(lines), 12)
-        cut = 0
-        for k in range(max_k, 0, -1):
-            if acc[-k:] == lines[:k]:
-                cut = k
-                break
-        acc.extend(lines[cut:])
+        acc.extend(_strip_slice_overlap(acc, lines))
     deduped = []
     for ln in acc:
         if deduped and deduped[-1] == ln:
@@ -668,6 +876,14 @@ _MEICAI_PAY_WORDS = (
     "多退少补", "总额", "商品总价", "商品金额", "付款", "实付", "签收",
     "司机", "物流", "包裹", "复制", "金额",
 )
+# 重量差异角标。整行就是「补 +」「退 -」，后面可以带差额，但不是另一件货。
+_MEICAI_ADJUST_LINE_RE = re.compile(
+    r"^(?:补差|补|退)\s*[+\-＋－]"
+    r"(?:\s*[￥¥]?\s*\d+(?:\.\d+)?)?"
+    r"(?:\s*[/／]\s*-?\d+(?:\.\d+)?)?"
+    r"(?:\s*(?:斤|公斤|千克|kg|KG|托|件|箱|包|袋|盒|个|份|板|只|条|瓶|桶|提))?"
+    r"(?:\s*等额收货)?$"
+)
 MEICAI_MISSING_RECV = "未识别到实收（收），请对照原图填写数量和金额，不要用下单数"
 
 
@@ -811,16 +1027,23 @@ def _meicai_norm_line(line):
 
 
 def _meicai_is_noise_line(s):
-    """坐标框、界面套话、补差标签。不当品名。"""
+    """坐标框、界面套话、补差标签。不当品名。
+
+    「补 +」「退 -」以及同一行写上的差额是重量差角标，实收已经在「收」里，
+    这里丢掉，不另造数量或金额。"""
     if not s:
         return True
     if _MEICAI_BBOX_RE.search(s):
         return True
     if any(k in s for k in _MEICAI_CHROME):
         return True
-    if s in ("复制", "等额收货", "已完成", "补", "退", "美菜", "美菜商城") or s.startswith("您的订单"):
+    if s in ("复制", "等额收货", "已完成", "补", "退", "补差", "美菜", "美菜商城") or s.startswith("您的订单"):
         return True
-    if s.startswith("+") or re.match(r"^-\s*[￥¥]", s):
+    if _MEICAI_ADJUST_LINE_RE.match(s):
+        return True
+    if s.startswith("+") or s.startswith("＋"):
+        return True
+    if re.match(r"^[-－]\s*[￥¥]", s):
         return True
     return False
 
@@ -860,7 +1083,8 @@ def parse_meicai_text(text):
 
     一图里多个订单号仍是一张单，订单号只作溯源。
     明细只认货品的「收」行。直降、历史欠款、补差不单独成行；
-    补差已经含在实收金额里。没有「收」就空着数量和金额，标实收缺失，
+    「补 +」「退 -」也不是货品。补差已经含在实收金额里，不从角标再填一遍。
+    没有「收」就空着数量和金额，标实收缺失，
     不用订货数填。品名单独一行、金额在下一行时也留下品名。
     连续几段都是这样时，下一条品名先把上一段交出去，不盖掉前面的品名。
     「收」单独一行、下一行是「￥金额/数量」时，与「收 ￥…」同样算实收。
