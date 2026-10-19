@@ -3,10 +3,15 @@
 
 金标 samples/gold/meicai_2026-09-09.json 是复核落地后的口径，不是 OCR 像素猜测。
 OCR 文本里没有「收」时，数量和金额留空并标存疑。
+Shot1 / Shot2 金标同样是复核后的落地值。仓库里没有这两张的 OCR 文本时，
+不对它们做「解析结果等于金标行」的断言；一旦把文本放到
+samples/gold/ocr/meicai_shot1.ocr.txt 或 meicai_shot2.ocr.txt，回归会自动跑。
+Shot2 的弱 OCR（没有「收」行）必须标存疑，不能把金标里的实收数编出来。
 """
 import copy
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -25,6 +30,14 @@ from openpyxl import load_workbook
 GOLD_JSON = os.path.join(ROOT, "samples", "gold", "meicai_2026-09-09.json")
 OCR_TXT = os.path.join(ROOT, "samples", "gold", "ocr", "meicai_2026-09-09.ocr.txt")
 HAND_TXT = os.path.join(ROOT, "samples", "gold", "ocr", "receipt_2026-08-11.ocr.txt")
+SHOT_GOLD = {
+    "shot1": os.path.join(ROOT, "samples", "gold", "meicai_shot1.json"),
+    "shot2": os.path.join(ROOT, "samples", "gold", "meicai_shot2.json"),
+}
+SHOT_OCR = {
+    "shot1": os.path.join(ROOT, "samples", "gold", "ocr", "meicai_shot1.ocr.txt"),
+    "shot2": os.path.join(ROOT, "samples", "gold", "ocr", "meicai_shot2.ocr.txt"),
+}
 
 
 def _ocr_text():
@@ -347,6 +360,185 @@ class LongScreenshot(unittest.TestCase):
         self.assertEqual(seen["full"], 0)
         self.assertEqual(res["kind"], "meicai")
         self.assertEqual(len(res["items"]), 7)
+
+
+def _read_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _shot_gold(name):
+    return _read_json(SHOT_GOLD[name])
+
+
+def _doc_from_gold(gold):
+    items = []
+    for row in gold["日物料采购_复核后期望行"]:
+        items.append({
+            "品名": row["name"],
+            "数量": row["qty"],
+            "金额": row["amt"],
+            "单位": row["unit"],
+            "渠道": "美菜",
+            "订单号": "",
+            "实收缺失": False,
+        })
+    return {
+        "date": gold["delivery_date"],
+        "paid": gold["paid"],
+        "order_ids": list(gold["order_ids"]),
+        "items": items,
+        "suspects": [],
+    }
+
+
+def _assert_filled_matches_gold(test, parsed, gold):
+    """「收」行齐全时，解析结果应落在复核金标上（单价按分四舍五入）。"""
+    test.assertEqual(parsed["date"], gold["delivery_date"])
+    test.assertEqual(parsed["paid"], gold["paid"])
+    test.assertEqual(parsed["order_ids"], gold["order_ids"])
+    rows = gold["日物料采购_复核后期望行"]
+    test.assertEqual(len(parsed["items"]), len(rows))
+    items, _stat = core.derive_price(parsed["items"])
+    total = 0.0
+    for got, want in zip(items, rows):
+        test.assertEqual(got["品名"], want["name"])
+        test.assertEqual(got["单位"], want["unit"])
+        test.assertAlmostEqual(got["数量"], want["qty"], places=2)
+        test.assertAlmostEqual(got["金额"], want["amt"], places=2)
+        test.assertFalse(got.get("实收缺失"))
+        total += got["金额"]
+    test.assertAlmostEqual(round(total, 2), gold["paid"], places=2)
+    test.assertEqual(gold["员工餐"]["amt"], 0)
+    test.assertAlmostEqual(round(total, 2) - gold["paid"], 0, places=2)
+
+
+def _assert_missing_receive_not_invented(test, parsed, gold, text):
+    """没有「收」的行不许填金标实收，也不许填标题上的订货数。"""
+    test.assertEqual(parsed["date"], gold["delivery_date"])
+    if re.search(r"商品多退少补合计\s*[￥¥]\s*" + re.escape(f"{gold['paid']:.2f}"), text):
+        test.assertEqual(parsed["paid"], gold["paid"])
+    recv_n = len(re.findall(r"(?:^|\n)\s*收\s*[￥¥]", text))
+    filled = [it for it in parsed["items"] if it.get("数量") is not None or it.get("金额") is not None]
+    test.assertLessEqual(len(filled), recv_n)
+    for it in parsed["items"]:
+        if it.get("实收缺失") or recv_n == 0:
+            test.assertIsNone(it.get("数量"))
+            test.assertIsNone(it.get("金额"))
+            test.assertTrue(it.get("实收缺失"))
+    for oid in parsed["order_ids"]:
+        test.assertIn(oid, text)
+    if recv_n == 0:
+        test.assertTrue(any("实收" in s for s in parsed["suspects"]))
+        gold_amts = {round(float(row["amt"]), 2) for row in gold["日物料采购_复核后期望行"]}
+        for it in parsed["items"]:
+            test.assertNotIn(it.get("金额"), gold_amts)
+
+
+class ShotGoldTargets(unittest.TestCase):
+    """Shot1 / Shot2 是复核落地金标。9/9 OCR 文本仍是解析必须通过的那条。"""
+
+    def test_fixtures_match_approved_landing_totals(self):
+        shot1 = _shot_gold("shot1")
+        shot2 = _shot_gold("shot2")
+        for gold, day, paid, n_orders in (
+            (shot1, "2026-09-02", 258.23, 4),
+            (shot2, "2026-09-03", 258.99, 3),
+        ):
+            rows = gold["日物料采购_复核后期望行"]
+            self.assertEqual(gold["delivery_date"], day)
+            self.assertEqual(gold["paid"], paid)
+            self.assertEqual(gold["员工餐"]["amt"], 0)
+            self.assertTrue(gold["paid_matches_line_sum"])
+            self.assertAlmostEqual(sum(r["amt"] for r in rows), paid, places=2)
+            self.assertEqual(len(gold["order_ids"]), n_orders)
+            self.assertEqual(len(gold["order_ids"]), len(set(gold["order_ids"])))
+        # Shot2 同一张单里两行小葱，落地时不按品名并成一行
+        scallions = [r for r in shot2["日物料采购_复核后期望行"] if r["name"] == "小葱"]
+        self.assertEqual(len(scallions), 2)
+        self.assertNotEqual(scallions[0]["qty"], scallions[1]["qty"])
+
+    def test_different_delivery_dates_stay_separate_docs(self):
+        merged = core.merge_meicai_docs([
+            _doc_from_gold(_shot_gold("shot1")),
+            _doc_from_gold(_shot_gold("shot2")),
+        ])
+        self.assertEqual([d["date"] for d in merged], ["2026-09-02", "2026-09-03"])
+        self.assertAlmostEqual(merged[0]["paid"], 258.23, places=2)
+        self.assertAlmostEqual(merged[1]["paid"], 258.99, places=2)
+        self.assertEqual(len(merged[1]["items"]), 10)
+
+    def test_shot2_weak_ocr_marks_receive_missing(self):
+        """按 Shot2 金标备注构造的弱 OCR：没有「收」分行，数字是订货量，还漏了一个订单号。"""
+        text = "\n".join([
+            "美菜",
+            "送达时间 2026-09-03 06:30:00",
+            "￥258.99",
+            "下单实付￥250.00",
+            "订单号：2997320400 复制",
+            "鸡毛菜 斤 ￥36.00/6.00斤",
+            "订 ￥36.00/6.00斤",
+            "黄瓜 二级 斤 ￥11.00/5.00斤",
+            "订 ￥11.00/5.00斤",
+            "多肉排骨粒 斤 ￥19.08/3.00斤",
+            "订 ￥19.08/3.00斤",
+            "鲜猪后腿瘦肉 纯瘦 斤 ￥48.00/5.00斤",
+            "订 ￥48.00/5.00斤",
+            "绿豆芽 斤 ￥3.00/3.00斤",
+            "订 ￥3.00/3.00斤",
+            "订单号：2997320402 复制",
+            "小葱 优质 水洗 斤 ￥26.00/3.00斤",
+            "订 ￥26.00/3.00斤",
+            "小葱 优质 水洗 斤 ￥44.00/5.00斤",
+            "订 ￥44.00/5.00斤",
+            "香菜 斤 ￥19.00/3.00斤",
+            "订 ￥19.00/3.00斤",
+            "鲜鸡蛋 白壳 中码 托(30 个) ￥40.00/2.00托",
+            "订 ￥40.00/2.00托",
+            "鱼腥草 斤 ￥6.00/1.00斤",
+            "订 ￥6.00/1.00斤",
+            "付款信息",
+            "直降 -￥5.00",
+            "历史欠款 ￥2.42",
+            "商品多退少补合计￥258.99",
+        ])
+        gold = _shot_gold("shot2")
+        parsed = core.parse_meicai_text(text)
+        self.assertTrue(core.is_meicai_ocr(text))
+        _assert_missing_receive_not_invented(self, parsed, gold, text)
+        self.assertEqual(parsed["order_ids"], ["2997320400", "2997320402"])
+        self.assertNotIn("2997320401", parsed["order_ids"])
+        names = [it["品名"] for it in parsed["items"]]
+        self.assertEqual(names.count("小葱"), 2)
+        self.assertIn("黄瓜 二级", names)
+        self.assertIn("鲜鸡蛋 白壳", names)
+        self.assertNotIn("直降", names)
+        self.assertFalse(any("欠款" in n for n in names))
+        # 订货数 5.00 / 11.00 不能当成黄瓜的实收（金标是 5.08 斤、11.84 元）
+        cucumber = next(it for it in parsed["items"] if it["品名"] == "黄瓜 二级")
+        self.assertIsNone(cucumber["数量"])
+        self.assertIsNone(cucumber["金额"])
+
+    def test_optional_shot_ocr_transcripts(self):
+        """有 OCR 文本才和金标行对账。Shot2 若「收」行不够，只检查不编造。"""
+        ran = False
+        for name in ("shot1", "shot2"):
+            path = SHOT_OCR[name]
+            if not os.path.isfile(path):
+                continue
+            ran = True
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            gold = _shot_gold(name)
+            parsed = core.parse_meicai_text(text)
+            self.assertTrue(core.is_meicai_ocr(text), name)
+            recv_n = len(re.findall(r"(?:^|\n)\s*收\s*[￥¥]", text))
+            if recv_n >= len(gold["日物料采购_复核后期望行"]):
+                _assert_filled_matches_gold(self, parsed, gold)
+            else:
+                _assert_missing_receive_not_invented(self, parsed, gold, text)
+        if not ran:
+            self.skipTest("shot1/shot2 的 OCR 文本还没放进 samples/gold/ocr/")
 
 
 if __name__ == "__main__":
