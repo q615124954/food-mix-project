@@ -722,6 +722,40 @@ class MeicaiBareRecvAndNoise(unittest.TestCase):
         self.assertNotEqual(it["数量"], 3.0)
         self.assertNotEqual(it["金额"], 6.9)
 
+    def test_multi_segment_pending_kept_when_next_name_arrives(self):
+        """连续两段「品名 + 下一行标价」都没有「收」，第三条品名不能把前两段盖掉。"""
+        text = "\n".join([
+            "美菜",
+            "送达时间 2026-09-04 07:12:48",
+            "订单号：2998060810 复制",
+            "大娃娃菜 优质 斤",
+            "￥6.90/3.00斤",
+            "订",
+            "￥6.90/3.00斤",
+            "鸡毛菜 普通 斤",
+            "￥6.54/3.00斤",
+            "订",
+            "￥6.54/3.00斤",
+            "鲜鸡蛋 红壳 中码 托(30个)",
+            "付款信息",
+            "商品多退少补合计￥20.00",
+        ])
+        parsed = core.parse_meicai_text(text)
+        self.assertEqual(
+            [it["品名"] for it in parsed["items"]],
+            ["大娃娃菜", "鸡毛菜", "鲜鸡蛋 红壳"],
+        )
+        for it in parsed["items"]:
+            self.assertIsNone(it["数量"])
+            self.assertIsNone(it["金额"])
+            self.assertTrue(it["实收缺失"])
+        self.assertNotEqual(parsed["items"][0]["数量"], 3.0)
+        self.assertNotEqual(parsed["items"][0]["金额"], 6.9)
+        self.assertNotEqual(parsed["items"][1]["数量"], 3.0)
+        self.assertNotEqual(parsed["items"][1]["金额"], 6.54)
+        self.assertTrue(any("实收" in s for s in parsed["suspects"]))
+        self.assertEqual(parsed["paid"], 20.0)
+
     def test_shot3_tiled_fixture_fills_recv_and_drops_noise(self):
         text = _read_text(SHOT3_TILED_OCR)
         parsed = core.parse_meicai_text(text)
