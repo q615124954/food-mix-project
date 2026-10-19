@@ -38,7 +38,12 @@ API_KEY = (
     or os.environ.get("MOLLI_ARK_API_KEY", "").strip()
 )
 MODEL = "HunyuanOCR"
-MAX_SIZE = 2048          # 图片最长边上限
+MAX_SIZE = 2048          # HunyuanOCR 最长边上限。测试和说明都按 2048，不另抬。
+# 一条货（品名 + 订 + 收）在手机宽上大约占屏宽的四成。竖切重叠至少留这么高，
+# 避免「收」落在切缝上、两条都只剩半行。
+SLICE_ROW_OVERLAP_RATIO = 0.42
+# 整图把最长边收到 MAX_SIZE 之后，短边不到原来的一半，字会糊。
+CRUSHED_FULL_FRAME_RATIO = 0.5
 INPUT_DIR = r"D:\采购单"
 OUTPUT_DIR = r"D:\财务表"
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "采购入库_暂存.xlsx")
@@ -129,7 +134,10 @@ def enhance_image(img, strategy):
 
 
 def prepare_image(path, enhance=False):
-    """按 EXIF 方向旋转校正 + 超限等比缩小，返回 (字节流, 文件名)。
+    """按 EXIF 方向旋转校正，最长边超过 MAX_SIZE 才等比缩小，返回 (字节流, 文件名)。
+
+    最长边已经在上限内时保持原分辨率，不缩到 2048。
+    手写单照片走这里。手机长截图不靠这次缩小，改由分条按原宽送识别。
     enhance 为 True/'shadow'/'red'/'flat' 时先做对应预处理（漏识别后的重试）。"""
     img = Image.open(path)
     img = ImageOps.exif_transpose(img)  # 依据 EXIF Orientation 自动摆正
@@ -146,7 +154,9 @@ def prepare_image(path, enhance=False):
 
 
 def _image_to_jpeg_buf(img, name="image.jpg"):
-    """最长边超过 MAX_SIZE 时等比缩小，返回 (JPEG 字节流, 文件名)。"""
+    """最长边超过 MAX_SIZE 时才等比缩小，返回 (JPEG 字节流, 文件名)。
+
+    最长边已经不超过 MAX_SIZE 时不缩放，也不放大。"""
     img = img.convert("RGB")
     w, h = img.size
     if max(w, h) > MAX_SIZE:
@@ -196,26 +206,135 @@ def looks_like_long_screenshot(path):
     return w <= 1600 and h > MAX_SIZE and (h / float(w)) >= 2.4
 
 
-def iter_vertical_slices(img, max_edge=None, overlap=0.15):
-    """把长图切成竖向重叠条，每条最长边不超过 max_edge，避免整图缩成一条窄图。"""
-    max_edge = MAX_SIZE if max_edge is None else int(max_edge)
-    w, h = img.size
+def _max_edge(max_edge):
+    edge = MAX_SIZE if max_edge is None else int(max_edge)
+    return edge if edge >= 1 else MAX_SIZE
+
+
+def full_frame_shrink_ratio(width, height, max_edge=None):
+    """整图只按最长边收到上限时的缩放比。不超过上限时是 1。"""
+    max_edge = _max_edge(max_edge)
+    long_edge = max(int(width or 0), int(height or 0))
+    if long_edge <= 0 or long_edge <= max_edge:
+        return 1.0
+    return max_edge / float(long_edge)
+
+
+def full_frame_is_crushed(path):
+    """整图 OCR 会把最长边收到 MAX_SIZE。短边因此不到原来一半时返回 True。
+
+    1080×6000 会变成大约 370×2048。这种瘦图认出来的字容易错。
+    打不开文件时返回 False，调用方按原来的择优。"""
+    try:
+        img = Image.open(path)
+        img = ImageOps.exif_transpose(img)
+        w, h = img.size
+    except Exception:
+        return False
     if w <= 0 or h <= 0:
+        return False
+    return full_frame_shrink_ratio(w, h) <= CRUSHED_FULL_FRAME_RATIO
+
+
+def _fitted_size(width, height, max_edge):
+    """宽超过上限时只缩宽。不用高度当缩放依据，避免把字压瘦。"""
+    width = int(width or 0)
+    height = int(height or 0)
+    if width <= 0 or height <= 0 or width <= max_edge:
+        return width, height
+    return max_edge, max(1, int(height * (max_edge / float(width))))
+
+
+def _scale_to_max_width(img, max_edge):
+    w, h = img.size
+    nw, nh = _fitted_size(w, h, max_edge)
+    if (nw, nh) == (w, h):
+        return img
+    return img.resize((nw, nh), Image.LANCZOS)
+
+
+def vertical_slice_boxes(width, height, max_edge=None, overlap=0.15, min_overlap_px=0,
+                         max_slice_height=None):
+    """半开区间 (y0, y1)，相对已经按宽度适配过的图。每条高度不超过 max_edge。"""
+    max_edge = _max_edge(max_edge)
+    width = int(width or 0)
+    height = int(height or 0)
+    if width <= 0 or height <= 0:
         return
-    slice_h = h if w > max_edge else min(h, max_edge)
-    if h <= slice_h:
-        yield img
+    height_cap = max_edge
+    if max_slice_height is not None:
+        height_cap = max(1, min(max_edge, int(max_slice_height)))
+    slice_h = min(height, height_cap)
+    if slice_h <= 0:
         return
-    step = max(1, int(slice_h * (1 - overlap)))
+    if height <= slice_h:
+        yield 0, height
+        return
+    overlap_px = int(slice_h * float(0.15 if overlap is None else overlap))
+    if min_overlap_px:
+        overlap_px = max(overlap_px, int(min_overlap_px))
+    overlap_px = max(0, min(overlap_px, slice_h - 1))
+    step = max(1, slice_h - overlap_px)
     y = 0
-    while y < h:
-        if h - y < slice_h and y > 0:
-            y = h - slice_h
-        bottom = min(h, y + slice_h)
-        yield img.crop((0, y, w, bottom))
-        if bottom >= h:
+    while y < height:
+        if height - y < slice_h and y > 0:
+            y = height - slice_h
+        bottom = min(height, y + slice_h)
+        yield y, bottom
+        if bottom >= height:
             break
         y += step
+
+
+def _row_overlap_px(width, height, max_edge):
+    """竖图才加「一条货」重叠。横图保持调用方给的比例，手写单照片不走这条。"""
+    if width <= 0 or height <= width:
+        return 0
+    working_w = min(int(width), max_edge)
+    return max(1, int(round(working_w * SLICE_ROW_OVERLAP_RATIO)))
+
+
+def ocr_slice_boxes(width, height, overlap=0.15, max_edge=None):
+    """和 iter_ocr_slices 同一套切法，返回缩宽之后的 (y0, y1)。不读图、不调用 OCR。"""
+    max_edge = _max_edge(max_edge)
+    fitted_w, fitted_h = _fitted_size(width, height, max_edge)
+    return list(vertical_slice_boxes(
+        fitted_w,
+        fitted_h,
+        max_edge=max_edge,
+        overlap=overlap,
+        min_overlap_px=_row_overlap_px(width, height, max_edge),
+    ))
+
+
+def iter_vertical_slices(img, max_edge=None, overlap=0.15, min_overlap_px=0, max_slice_height=None):
+    """竖向重叠条。宽不超过 max_edge（超了只缩宽），条高不超过 max_edge。
+
+    宽已经在上限内时保持原宽，不再按整图最长边把窄边一起压扁。
+    """
+    max_edge = _max_edge(max_edge)
+    fitted = _scale_to_max_width(img, max_edge)
+    w, h = fitted.size
+    for y0, y1 in vertical_slice_boxes(
+        w, h,
+        max_edge=max_edge,
+        overlap=overlap,
+        min_overlap_px=min_overlap_px,
+        max_slice_height=max_slice_height,
+    ):
+        yield fitted.crop((0, y0, w, y1))
+
+
+def iter_ocr_slices(img, overlap=0.15):
+    """长图送给 OCR 的竖条：原宽（宽超上限时只缩到上限），重叠盖住一条货。
+
+    每条最长边不超过 MAX_SIZE，编码时不会再把宽缩小。
+    整图本来就在上限内时不放大、不缩小。
+    """
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    w, h = img.size
+    kwargs = {"min_overlap_px": _row_overlap_px(w, h, MAX_SIZE)}
+    return iter_vertical_slices(img, overlap=overlap, **kwargs)
 
 
 def join_ocr_slices(texts):
@@ -244,13 +363,12 @@ def join_ocr_slices(texts):
 
 
 def call_ocr_tiled(image_path, timeout=600, overlap=0.15):
-    """长截图分条识别再拼接。某一条失败则整次抛出，调用方回退整图 OCR。
+    """长截图按原宽分条识别再拼接。某一条失败则整次抛出，调用方回退整图 OCR。
 
     只拼接模型返回的文字，不根据原图像素补数量或金额。"""
     img = Image.open(image_path)
-    img = ImageOps.exif_transpose(img)
     texts = []
-    for i, crop in enumerate(iter_vertical_slices(img, overlap=overlap)):
+    for i, crop in enumerate(iter_ocr_slices(img, overlap=overlap)):
         buf, name = _image_to_jpeg_buf(crop, f"slice-{i}.jpg")
         texts.append(_post_ocr_buf(buf, name, timeout))
     return join_ocr_slices(texts)
@@ -903,19 +1021,8 @@ def parse_meicai_text(text):
     }
 
 
-def meicai_ocr_quality(text):
-    """同一张美菜长图的两份 OCR 怎么比。只打分，不改、不编金额。
-
-    score = 可用实收数 × 100 + 干净货品行 × 5 − 噪声行 × 2
-
-    可用实收：去掉空白后整行就是「收」，且这一行或下一行能解析出
-    「￥金额/数量单位」；或者「收」和金额写在同一行。订货行不算。
-    干净货品行：品名和标价在同一行，或品名的下一行是纯标价（没有品名的金额行）。
-    噪声行：行内出现「(数字,数字)」坐标，或界面套话（已完成、美菜配送、退款详情、
-    送达时间、信任签收、查看更多物流、司机姓名等）。
-    只统计「付款信息 / 共N类」之前的行。实收权重最高，避免整图品名整齐但没有「收」
-    盖过有实收的分条结果。
-    """
+def _meicai_quality_parts(text):
+    """(可用实收数, 干净货品行, 噪声行)。规则见 meicai_ocr_quality。"""
     lines = []
     for raw in str(text or "").splitlines():
         if _meicai_goods_cutoff(raw):
@@ -954,7 +1061,29 @@ def meicai_ocr_quality(text):
         elif re.search(r"[\u4e00-\u9fff]", s) and i + 1 < len(lines) and _meicai_price_only_line(lines[i + 1]):
             goods += 1
         i += 1
+    return recv, goods, noise
+
+
+def meicai_ocr_quality(text):
+    """同一张美菜长图的两份 OCR 怎么比。只打分，不改、不编金额。
+
+    score = 可用实收数 × 100 + 干净货品行 × 5 − 噪声行 × 2
+
+    可用实收：去掉空白后整行就是「收」，且这一行或下一行能解析出
+    「￥金额/数量单位」；或者「收」和金额写在同一行。订货行不算。
+    干净货品行：品名和标价在同一行，或品名的下一行是纯标价（没有品名的金额行）。
+    噪声行：行内出现「(数字,数字)」坐标，或界面套话（已完成、美菜配送、退款详情、
+    送达时间、信任签收、查看更多物流、司机姓名等）。
+    只统计「付款信息 / 共N类」之前的行。实收权重最高，避免整图品名整齐但没有「收」
+    盖过有实收的分条结果。
+    """
+    recv, goods, noise = _meicai_quality_parts(text)
     return recv * 100 + goods * 5 - noise * 2
+
+
+def meicai_recv_count(text):
+    """可用「收」的行数。和 meicai_ocr_quality 同一套规则，订货行不算。"""
+    return _meicai_quality_parts(text)[0]
 
 
 def choose_meicai_ocr_text(texts):
