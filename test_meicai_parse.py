@@ -1193,6 +1193,11 @@ class MeicaiBareRecvAndNoise(unittest.TestCase):
         herb = next(it for it in parsed["items"] if it["品名"] == "鱼腥草")
         self.assertAlmostEqual(herb["数量"], 1.0, places=2)
         self.assertAlmostEqual(herb["金额"], 6.18, places=2)
+        # 香菜这条「收」是 0/0，但品名在。留下给人工看，不编成订货数 15.04。
+        coriander = next(it for it in parsed["items"] if it["品名"] == "香菜")
+        self.assertAlmostEqual(coriander["数量"], 0.0, places=2)
+        self.assertAlmostEqual(coriander["金额"], 0.0, places=2)
+        self.assertFalse(coriander["实收缺失"])
         beans = [it for it in parsed["items"] if it["品名"] == "优质黄豆" and it["金额"] == 4.66]
         self.assertEqual(len(beans), 1)
         self.assertEqual(beans[0]["单位"], "袋")
@@ -1476,6 +1481,104 @@ class MeicaiOverlapAndAdjust(unittest.TestCase):
             self.assertNotIn("退", it["品名"])
         self.assertFalse(parsed["suspects"])
         self.assertEqual(parsed["paid"], 22.03)
+
+    def test_orphan_blank_zero_recv_dropped(self):
+        """游离「收 ￥0.00」没有品名。空品名且数量/金额是 0 或缺的，不进明细。
+
+        有品名但没有「收」的仍标实收缺失。有品名且实收就是 0 的留下，不改成订货数。
+        """
+        text = "\n".join([
+            "美菜",
+            "送达时间 2026-09-04 07:12:48",
+            "订单号：2998060811 复制",
+            "鱼腥草 斤",
+            "收 ￥6.18/1.00斤",
+            "收 ￥0.00/0.00斤",
+            "收",
+            "￥0.00/0.00",
+            "收 ￥0.00",
+            "收 ¥0.00/0.00斤",
+            "黄瓜 二级 斤",
+            "￥11.84/5.08斤",
+            "香菜 优质 斤",
+            "收 ￥0.00/0.00斤",
+            "付款信息",
+            "商品多退少补合计￥6.18",
+        ])
+        parsed = core.parse_meicai_text(text)
+        self.assertEqual([it["品名"] for it in parsed["items"]], ["鱼腥草", "黄瓜 二级", "香菜"])
+        herb, cucumber, coriander = parsed["items"]
+        self.assertAlmostEqual(herb["数量"], 1.0, places=2)
+        self.assertAlmostEqual(herb["金额"], 6.18, places=2)
+        self.assertFalse(herb["实收缺失"])
+        self.assertIsNone(cucumber["数量"])
+        self.assertIsNone(cucumber["金额"])
+        self.assertTrue(cucumber["实收缺失"])
+        self.assertAlmostEqual(coriander["数量"], 0.0, places=2)
+        self.assertAlmostEqual(coriander["金额"], 0.0, places=2)
+        self.assertFalse(coriander["实收缺失"])
+        self.assertNotAlmostEqual(coriander["金额"], 11.84, places=2)
+        for it in parsed["items"]:
+            self.assertTrue(str(it["品名"]).strip())
+        self.assertEqual(parsed["suspects"], [core.meicai_missing_recv_summary(1)])
+
+    def test_join_orphan_zero_recv_does_not_change_houttuynia(self):
+        """交界上多出来的「收 ￥0.00」对不上上一笔实收，拼接留着，解析时丢掉。"""
+        first = "\n".join([
+            "美菜",
+            "送达时间 2026-09-04 07:12:48",
+            "订单号：2998060811 复制",
+            "鱼腥草 斤",
+            "收 ￥6.18/1.00斤",
+        ])
+        second = "\n".join([
+            "收 ￥0.00/0.00斤",
+            "收",
+            "￥0.00",
+            "优质黄豆 袋(500g)",
+            "￥4.66/1.00袋",
+            "订",
+            "￥4.66/1.00袋",
+            "收 ￥4.66/1.00袋",
+            "付款信息",
+            "商品多退少补合计￥10.84",
+        ])
+        joined = core.join_ocr_slices([first, second])
+        self.assertIn("收 ￥0.00/0.00斤", joined)
+        parsed = core.parse_meicai_text(joined)
+        self.assertEqual([it["品名"] for it in parsed["items"]], ["鱼腥草", "优质黄豆"])
+        herb, beans = parsed["items"]
+        self.assertAlmostEqual(herb["数量"], 1.0, places=2)
+        self.assertAlmostEqual(herb["金额"], 6.18, places=2)
+        self.assertFalse(herb["实收缺失"])
+        self.assertAlmostEqual(beans["数量"], 1.0, places=2)
+        self.assertAlmostEqual(beans["金额"], 4.66, places=2)
+        self.assertEqual(beans["单位"], "袋")
+        self.assertFalse(beans["实收缺失"])
+        self.assertFalse(parsed["suspects"])
+
+    def test_blank_name_nonzero_recv_kept_without_inventing_name(self):
+        """空品名但金额不是 0：留下这笔实收，不编品名，也不写到后面的货上。"""
+        text = "\n".join([
+            "美菜",
+            "送达时间 2026-09-04 07:12:48",
+            "订单号：2998060811 复制",
+            "收 ￥6.18/1.00斤",
+            "鱼腥草 斤",
+            "付款信息",
+            "商品多退少补合计￥6.18",
+        ])
+        parsed = core.parse_meicai_text(text)
+        self.assertEqual(len(parsed["items"]), 2)
+        blank, herb = parsed["items"]
+        self.assertEqual(blank["品名"], "")
+        self.assertAlmostEqual(blank["数量"], 1.0, places=2)
+        self.assertAlmostEqual(blank["金额"], 6.18, places=2)
+        self.assertFalse(blank["实收缺失"])
+        self.assertEqual(herb["品名"], "鱼腥草")
+        self.assertIsNone(herb["数量"])
+        self.assertIsNone(herb["金额"])
+        self.assertTrue(herb["实收缺失"])
 
     def test_handwriting_keeps_literal_adjust_text(self):
         html = "\n".join([
