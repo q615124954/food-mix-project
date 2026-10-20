@@ -1078,6 +1078,31 @@ def _meicai_line_kind(line):
     return "noise", s
 
 
+def _meicai_value_missing_or_zero(value):
+    """没有数字，或数字是 0。0.01 仍算有数。"""
+    if value is None or value == "":
+        return True
+    try:
+        return Decimal(str(value)) == 0
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+
+
+def _meicai_orphan_blank_item(item):
+    """空品名，且数量和金额都是 0 或没有。
+
+    没有挂上品名的「收 ￥0.00」「收 ￥0.00/0.00」是噪声，不进明细。
+    有品名的行留着：实收就是 0 的不改数，还没认出「收」的仍交给人工填。
+    品名空但数量或金额不是 0 的也留着，避免把认出来的金额丢掉或编到别的货上。
+    """
+    if item is None or str(item.get("品名") or "").strip():
+        return False
+    return (
+        _meicai_value_missing_or_zero(item.get("数量"))
+        and _meicai_value_missing_or_zero(item.get("金额"))
+    )
+
+
 def parse_meicai_text(text):
     """美菜订单截图 OCR 文本 → 一张采购单。
 
@@ -1088,6 +1113,7 @@ def parse_meicai_text(text):
     不用订货数填。品名单独一行、金额在下一行时也留下品名。
     连续几段都是这样时，下一条品名先把上一段交出去，不盖掉前面的品名。
     「收」单独一行、下一行是「￥金额/数量」时，与「收 ￥…」同样算实收。
+    品名为空、数量和金额又是 0 或没有的，是游离「收」，不进明细。
     交出去之前，品名和单位都相同的行加总数量和金额，复核页看到的是合并后的一行。
     """
     date = extract_meicai_date(text)
@@ -1106,13 +1132,13 @@ def parse_meicai_text(text):
     def _push(item):
         if item is None:
             return
-        name = str(item.get("品名") or "").strip()
         if item.get("数量") is None or item.get("金额") is None:
             # 缺实收只清数量和金额，品名留着给人工对原图。
             item["数量"] = None
             item["金额"] = None
             item["实收缺失"] = True
-        if not name and item.get("数量") is None and item.get("金额") is None:
+        # 空品名而且是 0 或没有数：游离「收」，不进复核明细。
+        if _meicai_orphan_blank_item(item):
             return
         items.append(item)
 
