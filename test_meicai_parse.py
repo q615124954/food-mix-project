@@ -1654,6 +1654,492 @@ class MeicaiOverlapAndAdjust(unittest.TestCase):
         self.assertAlmostEqual(items[0]["数量"], 1.0, places=2)
         self.assertAlmostEqual(items[0]["金额"], 2.0, places=2)
 
+    def test_dense_slice_paren_variants_stay_one_item(self):
+        """更密的相邻条把同一件货认了好几遍，括号和尺寸写法不同。
+
+        煲汤袋仍是 1 板，不是 3；冻鸡爪仍是 1 袋，不是 2。
+        后面数量不同的香菜是另一行，加总仍按这一行的实收。
+        """
+        def goods(rows):
+            lines = []
+            for name, amt, qty, unit in rows:
+                lines += [
+                    name,
+                    f"￥{amt}/{qty}{unit}",
+                    "订",
+                    f"￥{amt}/{qty}{unit}",
+                    "收",
+                    f"￥{amt}/{qty}{unit}",
+                ]
+            return lines
+
+        first = "\n".join([
+            "美菜",
+            "送达时间 2026-09-04 07:12:48",
+            "订单号：2998060809 复制",
+            *goods([
+                ("无纺布煲汤袋 10*15cm 板(12个)", "4.80", "1.00", "板"),
+                ("[雪靓] 冻鸡爪 L号 大爪/长爪 袋(1Kg)", "28.69", "1.00", "袋"),
+                ("大娃娃菜 优质 斤", "6.99", "3.04", "斤"),
+                ("鸡毛菜 普通 斤", "6.54", "3.00", "斤"),
+                ("鲜鸡蛋 红壳 中码 托(30个)", "20.08", "1.00", "托"),
+            ]),
+        ])
+        second = "\n".join([
+            "优质，拒绝欺骗！",
+            *goods([
+                ("无纺布煲汤袋(12个) 板", "4.80", "1.00", "板"),
+                ("[雪靓]冻鸡爪L号 大爪/长爪 袋(1Kg)", "28.69", "1.00", "袋"),
+                ("大娃娃菜 优质 斤", "6.99", "3.04", "斤"),
+                ("鸡毛菜 普通 斤", "6.54", "3.00", "斤"),
+                ("鲜鸡蛋 红壳 中码 托(30个)", "20.08", "1.00", "托"),
+                ("香菜 优质 斤", "15.04", "2.00", "斤"),
+            ]),
+        ])
+        third = "\n".join([
+            "由于季节和运输原因，会有烧心、碰碰黑斑现象。优质，拒绝欺骗！",
+            *goods([
+                ("无纺布煲汤袋 板（12个）", "4.80", "1.00", "板"),
+                ("冻鸡爪 L号 大爪/长爪 袋(1Kg)", "28.69", "1.00", "袋"),
+                ("大娃娃菜 优质 斤", "6.99", "3.04", "斤"),
+                ("鸡毛菜 普通 斤", "6.54", "3.00", "斤"),
+                ("鲜鸡蛋 红壳 中码 托(30个)", "20.08", "1.00", "托"),
+                ("香菜 优质 斤", "15.04", "2.00", "斤"),
+                ("黄瓜 二级 斤", "11.84", "5.08", "斤"),
+            ]),
+            "付款信息",
+            "商品多退少补合计￥93.00",
+        ])
+        parsed = core.parse_meicai_text(core.join_ocr_slices([first, second, third]))
+        bags = [it for it in parsed["items"] if "煲汤" in it["品名"]]
+        claws = [it for it in parsed["items"] if "鸡爪" in it["品名"]]
+        self.assertEqual(len(bags), 1)
+        self.assertEqual(bags[0]["单位"], "板")
+        self.assertAlmostEqual(bags[0]["数量"], 1.0, places=2)
+        self.assertAlmostEqual(bags[0]["金额"], 4.80, places=2)
+        self.assertNotAlmostEqual(bags[0]["数量"], 3.0, places=2)
+        self.assertEqual(len(claws), 1)
+        self.assertEqual(claws[0]["单位"], "袋")
+        self.assertAlmostEqual(claws[0]["数量"], 1.0, places=2)
+        self.assertAlmostEqual(claws[0]["金额"], 28.69, places=2)
+        self.assertNotAlmostEqual(claws[0]["数量"], 2.0, places=2)
+        cabbage = next(it for it in parsed["items"] if it["品名"] == "大娃娃菜")
+        self.assertAlmostEqual(cabbage["数量"], 3.04, places=2)
+        self.assertAlmostEqual(cabbage["金额"], 6.99, places=2)
+        coriander = next(it for it in parsed["items"] if it["品名"] == "香菜")
+        self.assertAlmostEqual(coriander["数量"], 2.0, places=2)
+        self.assertAlmostEqual(coriander["金额"], 15.04, places=2)
+        cucumber = next(it for it in parsed["items"] if it["品名"] == "黄瓜 二级")
+        self.assertAlmostEqual(cucumber["数量"], 5.08, places=2)
+        self.assertAlmostEqual(cucumber["金额"], 11.84, places=2)
+        blob = "\n".join(it["品名"] for it in parsed["items"])
+        self.assertNotIn("拒绝欺骗", blob)
+        self.assertNotIn("烧心", blob)
+
+    def test_long_identical_overlap_does_not_multiply_qty(self):
+        """重叠超过原先的 4 件货、行数也超过逐行比对上限时，数量仍不加倍。"""
+        rows = [
+            ("无纺布煲汤袋 板(12个)", "4.80", "1.00", "板"),
+            ("冻鸡爪 L号 大爪/长爪 袋(1Kg)", "28.69", "1.00", "袋"),
+            ("大娃娃菜 优质 斤", "6.99", "3.04", "斤"),
+            ("鸡毛菜 普通 斤", "6.54", "3.00", "斤"),
+            ("鲜鸡蛋 红壳 中码 托(30个)", "20.08", "1.00", "托"),
+            ("香菜 优质 斤", "15.04", "2.00", "斤"),
+            ("鱼腥草 斤", "6.18", "1.00", "斤"),
+            ("优质黄豆 袋(500g)", "4.66", "1.00", "袋"),
+        ]
+
+        def block(items, header):
+            lines = []
+            if header:
+                lines += ["美菜", "送达时间 2026-09-04 07:12:48", "订单号：2998060810 复制"]
+            for name, amt, qty, unit in items:
+                lines += [name, f"订 ￥{amt}/{qty}{unit}", f"收 ￥{amt}/{qty}{unit}", "等额收货"]
+            return "\n".join(lines)
+
+        nxt_rows = list(rows)
+        nxt_rows.append(("黄瓜 二级 斤", "11.84", "5.08", "斤"))
+        parsed = core.parse_meicai_text(core.join_ocr_slices([
+            block(rows, True),
+            block(nxt_rows, False) + "\n付款信息\n商品多退少补合计￥100",
+        ]))
+        expect = {
+            "无纺布煲汤袋": (1.0, 4.80),
+            "冻鸡爪 L号 大爪/长爪": (1.0, 28.69),
+            "大娃娃菜": (3.04, 6.99),
+            "鸡毛菜": (3.0, 6.54),
+            "鲜鸡蛋 红壳": (1.0, 20.08),
+            "香菜": (2.0, 15.04),
+            "鱼腥草": (1.0, 6.18),
+            "优质黄豆": (1.0, 4.66),
+            "黄瓜 二级": (5.08, 11.84),
+        }
+        self.assertEqual(sorted(it["品名"] for it in parsed["items"]), sorted(expect))
+        for it in parsed["items"]:
+            qty, amt = expect[it["品名"]]
+            self.assertAlmostEqual(it["数量"], qty, places=2)
+            self.assertAlmostEqual(it["金额"], amt, places=2)
+            self.assertFalse(it["实收缺失"])
+
+    def test_slogan_ad_lines_do_not_become_items(self):
+        """「优质，拒绝欺骗！」以及同类宣传句不进明细，也不粘进品名。
+
+        夹在订和「收」之间、且「收」和订行一致时，实收仍记在这件货上。优质黄豆不是广告。
+        """
+        text = "\n".join([
+            "美菜",
+            "送达时间 2026-09-04 07:12:48",
+            "订单号：2998060809 复制",
+            "无纺布煲汤袋 10*15cm 板(12个)",
+            "订 ￥4.80/1.00板",
+            "优质，拒绝欺骗！",
+            "由于季节和运输原因，会有烧心、碰碰黑斑现象。优质，拒绝欺骗！",
+            "收",
+            "￥4.80/1.00板",
+            "拒绝双氧水漂白",
+            "国产屠宰厂速冻锁鲜",
+            "[雪靓] 冻鸡爪 L号 大爪/长爪 袋(1Kg)",
+            "收 ￥28.69/1.00袋",
+            "香菜 优质 斤",
+            "收 ￥0.00/0.00斤",
+            "茎干均匀，真优质 拒绝欺骗",
+            "优质黄豆 袋(500g)",
+            "收 ￥4.66/1.00袋",
+            "真材实料，拒绝以次充好",
+            "付款信息",
+            "商品多退少补合计￥38.15",
+        ])
+        parsed = core.parse_meicai_text(text)
+        names = [it["品名"] for it in parsed["items"]]
+        self.assertEqual(names, ["无纺布煲汤袋 10*15cm", "冻鸡爪 L号 大爪/长爪", "香菜", "优质黄豆"])
+        bag, claw, coriander, beans = parsed["items"]
+        self.assertAlmostEqual(bag["数量"], 1.0, places=2)
+        self.assertAlmostEqual(bag["金额"], 4.80, places=2)
+        self.assertEqual(bag["单位"], "板")
+        self.assertFalse(bag["实收缺失"])
+        self.assertAlmostEqual(claw["数量"], 1.0, places=2)
+        self.assertAlmostEqual(claw["金额"], 28.69, places=2)
+        self.assertAlmostEqual(coriander["数量"], 0.0, places=2)
+        self.assertAlmostEqual(coriander["金额"], 0.0, places=2)
+        self.assertFalse(coriander["实收缺失"])
+        self.assertAlmostEqual(beans["数量"], 1.0, places=2)
+        self.assertAlmostEqual(beans["金额"], 4.66, places=2)
+        self.assertEqual(beans["单位"], "袋")
+        blob = "\n".join(names)
+        for word in ("拒绝欺骗", "拒绝双氧", "烧心", "茎干均匀", "速冻锁鲜", "以次充好"):
+            self.assertNotIn(word, blob)
+        self.assertFalse(parsed["suspects"])
+
+    def test_short_name_is_not_swallowed_as_paren_variant(self):
+        """只差一个单位字的短品名不是重叠变体。鱼腥草和鱼腥草包都留下。"""
+        first = "\n".join([
+            "美菜",
+            "订单号：2998060811 复制",
+            "鱼腥草 斤",
+            "收 ￥6.18/1.00斤",
+        ])
+        second = "\n".join([
+            "鱼腥草包 斤",
+            "收 ￥6.18/1.00斤",
+            "优质黄豆 袋(500g)",
+            "收 ￥4.66/1.00袋",
+        ])
+        parsed = core.parse_meicai_text(core.join_ocr_slices([first, second]))
+        self.assertEqual([it["品名"] for it in parsed["items"]], ["鱼腥草", "鱼腥草包", "优质黄豆"])
+        herb, packed, beans = parsed["items"]
+        self.assertAlmostEqual(herb["数量"], 1.0, places=2)
+        self.assertAlmostEqual(herb["金额"], 6.18, places=2)
+        self.assertAlmostEqual(packed["数量"], 1.0, places=2)
+        self.assertAlmostEqual(packed["金额"], 6.18, places=2)
+        self.assertAlmostEqual(beans["数量"], 1.0, places=2)
+
+    def test_handwriting_keeps_slogan_text(self):
+        html = "\n".join([
+            "<table><tr><td>编号</td><td>商品名称</td><td>单位</td><td>数量</td><td>单价</td><td>金额</td><td>备注</td></tr>",
+            "<tr><td>1</td><td>优质，拒绝欺骗！</td><td>斤</td><td>1</td><td>2</td><td>2</td><td></td></tr>",
+            "</table>",
+        ])
+        self.assertFalse(core.is_meicai_ocr(html))
+        items = core.parse_line_items(core.parse_table(html))
+        self.assertEqual(items[0]["品名"], "优质，拒绝欺骗！")
+        self.assertAlmostEqual(items[0]["数量"], 1.0, places=2)
+        self.assertAlmostEqual(items[0]["金额"], 2.0, places=2)
+
+    def test_same_strip_bundle_tier_keeps_smaller_recv(self):
+        """同一条里煲汤袋有两档实收：2 板 9.40 和 1 板 4.80。
+
+        数量金额不同，重叠去重对不上。两档单价也不一样，不是两笔同价货。
+        留下 1 板 / 4.80，不加总成 3 板 / 14.20。先后顺序不影响留哪一档。
+        """
+        def block(first, second):
+            rows = []
+            for amt, qty in (first, second):
+                rows += [
+                    "无纺布煲汤袋 10*15cm 板(12个)",
+                    f"￥{amt}/{qty}板",
+                    "订",
+                    f"￥{amt}/{qty}板",
+                    "收",
+                    f"￥{amt}/{qty}板",
+                ]
+            return "\n".join([
+                "美菜",
+                "送达时间 2026-09-04 07:12:48",
+                "订单号：2998060809 复制",
+                *rows,
+                "付款信息",
+                "商品多退少补合计￥4.80",
+            ])
+
+        for text in (
+            block(("9.40", "2.00"), ("4.80", "1.00")),
+            block(("4.80", "1.00"), ("9.40", "2.00")),
+        ):
+            parsed = core.parse_meicai_text(text)
+            bags = [it for it in parsed["items"] if "煲汤" in it["品名"]]
+            self.assertEqual(len(bags), 1)
+            self.assertAlmostEqual(bags[0]["数量"], 1.0, places=2)
+            self.assertAlmostEqual(bags[0]["金额"], 4.80, places=2)
+            self.assertEqual(bags[0]["单位"], "板")
+            self.assertNotAlmostEqual(bags[0]["数量"], 3.0, places=2)
+            self.assertNotAlmostEqual(bags[0]["金额"], 14.2, places=2)
+            self.assertFalse(bags[0]["实收缺失"])
+
+    def test_join_bundle_tiers_keep_one_recv(self):
+        """两片各有一档煲汤袋，数量不同，拼完仍是 1 板 / 4.80。"""
+        first = "\n".join([
+            "美菜",
+            "送达时间 2026-09-04 07:12:48",
+            "订单号：2998060809 复制",
+            "无纺布煲汤袋 10*15cm 板(12个)",
+            "收 ￥4.80/1.00板",
+        ])
+        second = "\n".join([
+            "无纺布煲汤袋 10*15cm 板(12个)",
+            "收 ￥9.40/2.00板",
+            "冻鸡爪 L号 大爪/长爪 袋(1Kg)",
+            "收 ￥28.69/1.00袋",
+        ])
+        parsed = core.parse_meicai_text(core.join_ocr_slices([first, second]))
+        bags = [it for it in parsed["items"] if "煲汤" in it["品名"]]
+        self.assertEqual(len(bags), 1)
+        self.assertAlmostEqual(bags[0]["数量"], 1.0, places=2)
+        self.assertAlmostEqual(bags[0]["金额"], 4.80, places=2)
+        claw = next(it for it in parsed["items"] if "鸡爪" in it["品名"])
+        self.assertAlmostEqual(claw["数量"], 1.0, places=2)
+        self.assertAlmostEqual(claw["金额"], 28.69, places=2)
+
+    def test_same_unit_price_double_qty_still_sums(self):
+        """1 板 4.80 和 2 板 9.60 单价相同，是两笔货，加总成 3 板 / 14.40。"""
+        text = "\n".join([
+            "美菜",
+            "送达时间 2026-09-04 07:12:48",
+            "订单号：2998060809 复制",
+            "无纺布煲汤袋 10*15cm 板(12个)",
+            "收 ￥4.80/1.00板",
+            "无纺布煲汤袋 10*15cm 板(12个)",
+            "收 ￥9.60/2.00板",
+            "付款信息",
+            "商品多退少补合计￥14.40",
+        ])
+        parsed = core.parse_meicai_text(text)
+        bags = [it for it in parsed["items"] if "煲汤" in it["品名"]]
+        self.assertEqual(len(bags), 1)
+        self.assertAlmostEqual(bags[0]["数量"], 3.0, places=2)
+        self.assertAlmostEqual(bags[0]["金额"], 14.40, places=2)
+
+    def test_slogan_orphan_recv_does_not_attach_to_previous(self):
+        """广告紧后面的无名「收」丢掉，不把 3.04/6.99 加进已经写过实收的鸡毛菜。"""
+        text = "\n".join([
+            "美菜",
+            "送达时间 2026-09-04 07:12:48",
+            "订单号：2998060810 复制",
+            "鸡毛菜 普通 斤",
+            "￥6.54/3.00斤",
+            "订",
+            "￥6.54/3.00斤",
+            "收",
+            "￥6.54/3.00斤",
+            "优质，拒绝欺骗！",
+            "收",
+            "￥6.99/3.04斤",
+            "大娃娃菜 优质 斤",
+            "收 ￥6.99/3.04斤",
+            "付款信息",
+            "商品多退少补合计￥13.53",
+        ])
+        parsed = core.parse_meicai_text(text)
+        self.assertEqual([it["品名"] for it in parsed["items"]], ["鸡毛菜", "大娃娃菜"])
+        greens, cabbage = parsed["items"]
+        self.assertAlmostEqual(greens["数量"], 3.0, places=2)
+        self.assertAlmostEqual(greens["金额"], 6.54, places=2)
+        self.assertNotAlmostEqual(greens["数量"], 6.04, places=2)
+        self.assertNotAlmostEqual(greens["金额"], 13.53, places=2)
+        self.assertFalse(greens["实收缺失"])
+        self.assertAlmostEqual(cabbage["数量"], 3.04, places=2)
+        self.assertAlmostEqual(cabbage["金额"], 6.99, places=2)
+        self.assertFalse(any(not str(it["品名"]).strip() for it in parsed["items"]))
+
+    def test_slogan_between_order_and_matching_recv_keeps_recv(self):
+        """广告夹在订和收之间时，只把和订行一致的「收」记在这件货上。"""
+        text = "\n".join([
+            "美菜",
+            "送达时间 2026-09-04 07:12:48",
+            "订单号：2998060810 复制",
+            "鸡毛菜 普通 斤",
+            "订 ￥6.54/3.00斤",
+            "优质，拒绝欺骗！",
+            "收",
+            "￥6.54/3.00斤",
+            "付款信息",
+            "商品多退少补合计￥6.54",
+        ])
+        parsed = core.parse_meicai_text(text)
+        self.assertEqual(len(parsed["items"]), 1)
+        it = parsed["items"][0]
+        self.assertEqual(it["品名"], "鸡毛菜")
+        self.assertAlmostEqual(it["数量"], 3.0, places=2)
+        self.assertAlmostEqual(it["金额"], 6.54, places=2)
+        self.assertFalse(it["实收缺失"])
+        self.assertFalse(parsed["suspects"])
+
+    def test_slogan_between_order_and_mismatched_recv_is_orphan(self):
+        """订 3.00/6.54，广告后的 3.04/6.99 对不上，丢掉，不和后面的真鸡毛菜加总。"""
+        text = "\n".join([
+            "美菜",
+            "送达时间 2026-09-04 07:12:48",
+            "订单号：2998060810 复制",
+            "鸡毛菜 普通 斤 ￥6.54/3.00斤",
+            "订 ￥6.54/3.00斤",
+            "优质，拒绝欺骗！",
+            "收 ￥6.99/3.04斤",
+            "补 +￥0.09/0.04斤",
+            "鸡毛菜 普通 斤 ￥6.54/3.00斤",
+            "订 ￥6.54/3.00斤",
+            "收 ￥6.54/3.00斤",
+            "等额收货",
+            "付款信息",
+            "商品多退少补合计￥6.54",
+        ])
+        parsed = core.parse_meicai_text(text)
+        self.assertEqual([it["品名"] for it in parsed["items"]], ["鸡毛菜"])
+        greens = parsed["items"][0]
+        self.assertAlmostEqual(greens["数量"], 3.0, places=2)
+        self.assertAlmostEqual(greens["金额"], 6.54, places=2)
+        self.assertNotAlmostEqual(greens["数量"], 6.04, places=2)
+        self.assertNotAlmostEqual(greens["金额"], 13.53, places=2)
+        self.assertFalse(greens["实收缺失"])
+        self.assertFalse(parsed["suspects"])
+
+    def test_shot3_slogan_orphan_recv_does_not_stick_to_jimaocai(self):
+        """Shot3：大娃娃菜实收之后，鸡毛菜订行、广告、交界孤儿收、再出真鸡毛菜。"""
+        text = "\n".join([
+            "美菜",
+            "送达时间 2026-09-04 07:12:48",
+            "订单号：2998060809 复制",
+            "促 大娃娃菜 优质 斤 ￥6.90/3.00斤",
+            "订 ￥6.90/3.00斤",
+            "收 ￥6.99/3.04斤",
+            "补 +￥0.09/0.04斤",
+            "鸡毛菜 普通 斤 ￥6.54/3.00斤",
+            "订 ￥6.54/3.00斤",
+            "优质，拒绝欺骗！",
+            "收 ￥6.99/3.04斤",
+            "补 +￥0.09/0.04斤",
+            "鸡毛菜 普通 斤 ￥6.54/3.00斤",
+            "订 ￥6.54/3.00斤",
+            "收 ￥6.54/3.00斤",
+            "等额收货",
+            "付款信息",
+            "商品多退少补合计￥13.53",
+        ])
+        parsed = core.parse_meicai_text(text)
+        self.assertEqual([it["品名"] for it in parsed["items"]], ["大娃娃菜", "鸡毛菜"])
+        cabbage, greens = parsed["items"]
+        self.assertAlmostEqual(cabbage["数量"], 3.04, places=2)
+        self.assertAlmostEqual(cabbage["金额"], 6.99, places=2)
+        self.assertFalse(cabbage["实收缺失"])
+        self.assertAlmostEqual(greens["数量"], 3.0, places=2)
+        self.assertAlmostEqual(greens["金额"], 6.54, places=2)
+        self.assertNotAlmostEqual(greens["数量"], 6.04, places=2)
+        self.assertNotAlmostEqual(greens["金额"], 13.53, places=2)
+        self.assertFalse(greens["实收缺失"])
+        self.assertNotIn("拒绝欺骗", "\n".join(it["品名"] for it in parsed["items"]))
+        self.assertFalse(any(not str(it["品名"]).strip() for it in parsed["items"]))
+        self.assertFalse(parsed["suspects"])
+
+    def test_slogan_between_order_and_small_adjust_keeps_recv(self):
+        """订 6.90/3.00，广告后收 6.99/3.04 是小额补差，仍记在这件货上。"""
+        text = "\n".join([
+            "美菜",
+            "送达时间 2026-09-04 07:12:48",
+            "订单号：2998060809 复制",
+            "促 大娃娃菜 优质 斤 ￥6.90/3.00斤",
+            "订 ￥6.90/3.00斤",
+            "优质，拒绝欺骗！",
+            "收 ￥6.99/3.04斤",
+            "补 +￥0.09/0.04斤",
+            "付款信息",
+            "商品多退少补合计￥6.99",
+        ])
+        parsed = core.parse_meicai_text(text)
+        self.assertEqual(len(parsed["items"]), 1)
+        cabbage = parsed["items"][0]
+        self.assertEqual(cabbage["品名"], "大娃娃菜")
+        self.assertAlmostEqual(cabbage["数量"], 3.04, places=2)
+        self.assertAlmostEqual(cabbage["金额"], 6.99, places=2)
+        self.assertFalse(cabbage["实收缺失"])
+        self.assertFalse(parsed["suspects"])
+
+    def test_slogan_recv_copied_from_other_goods_is_orphan(self):
+        """订行对得上，但这笔实收和前面另一件货相同，仍丢掉。同一品名的第二笔留下。"""
+        copied = "\n".join([
+            "美菜",
+            "送达时间 2026-09-04 07:12:48",
+            "订单号：2998060809 复制",
+            "大娃娃菜 优质 斤 ￥6.99/3.04斤",
+            "订 ￥6.99/3.04斤",
+            "收 ￥6.99/3.04斤",
+            "鸡毛菜 普通 斤 ￥6.99/3.04斤",
+            "订 ￥6.99/3.04斤",
+            "优质，拒绝欺骗！",
+            "收 ￥6.99/3.04斤",
+            "鸡毛菜 普通 斤 ￥6.54/3.00斤",
+            "订 ￥6.54/3.00斤",
+            "收 ￥6.54/3.00斤",
+            "付款信息",
+            "商品多退少补合计￥13.53",
+        ])
+        parsed = core.parse_meicai_text(copied)
+        self.assertEqual([it["品名"] for it in parsed["items"]], ["大娃娃菜", "鸡毛菜"])
+        cabbage, greens = parsed["items"]
+        self.assertAlmostEqual(cabbage["数量"], 3.04, places=2)
+        self.assertAlmostEqual(cabbage["金额"], 6.99, places=2)
+        self.assertAlmostEqual(greens["数量"], 3.0, places=2)
+        self.assertAlmostEqual(greens["金额"], 6.54, places=2)
+        self.assertFalse(parsed["suspects"])
+
+        same_name = "\n".join([
+            "美菜",
+            "送达时间 2026-09-04 07:12:48",
+            "订单号：2998060811 复制",
+            "鱼腥草 斤",
+            "订 ￥6.18/1.00斤",
+            "收 ￥6.18/1.00斤",
+            "鱼腥草 斤",
+            "订 ￥6.18/1.00斤",
+            "优质，拒绝欺骗！",
+            "收 ￥6.18/1.00斤",
+            "付款信息",
+            "商品多退少补合计￥12.36",
+        ])
+        parsed = core.parse_meicai_text(same_name)
+        herbs = [it for it in parsed["items"] if it["品名"] == "鱼腥草"]
+        self.assertEqual(len(herbs), 1)
+        self.assertAlmostEqual(herbs[0]["数量"], 2.0, places=2)
+        self.assertAlmostEqual(herbs[0]["金额"], 12.36, places=2)
+        self.assertFalse(herbs[0]["实收缺失"])
+
     def test_gold_9_9_and_shot_scallion_do_not_regress(self):
         parsed = core.parse_meicai_text(_ocr_text())
         gold = _gold()
