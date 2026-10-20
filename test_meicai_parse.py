@@ -537,8 +537,10 @@ class LongScreenshot(unittest.TestCase):
         img.putpixel((0, 0), (255, 0, 0))
         img.putpixel((20, h - 1), (0, 255, 0))
         slices = list(core.iter_ocr_slices(img))
-        self.assertGreaterEqual(len(slices), 3)
+        self.assertGreaterEqual(len(slices), 5)
+        self.assertLess(core.OCR_SLICE_HEIGHT, core.MAX_SIZE)
         self.assertTrue(all(s.size[0] == w for s in slices))
+        self.assertTrue(all(s.size[1] <= core.OCR_SLICE_HEIGHT for s in slices))
         self.assertTrue(all(max(s.size) <= core.MAX_SIZE for s in slices))
         self.assertTrue(any(s.getpixel((0, 0)) == (255, 0, 0) for s in slices))
         self.assertTrue(any(s.getpixel((20, s.size[1] - 1)) == (0, 255, 0) for s in slices))
@@ -551,7 +553,12 @@ class LongScreenshot(unittest.TestCase):
 
         boxes = core.ocr_slice_boxes(w, h)
         self.assertEqual(len(boxes), len(slices))
+        self.assertEqual(boxes[0][0], 0)
+        self.assertEqual(boxes[-1][1], h)
+        self.assertTrue(all(b - a <= core.OCR_SLICE_HEIGHT for a, b in boxes))
         row = max(1, int(round(w * core.SLICE_ROW_OVERLAP_RATIO)))
+        for (a0, a1), (b0, b1) in zip(boxes, boxes[1:]):
+            self.assertGreaterEqual(a1 - b0, row)
         for y0 in range(0, h - row + 1, 37):
             y1 = y0 + row
             self.assertTrue(
@@ -565,9 +572,27 @@ class LongScreenshot(unittest.TestCase):
         slices = list(core.iter_ocr_slices(img))
         self.assertGreaterEqual(len(slices), 2)
         self.assertTrue(all(s.size[0] == core.MAX_SIZE for s in slices))
+        self.assertTrue(all(s.size[1] <= core.OCR_SLICE_HEIGHT for s in slices))
         self.assertTrue(all(max(s.size) <= core.MAX_SIZE for s in slices))
         crushed_w = int(3000 * (core.MAX_SIZE / 5000.0))
         self.assertGreater(slices[0].size[0], crushed_w)
+        # 编码不再按最长边把这条压回去。宽已是上限时尺寸不变。
+        encoded, _ = core._image_to_jpeg_buf(slices[0], "slice-0.jpg")
+        self.assertEqual(Image.open(encoded).size, slices[0].size)
+
+    def test_slice_jpeg_shrinks_width_only(self):
+        """分条编码只缩宽。高过上限的窄条不能按最长边把宽一起压瘦。"""
+        tall = Image.new("RGB", (1080, 2500), "white")
+        tall_buf, _ = core._image_to_jpeg_buf(tall, "tall.jpg")
+        self.assertEqual(Image.open(tall_buf).size, (1080, 2500))
+        wide = Image.new("RGB", (3000, 4000), "white")
+        wide_buf, _ = core._image_to_jpeg_buf(wide, "wide.jpg")
+        opened = Image.open(wide_buf)
+        fitted_h = int(4000 * (core.MAX_SIZE / 3000.0))
+        self.assertEqual(opened.size, (core.MAX_SIZE, fitted_h))
+        self.assertGreater(opened.size[1], core.MAX_SIZE)
+        longest = int(3000 * (core.MAX_SIZE / 4000.0))
+        self.assertGreater(opened.size[0], longest)
 
     def test_ocr_one_uses_tiled_text_for_long_image(self):
         tmp = tempfile.TemporaryDirectory()
@@ -605,7 +630,7 @@ class LongScreenshot(unittest.TestCase):
         self.assertAlmostEqual(res["items"][0]["数量"], 3.08, places=2)
 
     def test_ocr_one_prefers_full_when_it_has_more_recv(self):
-        """分条几乎没有可用「收」、整图有实收时，用整图原文。不把订货数写成实收。"""
+        """分条没有可用「收」、整图「收」多出足够行数时，用整图原文。不把订货数写成实收。"""
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         path_dir = tmp.name
@@ -704,8 +729,8 @@ class LongScreenshot(unittest.TestCase):
         self.assertEqual(seen["full"], 1)
         self.assertEqual([it["品名"] for it in res["items"]], ["小葱"])
 
-    def test_crushed_full_still_wins_when_it_has_more_recv(self):
-        """瘦图「收」更多时仍用整图。不把缺掉的实收留空。"""
+    def test_one_extra_recv_does_not_let_shrunk_full_win(self):
+        """压瘦的整图只多一行「收」时仍用分条。不拿糊掉的字盖过原宽切片。"""
         tiled_text = "\n".join([
             "美菜",
             "送达时间 2026-09-09 06:35:03",
@@ -726,15 +751,50 @@ class LongScreenshot(unittest.TestCase):
             "付款信息",
             "商品多退少补合计￥16.00",
         ])
+        self.assertFalse(core.shrunk_full_beats_tiled(tiled_text, full_text))
         res, seen = self._ocr_long((1080, 6000), tiled_text, full_text)
         self.assertEqual(seen["full"], 1)
-        names = [it["品名"] for it in res["items"]]
-        self.assertEqual(names, ["小葱", "鸡毛菜"])
+        self.assertEqual([it["品名"] for it in res["items"]], ["小葱"])
+
+    def test_full_wins_only_when_recv_margin_is_met(self):
+        """分条「收」明显更少（少够 MEICAI_FULL_RECV_MARGIN 行）时才退回整图。"""
+        tiled_rows = [
+            "美菜",
+            "送达时间 2026-09-09 06:35:03",
+            "订单号：3002160333 复制",
+            "小葱 斤 ￥10.00/1.00斤",
+            "收 ￥10.00/1.00斤",
+            "付款信息",
+            "商品多退少补合计￥40.00",
+        ]
+        names = ["小葱", "鸡毛菜", "生菜", "香菜"]
+        amounts = [(10.0, 1.0), (6.0, 1.0), (8.0, 2.0), (4.0, 1.0)]
+        self.assertEqual(len(names), 1 + core.MEICAI_FULL_RECV_MARGIN)
+        full_rows = [
+            "美菜",
+            "送达时间 2026-09-09 06:35:03",
+            "订单号：3002160333 复制",
+        ]
+        for name, (amt, qty) in zip(names, amounts):
+            full_rows.append("%s 斤 ￥%.2f/%.2f斤" % (name, amt, qty))
+            full_rows.append("收 ￥%.2f/%.2f斤" % (amt, qty))
+        full_rows.extend(["付款信息", "商品多退少补合计￥40.00"])
+        tiled_text = "\n".join(tiled_rows)
+        full_text = "\n".join(full_rows)
+        self.assertTrue(core.shrunk_full_beats_tiled(tiled_text, full_text))
+        # 只留前三件货：比分条多两行「收」，还没到门槛。
+        short_full = "\n".join(full_rows[:3] + full_rows[3:9] + full_rows[-2:])
+        self.assertEqual(core.meicai_recv_count(short_full), core.meicai_recv_count(tiled_text) + 2)
+        self.assertFalse(core.shrunk_full_beats_tiled(tiled_text, short_full))
+        res, seen = self._ocr_long((1080, 6000), tiled_text, full_text)
+        self.assertEqual(seen["tiled"], 1)
+        self.assertEqual(seen["full"], 1)
+        self.assertEqual([it["品名"] for it in res["items"]], names)
         self.assertAlmostEqual(res["items"][1]["数量"], 1.0, places=2)
         self.assertAlmostEqual(res["items"][1]["金额"], 6.0, places=2)
 
-    def test_mild_shrink_full_still_wins_on_score(self):
-        """1080×3000 还没压到一半宽。整图分数更高时仍走原来的择优。"""
+    def test_mild_shrink_does_not_win_on_extra_goods_lines(self):
+        """1080×3000 也会把长边收到 2048。整图多一行品名、没有多出来的「收」，仍用分条。"""
         tiled_text = "\n".join([
             "美菜",
             "送达时间 2026-09-09 06:35:03",
@@ -755,8 +815,10 @@ class LongScreenshot(unittest.TestCase):
             "商品多退少补合计￥10.00",
         ])
         self.assertGreater(core.full_frame_shrink_ratio(1080, 3000), core.CRUSHED_FULL_FRAME_RATIO)
+        self.assertGreater(core.meicai_ocr_quality(full_text), core.meicai_ocr_quality(tiled_text))
+        self.assertFalse(core.shrunk_full_beats_tiled(tiled_text, full_text))
         res, _seen = self._ocr_long((1080, 3000), tiled_text, full_text)
-        self.assertEqual([it["品名"] for it in res["items"]], ["小葱", "鸡毛菜"])
+        self.assertEqual([it["品名"] for it in res["items"]], ["小葱"])
 
     def test_long_handwriting_stays_on_tiled_text(self):
         """两份都不像美菜时不换文本。手写单仍走原来的表解析。"""

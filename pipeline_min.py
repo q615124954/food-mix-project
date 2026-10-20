@@ -39,11 +39,19 @@ API_KEY = (
 )
 MODEL = "HunyuanOCR"
 MAX_SIZE = 2048          # HunyuanOCR 最长边上限。测试和说明都按 2048，不另抬。
-# 一条货（品名 + 订 + 收）在手机宽上大约占屏宽的四成。竖切重叠至少留这么高，
+# 条高略低于最长边上限。窄长图按原宽切得更短，每条更接近裁一块来认，
+# 而不是把很长一段塞进 2048。条高不超过 MAX_SIZE，编码时不会再缩小。
+OCR_SLICE_HEIGHT = 1600
+# 相对条高的重叠。窄图上还会抬到至少一条货的高度，见 SLICE_ROW_OVERLAP_RATIO。
+OCR_SLICE_OVERLAP = 0.25
+# 一条货（品名 + 订 + 收）大约占屏宽的一半。竖切重叠至少留这么高，
 # 避免「收」落在切缝上、两条都只剩半行。
-SLICE_ROW_OVERLAP_RATIO = 0.42
+SLICE_ROW_OVERLAP_RATIO = 0.50
 # 整图把最长边收到 MAX_SIZE 之后，短边不到原来的一半，字会糊。
 CRUSHED_FULL_FRAME_RATIO = 0.5
+# 窄长图分条已经有字时，整图要多出至少这么多行可用「收」才替换分条。
+# 多一两行「收」、或多几行品名，都不换。整图长边被收到 MAX_SIZE，字是压瘦的。
+MEICAI_FULL_RECV_MARGIN = 3
 INPUT_DIR = r"D:\采购单"
 OUTPUT_DIR = r"D:\财务表"
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "采购入库_暂存.xlsx")
@@ -154,14 +162,12 @@ def prepare_image(path, enhance=False):
 
 
 def _image_to_jpeg_buf(img, name="image.jpg"):
-    """最长边超过 MAX_SIZE 时才等比缩小，返回 (JPEG 字节流, 文件名)。
+    """分条编码，返回 (JPEG 字节流, 文件名)。
 
-    最长边已经不超过 MAX_SIZE 时不缩放，也不放大。"""
-    img = img.convert("RGB")
-    w, h = img.size
-    if max(w, h) > MAX_SIZE:
-        scale = MAX_SIZE / float(max(w, h))
-        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+    宽超过 MAX_SIZE 时只缩宽，高度不参与缩放，避免按最长边把字压瘦。
+    切分已经把条高限制在 OCR_SLICE_HEIGHT（不超过最长边上限）。
+    宽、高都在上限内时原样编码，不放大。"""
+    img = _scale_to_max_width(img.convert("RGB"), MAX_SIZE)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=92)
     buf.seek(0)
@@ -224,7 +230,8 @@ def full_frame_is_crushed(path):
     """整图 OCR 会把最长边收到 MAX_SIZE。短边因此不到原来一半时返回 True。
 
     1080×6000 会变成大约 370×2048。这种瘦图认出来的字容易错。
-    打不开文件时返回 False，调用方按原来的择优。"""
+    打不开文件时返回 False。
+    窄长图是否改用整图，看 shrunk_full_beats_tiled，不按这里的一半宽单独放行。"""
     try:
         img = Image.open(path)
         img = ImageOps.exif_transpose(img)
@@ -294,9 +301,11 @@ def _row_overlap_px(width, height, max_edge):
     return max(1, int(round(working_w * SLICE_ROW_OVERLAP_RATIO)))
 
 
-def ocr_slice_boxes(width, height, overlap=0.15, max_edge=None):
+def ocr_slice_boxes(width, height, overlap=None, max_edge=None):
     """和 iter_ocr_slices 同一套切法，返回缩宽之后的 (y0, y1)。不读图、不调用 OCR。"""
     max_edge = _max_edge(max_edge)
+    if overlap is None:
+        overlap = OCR_SLICE_OVERLAP
     fitted_w, fitted_h = _fitted_size(width, height, max_edge)
     return list(vertical_slice_boxes(
         fitted_w,
@@ -304,6 +313,7 @@ def ocr_slice_boxes(width, height, overlap=0.15, max_edge=None):
         max_edge=max_edge,
         overlap=overlap,
         min_overlap_px=_row_overlap_px(width, height, max_edge),
+        max_slice_height=min(OCR_SLICE_HEIGHT, max_edge),
     ))
 
 
@@ -325,16 +335,22 @@ def iter_vertical_slices(img, max_edge=None, overlap=0.15, min_overlap_px=0, max
         yield fitted.crop((0, y0, w, y1))
 
 
-def iter_ocr_slices(img, overlap=0.15):
-    """长图送给 OCR 的竖条：原宽（宽超上限时只缩到上限），重叠盖住一条货。
+def iter_ocr_slices(img, overlap=None):
+    """长图送给 OCR 的竖条：原宽（宽超上限时只缩到上限），条高略短于最长边，重叠盖住一条货。
 
-    每条最长边不超过 MAX_SIZE，编码时不会再把宽缩小。
+    每条最长边不超过 MAX_SIZE，编码时不会再按最长边把宽缩小。
     整图本来就在上限内时不放大、不缩小。
     """
     img = ImageOps.exif_transpose(img).convert("RGB")
     w, h = img.size
-    kwargs = {"min_overlap_px": _row_overlap_px(w, h, MAX_SIZE)}
-    return iter_vertical_slices(img, overlap=overlap, **kwargs)
+    if overlap is None:
+        overlap = OCR_SLICE_OVERLAP
+    return iter_vertical_slices(
+        img,
+        overlap=overlap,
+        min_overlap_px=_row_overlap_px(w, h, MAX_SIZE),
+        max_slice_height=OCR_SLICE_HEIGHT,
+    )
 
 
 _JOIN_EXACT_LINE_LIMIT = 12
@@ -570,7 +586,7 @@ def join_ocr_slices(texts):
     return "\n".join(deduped)
 
 
-def call_ocr_tiled(image_path, timeout=600, overlap=0.15):
+def call_ocr_tiled(image_path, timeout=600, overlap=None):
     """长截图按原宽分条识别再拼接。某一条失败则整次抛出，调用方回退整图 OCR。
 
     只拼接模型返回的文字，不根据原图像素补数量或金额。"""
@@ -1336,12 +1352,33 @@ def meicai_recv_count(text):
     return _meicai_quality_parts(text)[0]
 
 
+def shrunk_full_beats_tiled(tiled, full, margin=None):
+    """窄长图的整图 OCR 是否该替换分条结果。
+
+    整图会把最长边收到 MAX_SIZE，窄图的字被压瘦。分条有字时默认留分条。
+    只有整图的可用「收」比分条多出 margin 行及以上才换。
+    品名行更多、噪声更少、或多一两行「收」，都不换。
+    两份都不像美菜时不换（手写单仍用分条原文）。
+    """
+    if margin is None:
+        margin = MEICAI_FULL_RECV_MARGIN
+    margin = int(margin)
+    if margin < 1:
+        margin = 1
+    if not str(tiled or "").strip() or not str(full or "").strip():
+        return False
+    if not (is_meicai_ocr(tiled) or is_meicai_ocr(full)):
+        return False
+    return meicai_recv_count(full) >= meicai_recv_count(tiled) + margin
+
+
 def choose_meicai_ocr_text(texts):
     """在同一张长图的多份 OCR 原文里选一份。不改数字。
 
     有任一份像美菜时，只在这些里面比 meicai_ocr_quality，
     避免把认成手写表的那份选上来把实收丢掉。
     都不像美菜时比同一分数；分数相同留前面的那份（调用方把分条放前面）。
+    窄长美菜截图不走这里：整图长边会被压到 MAX_SIZE，见 shrunk_full_beats_tiled。
     """
     usable = [t for t in texts or [] if str(t or "").strip()]
     if not usable:
