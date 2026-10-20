@@ -733,14 +733,13 @@ def _ocr_needs_retry(parsed):
 
 
 def _ocr_text_for_path(path):
-    """长截图分条识别，再和整图 OCR 比哪份更能用。短图只整图。
+    """窄长截图默认只采用原宽竖切。短图只整图。
 
-    分条按原宽竖切，不把长图收成一条窄图。
-    两份都有字、且至少一份像美菜时，用 meicai_ocr_quality 选：
-    可用「收」更多优先，其次噪声更少、干净货品行更多。分数相同留分条结果。
-    整图短边会被压到原来一半以下时，分条的可用「收」不少于整图就留分条，
-    不让糊掉的瘦图靠多出来的品名行盖过。整图「收」更多时仍用整图。
-    都不像美菜时仍用分条结果（手写单不因多打一次整图而换文本）。
+    分条按原宽切（宽超过上限时只缩宽），不把长图收成一条窄图。
+    分条有字时，不用 meicai_ocr_quality 和整图比：整图会把最长边收到 MAX_SIZE，
+    1080×6000 会变成大约 370 宽。多出来的品名行、或多一两行「收」，都不换。
+    只有整图的可用「收」比分条多出 MEICAI_FULL_RECV_MARGIN 行及以上，才改用整图。
+    都不像美菜时仍用分条（手写单不因多打一次整图而换文本）。
     分条失败或为空，才退回整图。选中的是 OCR 原文，不在这里填金额。
     """
     if core.looks_like_long_screenshot(path):
@@ -753,13 +752,8 @@ def _ocr_text_for_path(path):
                 full = core.call_ocr(path) or ""
             except Exception:
                 full = ""
-            if str(full).strip() and (core.is_meicai_ocr(tiled) or core.is_meicai_ocr(full)):
-                if (
-                    core.full_frame_is_crushed(path)
-                    and core.meicai_recv_count(tiled) >= core.meicai_recv_count(full)
-                ):
-                    return tiled
-                return core.choose_meicai_ocr_text([tiled, full])
+            if core.shrunk_full_beats_tiled(tiled, full):
+                return full
             return tiled
     return core.call_ocr(path)
 
