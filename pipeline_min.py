@@ -1198,7 +1198,8 @@ def parse_meicai_text(text):
     明细只认货品的「收」行。直降、历史欠款、补差不单独成行；
     「补 +」「退 -」也不是货品。补差已经含在实收金额里，不从角标再填一遍。
     「优质，拒绝欺骗！」这类广告句不是货品，不进明细，也不粘进品名。
-    广告紧后面、没有品名在等的「收」一起丢掉，不挂到上一件货上。
+    广告夹在品名/订和「收」之间时，只把和订行一致或接近的「收」记在这件货上。
+    和订行明显不符，或和前面另一件货的实收相同的，当孤儿丢掉。
     同一件货紧挨着的两档实收，若数量是 2 倍或 3 倍且单价不是同一档，
     留下数量较小的那一档（促销价/下单价不再和实收加总）。
     单价相同，或数量不成整数倍（小葱 3 斤和 5 斤），仍按品名加总。
@@ -1215,6 +1216,10 @@ def parse_meicai_text(text):
     items = []
     current = None
     pending_name = ""
+    # 当前这件货的「订」行（金额, 数量, 单位）。用来判断广告后面的「收」是不是这件货的。
+    pending_order = None
+    # 已经记到有品名货上的实收，用来认出交界又抄了一遍的同一笔。
+    seen_recv = []
     # 当前挂着的品名后面已经出现过纯标价（没有「收」）。下一条新品名要先交上一段。
     pending_priced = False
     current_oid = order_ids[0] if order_ids else ""
@@ -1223,7 +1228,7 @@ def parse_meicai_text(text):
     seen_goods = False
 
     def _name_waiting_for_recv():
-        """当前还有一件货等着自己的「收」。这时广告后面的「收」是它的，不能丢。"""
+        """当前还有一件货等着自己的「收」。"""
         if pending_name:
             return True
         if current is None:
@@ -1232,11 +1237,49 @@ def parse_meicai_text(text):
             return True
         return current.get("数量") is None or current.get("金额") is None
 
-    def _skip_slogan_and_orphan_recv(start):
-        """跳过这条广告，以及紧跟着的无名「收」（金额可以在下一行）。
+    def _near_amount(left, right, abs_tol, rel_tol):
+        if left is None or right is None:
+            return False
+        diff = abs(Decimal(str(left)) - Decimal(str(right)))
+        base = max(abs(Decimal(str(left))), abs(Decimal(str(right))), Decimal("0.01"))
+        return diff <= abs_tol or (diff / base) <= rel_tol
 
-        中间只许再夹噪声。遇到品名、订货价就停，只丢掉广告本身。
+    def _order_recv_close(order, recv):
+        """收和订是否同一档。差几分、数量差 0.04 这种补差算接近。
+
+        订 6.54/3.00 对收 6.99/3.04 不算：金额差了 0.45。
         """
+        if not order or not recv:
+            return False
+        oa, oq, ou = order
+        ra, rq, ru = recv
+        if ou and ru and ou != ru:
+            return False
+        return (
+            _near_amount(oa, ra, Decimal("0.20"), Decimal("0.03"))
+            and _near_amount(oq, rq, Decimal("0.10"), Decimal("0.03"))
+        )
+
+    def _waiting_goods_name():
+        if pending_name:
+            return _clean_meicai_name(pending_name)
+        if current is not None:
+            return str(current.get("品名") or "").strip()
+        return ""
+
+    def _matches_other_goods_recv(amt, qty, unit, owner):
+        for name, seen_amt, seen_qty, seen_unit in seen_recv:
+            if owner and name == owner:
+                continue
+            if not _money_same(seen_amt, amt) or not _money_same(seen_qty, qty):
+                continue
+            if seen_unit and unit and seen_unit != unit:
+                continue
+            return True
+        return False
+
+    def _peek_recv_after(start):
+        """广告之后、下一个品名之前的「收」。没有则返回 None。"""
         j = start + 1
         while j < n and not _meicai_goods_cutoff(raw_lines[j]):
             kind_j, payload_j = _meicai_line_kind(raw_lines[j])
@@ -1244,13 +1287,41 @@ def parse_meicai_text(text):
                 j += 1
                 continue
             if kind_j != "recv":
-                break
+                return None
             parsed = _parse_meicai_amt_qty(payload_j)
-            j += 1
-            if parsed is None and payload_j == "收" and j < n and _meicai_price_only_line(raw_lines[j]):
-                j += 1
-            return j
-        return start + 1
+            end = j + 1
+            if parsed is None and payload_j == "收" and end < n and _meicai_price_only_line(raw_lines[end]):
+                parsed = _parse_meicai_amt_qty(raw_lines[end])
+                end += 1
+            if not parsed:
+                return None
+            return end, parsed
+        return None
+
+    def _recv_after_slogan_is_orphan(parsed):
+        """广告夹在品名/订和「收」之间时，对不上这件货的订行就丢掉。
+
+        没有订行也丢掉：没法证明这笔「收」属于这件货。
+        订行接近（含几分钱、数量差 0.04 的补差）才留下。
+        数字和前面另一件货的实收相同，仍当孤儿丢掉。
+        同一品名已经记过的不算另一件货，两笔一样的货仍加总。
+        """
+        if not _name_waiting_for_recv():
+            return True
+        if pending_order is None or not _order_recv_close(pending_order, parsed):
+            return True
+        amt, qty, unit = parsed
+        return _matches_other_goods_recv(amt, qty, unit, _waiting_goods_name())
+
+    def _skip_slogan_and_orphan_recv(start):
+        """若广告后面那笔「收」是孤儿，返回跳过之后的下标；否则返回 None，只丢掉广告。"""
+        found = _peek_recv_after(start)
+        if found is None:
+            return None
+        end, parsed = found
+        if _recv_after_slogan_is_orphan(parsed):
+            return end
+        return None
 
     def _push(item):
         if item is None:
@@ -1274,15 +1345,13 @@ def parse_meicai_text(text):
             break
         kind, payload = _meicai_line_kind(raw_line)
         if kind in ("noise", "pay"):
-            # 广告句后面紧跟的、没有品名在等的「收」是游离行。
-            # 丢掉，避免挂到上一件已经写过实收的货上（鸡毛菜被多加一笔）。
-            if (
-                kind == "noise"
-                and _meicai_is_slogan_line(payload)
-                and not _name_waiting_for_recv()
-            ):
-                i = _skip_slogan_and_orphan_recv(i)
-                continue
+            # 广告后面的「收」：没人等、没有可对上的订行、和订行差一截，或是别的货已经记过的实收，丢掉。
+            # 鸡毛菜订的是 6.54/3.00，交界上的 6.99/3.04 是大娃娃菜，不能记到鸡毛菜上。
+            if kind == "noise" and _meicai_is_slogan_line(payload):
+                skipped = _skip_slogan_and_orphan_recv(i)
+                if skipped is not None:
+                    i = skipped
+                    continue
             i += 1
             continue
         if kind == "price":
@@ -1300,6 +1369,14 @@ def parse_meicai_text(text):
             continue
         if kind == "order":
             seen_goods = True
+            parsed = _parse_meicai_amt_qty(payload)
+            if parsed is None and payload == "订" and i + 1 < n and _meicai_price_only_line(raw_lines[i + 1]):
+                parsed = _parse_meicai_amt_qty(raw_lines[i + 1])
+                i += 1
+            if parsed and _name_waiting_for_recv():
+                pending_order = parsed
+                if pending_name:
+                    pending_priced = True
             i += 1
             continue
         if kind == "name":
@@ -1315,6 +1392,7 @@ def parse_meicai_text(text):
                     current = None
                     _push(_blank_meicai_item(name, current_oid))
             if _MEICAI_UNIT_TAIL_RE.search(payload):
+                pending_order = None
                 pending_name = payload
                 pending_priced = False
             else:
@@ -1336,6 +1414,7 @@ def parse_meicai_text(text):
             unit = parsed[2] if parsed else ""
             current = _blank_meicai_item(_clean_meicai_name(payload), current_oid, unit)
             pending_name = ""
+            pending_order = None
             pending_priced = False
             i += 1
             continue
@@ -1373,6 +1452,10 @@ def parse_meicai_text(text):
             if unit:
                 current["单位"] = unit
             current["实收缺失"] = False
+            remembered = str(current.get("品名") or "").strip()
+            if remembered:
+                seen_recv.append((remembered, amt, qty, unit or str(current.get("单位") or "")))
+            pending_order = None
             i += 1
             continue
         i += 1
