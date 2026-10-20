@@ -355,6 +355,10 @@ def iter_ocr_slices(img, overlap=None):
 
 _JOIN_EXACT_LINE_LIMIT = 12
 _JOIN_NORM_LINE_LIMIT = 24
+# 一条切片里能排下的货。窄长图重叠大约半个屏宽，末条还会往回对齐，
+# 重复的往往不止原先看的最后 4 件。只对这 4 件时，更早的重复会留下，
+# 按品名加总后数量变多。
+_OVERLAP_ROW_LIMIT = 16
 
 
 def _norm_join_line(line):
@@ -402,9 +406,50 @@ def _money_same(left, right):
     return round(float(left), 2) == round(float(right), 2)
 
 
+def _overlap_name_key(name):
+    """重叠比对用品名：去掉括号里的规格、空白和斜杠。不改最终入账的品名。"""
+    s = str(name or "").strip()
+    s = s.replace("（", "(").replace("）", ")").replace("／", "/")
+    s = re.sub(r"\([^)]*\)", "", s)
+    s = re.sub(r"[\s/\\·・,，.。、]+", "", s)
+    return s.lower()
+
+
+def _overlap_extra_is_spec(extra, short_len):
+    """多出来的是尺寸或计量单位（10*15cm、末尾的「袋」），不是另一种货。"""
+    left = re.sub(r"[0-9A-Za-z*×xX.+\-]+", "", extra or "")
+    if not left:
+        return True
+    if short_len >= 4 and re.fullmatch(r"[斤托件箱包袋盒个份板只条瓶桶提]+", left):
+        return True
+    return False
+
+
+def _same_overlap_name(left, right):
+    """括号、空白、尺寸写漏，在重叠带里仍算同一品名。
+
+    「无纺布煲汤袋(12个)」和「无纺布煲汤袋 10*15cm」算同一件。
+    「鱼腥草」和「鱼腥草包」不算：短名至少四个字，才允许只差一个单位字。
+    """
+    a = _overlap_name_key(left)
+    b = _overlap_name_key(right)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    if len(short) < 3 or not long.startswith(short):
+        return False
+    return _overlap_extra_is_spec(long[len(short):], len(short))
+
+
 def _same_overlap_row(left, right):
-    """同一件货的重叠：品名、数量、金额相同。单位一边没认出来时仍算同一行。"""
-    if not left["name"] or left["name"] != right["name"]:
+    """同一件货的重叠：品名、数量、金额相同。单位一边没认出来时仍算同一行。
+
+    品名允许括号和轻微规格差（分条把「袋(12个)」和「袋」认成两样）。
+    数量或金额不同的仍是另一行。
+    """
+    if not left["name"] or not _same_overlap_name(left["name"], right["name"]):
         return False
     if not _money_same(left["qty"], right["qty"]) or not _money_same(left["amt"], right["amt"]):
         return False
@@ -490,7 +535,7 @@ def _overlap_sig_range(prev_rows, nxt_rows):
     """下一片开头的货，若和上一片结尾是同一实收，返回要删的行区间。"""
     if not prev_rows or not nxt_rows:
         return None
-    tail = prev_rows[-4:]
+    tail = prev_rows[-_OVERLAP_ROW_LIMIT:]
     limit = min(len(tail), len(nxt_rows))
     best = 0
     for k in range(1, limit + 1):
@@ -536,7 +581,8 @@ def _strip_slice_overlap(prev, nxt):
     """去掉下一片里和上一片结尾重复的那段。
 
     完全相同的行仍按原来的方式删。美菜长图还会对上「品名 + 实收数量 + 金额」：
-    重叠带里同一行货被认了两遍（字不完全一样）时只留上一片那一遍。
+    重叠带里同一行货被认了两遍（字不完全一样，或括号/尺寸写法不同）时只留上一片那一遍。
+    密集分条的重叠能盖住多件货，不只对最后几件。
     数量或金额不同的，是另一行货，留给后面的同名加总。手写单不走这套。
     """
     meicai = _text_looks_meicai(prev) or _text_looks_meicai(nxt)
@@ -566,8 +612,8 @@ def join_ocr_slices(texts):
     """按切片顺序拼接 OCR 文本。
 
     相邻切片结尾和开头若是同一段字，只留一份。
-    美菜重叠带里同一件货（品名、实收数量、金额相同，行文可以略有差别）也只留一份，
-    避免拼完再按品名加总时把这一行算两遍。数量或金额不同的行不去掉。
+    美菜重叠带里同一件货（品名、实收数量、金额相同；括号和轻微规格差仍算同一品名）
+    也只留一份，避免拼完再按品名加总时把这一行算两遍。数量或金额不同的行不去掉。
     """
     acc = []
     for text in texts or []:
@@ -892,6 +938,10 @@ _MEICAI_PAY_WORDS = (
     "多退少补", "总额", "商品总价", "商品金额", "付款", "实付", "签收",
     "司机", "物流", "包裹", "复制", "金额",
 )
+# 商品图上的宣传句，不是 SKU。「优质黄豆」这类品名不含这些说法。
+_MEICAI_SLOGAN_RE = re.compile(
+    r"拒绝欺骗|拒绝双氧|双氧水|烧心|黑斑|茎干均匀|速冻锁鲜"
+)
 # 重量差异角标。整行就是「补 +」「退 -」，后面可以带差额，但不是另一件货。
 _MEICAI_ADJUST_LINE_RE = re.compile(
     r"^(?:补差|补|退)\s*[+\-＋－]"
@@ -1042,14 +1092,36 @@ def _meicai_norm_line(line):
     return re.sub(r"^#+\s*", "", (line or "").strip())
 
 
+def _meicai_is_slogan_line(s):
+    """广告宣传句。不当品名，也不粘进上一件货的名字。
+
+    「优质，拒绝欺骗！」「茎干均匀，真优质 拒绝欺骗」是图上的口号。
+    带实收标价、或以单位结尾的行仍当货品，避免把品名和数量一起丢掉。
+    「优质黄豆」没有这些口号，不会被滤掉。
+    """
+    if not s or _parse_meicai_amt_qty(s) or _MEICAI_UNIT_TAIL_RE.search(s):
+        return False
+    if _MEICAI_SLOGAN_RE.search(s):
+        return True
+    if re.search(r"[！!]", s) and re.search(r"拒绝|欺骗|优质", s):
+        return True
+    if "拒绝" in s and re.search(r"[，。]", s):
+        return True
+    return False
+
+
 def _meicai_is_noise_line(s):
-    """坐标框、界面套话、补差标签。不当品名。
+    """坐标框、界面套话、补差标签、广告宣传句。不当品名。
 
     「补 +」「退 -」以及同一行写上的差额是重量差角标，实收已经在「收」里，
-    这里丢掉，不另造数量或金额。"""
+    这里丢掉，不另造数量或金额。
+    「优质，拒绝欺骗！」这类口号也丢掉，不进明细。
+    """
     if not s:
         return True
     if _MEICAI_BBOX_RE.search(s):
+        return True
+    if _meicai_is_slogan_line(s):
         return True
     if any(k in s for k in _MEICAI_CHROME):
         return True
@@ -1125,6 +1197,7 @@ def parse_meicai_text(text):
     一图里多个订单号仍是一张单，订单号只作溯源。
     明细只认货品的「收」行。直降、历史欠款、补差不单独成行；
     「补 +」「退 -」也不是货品。补差已经含在实收金额里，不从角标再填一遍。
+    「优质，拒绝欺骗！」这类广告句不是货品，不进明细，也不粘进品名。
     没有「收」就空着数量和金额，标实收缺失，
     不用订货数填。品名单独一行、金额在下一行时也留下品名。
     连续几段都是这样时，下一条品名先把上一段交出去，不盖掉前面的品名。
@@ -1338,8 +1411,8 @@ def meicai_ocr_quality(text):
     可用实收：去掉空白后整行就是「收」，且这一行或下一行能解析出
     「￥金额/数量单位」；或者「收」和金额写在同一行。订货行不算。
     干净货品行：品名和标价在同一行，或品名的下一行是纯标价（没有品名的金额行）。
-    噪声行：行内出现「(数字,数字)」坐标，或界面套话（已完成、美菜配送、退款详情、
-    送达时间、信任签收、查看更多物流、司机姓名等）。
+    噪声行：行内出现「(数字,数字)」坐标，界面套话（已完成、美菜配送、退款详情、
+    送达时间、信任签收、查看更多物流、司机姓名等），或广告宣传句（拒绝欺骗等）。
     只统计「付款信息 / 共N类」之前的行。实收权重最高，避免整图品名整齐但没有「收」
     盖过有实收的分条结果。
     """
