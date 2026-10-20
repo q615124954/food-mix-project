@@ -1198,6 +1198,10 @@ def parse_meicai_text(text):
     明细只认货品的「收」行。直降、历史欠款、补差不单独成行；
     「补 +」「退 -」也不是货品。补差已经含在实收金额里，不从角标再填一遍。
     「优质，拒绝欺骗！」这类广告句不是货品，不进明细，也不粘进品名。
+    广告紧后面、没有品名在等的「收」一起丢掉，不挂到上一件货上。
+    同一件货紧挨着的两档实收，若数量是 2 倍或 3 倍且单价不是同一档，
+    留下数量较小的那一档（促销价/下单价不再和实收加总）。
+    单价相同，或数量不成整数倍（小葱 3 斤和 5 斤），仍按品名加总。
     没有「收」就空着数量和金额，标实收缺失，
     不用订货数填。品名单独一行、金额在下一行时也留下品名。
     连续几段都是这样时，下一条品名先把上一段交出去，不盖掉前面的品名。
@@ -1217,6 +1221,36 @@ def parse_meicai_text(text):
     # 只有出现过订单号 / 订 / 收 / 带价格的品名行，才把落单的品名行交给人工补实收。
     # 避免手写单抬头里的中文被误收成一行。
     seen_goods = False
+
+    def _name_waiting_for_recv():
+        """当前还有一件货等着自己的「收」。这时广告后面的「收」是它的，不能丢。"""
+        if pending_name:
+            return True
+        if current is None:
+            return False
+        if current.get("实收缺失"):
+            return True
+        return current.get("数量") is None or current.get("金额") is None
+
+    def _skip_slogan_and_orphan_recv(start):
+        """跳过这条广告，以及紧跟着的无名「收」（金额可以在下一行）。
+
+        中间只许再夹噪声。遇到品名、订货价就停，只丢掉广告本身。
+        """
+        j = start + 1
+        while j < n and not _meicai_goods_cutoff(raw_lines[j]):
+            kind_j, payload_j = _meicai_line_kind(raw_lines[j])
+            if kind_j == "noise":
+                j += 1
+                continue
+            if kind_j != "recv":
+                break
+            parsed = _parse_meicai_amt_qty(payload_j)
+            j += 1
+            if parsed is None and payload_j == "收" and j < n and _meicai_price_only_line(raw_lines[j]):
+                j += 1
+            return j
+        return start + 1
 
     def _push(item):
         if item is None:
@@ -1240,6 +1274,15 @@ def parse_meicai_text(text):
             break
         kind, payload = _meicai_line_kind(raw_line)
         if kind in ("noise", "pay"):
+            # 广告句后面紧跟的、没有品名在等的「收」是游离行。
+            # 丢掉，避免挂到上一件已经写过实收的货上（鸡毛菜被多加一笔）。
+            if (
+                kind == "noise"
+                and _meicai_is_slogan_line(payload)
+                and not _name_waiting_for_recv()
+            ):
+                i = _skip_slogan_and_orphan_recv(i)
+                continue
             i += 1
             continue
         if kind == "price":
@@ -1340,6 +1383,7 @@ def parse_meicai_text(text):
         if name:
             _push(_blank_meicai_item(name, current_oid))
 
+    items = _meicai_drop_bundle_tiers(items)
     items = aggregate_meicai_items(items)
     suspects = []
     missing = sum(1 for it in items if it.get("实收缺失"))
@@ -1504,6 +1548,71 @@ def _sum_meicai_field(left, right):
         return None
     total = (a or Decimal("0")) + (b or Decimal("0"))
     return float(total.quantize(CENT, rounding=ROUND_HALF_UP))
+
+
+def _meicai_bundle_larger(qty_a, amt_a, qty_b, amt_b):
+    """两档实收里，数量较大的那档是不是另一档的促销/整包价。
+
+    较大数量是较小数量的 2 倍或 3 倍，且两档单价相差至少 5 分，才算。
+    返回 "a" 或 "b"。不是这种关系时返回空串。
+    单价相同的 1 板 + 2 板仍是两笔货，这里不判掉。
+    """
+    if qty_a is None or qty_b is None or amt_a is None or amt_b is None:
+        return ""
+    if qty_a <= 0 or qty_b <= 0:
+        return ""
+    if qty_a == qty_b:
+        return ""
+    if qty_a > qty_b:
+        big_q, big_a, big_side = qty_a, amt_a, "a"
+        small_q, small_a = qty_b, amt_b
+    else:
+        big_q, big_a, big_side = qty_b, amt_b, "b"
+        small_q, small_a = qty_a, amt_a
+    ratio = big_q / small_q
+    k = int(ratio.to_integral_value(rounding=ROUND_HALF_UP))
+    if k < 2 or k > 3:
+        return ""
+    if abs(big_q - small_q * k) > Decimal("0.05"):
+        return ""
+    if abs((big_a / big_q) - (small_a / small_q)) < Decimal("0.05"):
+        return ""
+    return big_side
+
+
+def _meicai_drop_bundle_tiers(items):
+    """同一件货紧挨着出现两档实收时，丢掉促销/整包那一档。
+
+    分条把下单价（2 板 9.40）和实收（1 板 4.80）都认成「收」时，
+    数量金额不同，重叠去重对不上，按品名加总会变成 3 板 / 14.20。
+    这里留下数量较小的那一档。小葱 3 斤和 5 斤不成整数倍，两笔都留着。
+    """
+    kept = []
+    for src in items or []:
+        row = dict(src)
+        name = str(row.get("品名") or "").strip()
+        unit = str(row.get("单位") or "").strip()
+        qty = _meicai_decimal(row.get("数量"))
+        amt = _meicai_decimal(row.get("金额"))
+        prev = kept[-1] if kept else None
+        if (
+            prev is not None
+            and name
+            and name == str(prev.get("品名") or "").strip()
+            and unit == str(prev.get("单位") or "").strip()
+            and qty is not None
+            and amt is not None
+        ):
+            prev_q = _meicai_decimal(prev.get("数量"))
+            prev_a = _meicai_decimal(prev.get("金额"))
+            larger = _meicai_bundle_larger(prev_q, prev_a, qty, amt)
+            if larger == "a":
+                kept[-1] = row
+                continue
+            if larger == "b":
+                continue
+        kept.append(row)
+    return kept
 
 
 def _fold_meicai_line(base, extra):
