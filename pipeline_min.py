@@ -927,12 +927,28 @@ _MEICAI_CHROME = (
     "查看更多物流", "司机姓名", "订单详情", "签收方式",
 )
 # 一级/二级留在品名里（Shot2 落地名是「黄瓜 二级」）。中码/大码仍是规格，会去掉。
-# 「促」是促销角标，不是品名。
+# 「促」是促销角标，不是品名。贴在字上的「促鸡毛菜」同样去掉前缀。
 _MEICAI_SPEC_TOKENS = {
     "普通", "带皮", "去皮", "纯瘦", "优质", "水洗", "中码", "大码", "小码",
     "中号", "大号", "小号", "精品", "特级", "精选", "带泥",
     "新鲜", "鲜", "带叶", "去根", "促",
 }
+# 店铺前缀。括号里的 [美菜鲜坊] 上面已经整段去掉；没有括号时仍要摘掉。
+_MEICAI_BRAND_PREFIX_RE = re.compile(r"^(?:美菜鲜坊|美菜商城)+")
+# OCR 把品名认短、认散之后，对得上金标的几种写法。键是去掉空白后的整名。
+_MEICAI_NAME_ALIASES = {
+    "白壳中码": "鲜鸡蛋 白壳",
+    "鲜鸡蛋白壳": "鲜鸡蛋 白壳",
+    "鲜鸡蛋白壳中码": "鲜鸡蛋 白壳",
+    "汽水碳酸饮料": "百事可乐汽水",
+    "汽水谈岁饮料": "百事可乐汽水",
+    "汽水谈岁": "百事可乐汽水",
+    "百事可乐汽水": "百事可乐汽水",
+}
+_MEICAI_LINE_UNIT_RE = re.compile(
+    r"(斤|公斤|千克|kg|KG|托|件|箱|包|袋|盒|个|份|板|只|条|瓶|桶|提)"
+    r"(?:\s*[（(][^)）]{0,24}[)）])?\s*$"
+)
 _MEICAI_PAY_WORDS = (
     "下单", "支付", "合计", "欠款", "直降", "优惠", "补交", "补款", "补足",
     "多退少补", "总额", "商品总价", "商品金额", "付款", "实付", "签收",
@@ -983,6 +999,29 @@ def _meicai_money(num):
     return float(Decimal(str(num)).quantize(CENT, rounding=ROUND_HALF_UP))
 
 
+def _finalize_meicai_name(name):
+    """摘掉品牌前缀和贴在字上的「促」，再按整名别名换成金标品名。"""
+    name = _MEICAI_BRAND_PREFIX_RE.sub("", str(name or "")).strip()
+    name = re.sub(r"^促+", "", name).strip()
+    key = re.sub(r"\s+", "", name)
+    return _MEICAI_NAME_ALIASES.get(key, name)
+
+
+def _meicai_line_unit(raw):
+    m = _MEICAI_LINE_UNIT_RE.search(str(raw or ""))
+    if not m:
+        return ""
+    unit = m.group(1)
+    return "kg" if unit.upper() == "KG" else unit
+
+
+def _meicai_raw_is_promo(raw):
+    """行首「促」是角标。单独成词或贴在品名上，都算促销重行。"""
+    s = _meicai_norm_line(raw)
+    s = re.sub(r"^[\[【][^\]】]{0,40}[\]】]", "", s).strip()
+    return s.startswith("促")
+
+
 def _clean_meicai_name(raw):
     """去掉店铺前缀、规格套话和价格，留下还能对别名的品名。"""
     s = str(raw or "")
@@ -994,7 +1033,9 @@ def _clean_meicai_name(raw):
     tokens = [t for t in s.split() if t]
     kept = []
     for t in tokens:
-        if t in _MEICAI_SPEC_TOKENS:
+        t = _MEICAI_BRAND_PREFIX_RE.sub("", t)
+        t = re.sub(r"^促+", "", t)
+        if not t or t in _MEICAI_SPEC_TOKENS:
             continue
         kept.append(t)
     if kept:
@@ -1009,11 +1050,64 @@ def _clean_meicai_name(raw):
             filtered.append(t)
         kept = filtered
     name = " ".join(kept).strip()
-    if name:
-        return name
-    fallback = re.sub(r"[\[【][^\]】]{0,40}[\]】]", "", str(raw or ""))
-    fallback = _MEICAI_PRICE_TAIL_RE.sub(" ", fallback)
-    return re.sub(r"\s+", " ", fallback).strip()
+    if not name:
+        fallback = re.sub(r"[\[【][^\]】]{0,40}[\]】]", "", str(raw or ""))
+        fallback = _MEICAI_PRICE_TAIL_RE.sub(" ", fallback)
+        name = re.sub(r"\s+", " ", fallback).strip()
+    return _finalize_meicai_name(name)
+
+
+def _new_meicai_item(raw, order_id, unit="", order=None):
+    """由原始品名行建一条货。记下促销角标和订行，供后面消重、把实收挂回去。"""
+    if not unit:
+        unit = _meicai_line_unit(raw)
+    item = _blank_meicai_item(_clean_meicai_name(raw), order_id, unit or "")
+    if raw and _meicai_raw_is_promo(raw):
+        item["_促"] = True
+    if order:
+        item["_订"] = order
+    return item
+
+
+def _drop_meicai_promo_dupes(items):
+    """「促」行和另一行的品名、单位、数量、金额都相同，是角标重行，不加总。
+
+    只有促销行、没有普通行时留下，两笔真货仍按品名加总。
+    """
+    twins = set()
+    for it in items or []:
+        if it.get("_促"):
+            continue
+        if it.get("数量") is None or it.get("金额") is None:
+            continue
+        twins.add((
+            str(it.get("品名") or "").strip(),
+            str(it.get("单位") or "").strip(),
+            round(float(it["数量"]), 2),
+            round(float(it["金额"]), 2),
+        ))
+    if not twins:
+        return list(items or [])
+    kept = []
+    for it in items or []:
+        if it.get("_促") and it.get("数量") is not None and it.get("金额") is not None:
+            key = (
+                str(it.get("品名") or "").strip(),
+                str(it.get("单位") or "").strip(),
+                round(float(it["数量"]), 2),
+                round(float(it["金额"]), 2),
+            )
+            if key in twins:
+                continue
+        kept.append(it)
+    return kept
+
+
+def _strip_meicai_marks(items):
+    for it in items or []:
+        it.pop("_促", None)
+        it.pop("_订", None)
+    return items
 
 
 def _meicai_goods_cutoff(line):
@@ -1207,7 +1301,10 @@ def parse_meicai_text(text):
     不用订货数填。品名单独一行、金额在下一行时也留下品名。
     连续几段都是这样时，下一条品名先把上一段交出去，不盖掉前面的品名。
     「收」单独一行、下一行是「￥金额/数量」时，与「收 ￥…」同样算实收。
+    这笔「收」对不上当前货的订行、却对得上前面还缺实收的订行时，记回那一件。
     品名为空、数量和金额又是 0 或没有的，是游离「收」，不进明细。
+    品名去掉前导「促」和「美菜鲜坊」。白壳中码、汽水碳酸饮料、汽水谈岁饮料换成金标名。
+    带「促」的行若和另一行品名、单位、数量、金额都相同，是角标重行，不加总。
     交出去之前，品名和单位都相同的行加总数量和金额，复核页看到的是合并后的一行。
     """
     date = extract_meicai_date(text)
@@ -1336,6 +1433,39 @@ def parse_meicai_text(text):
             return
         items.append(item)
 
+    def _item_waiting(item):
+        if item is None or not str(item.get("品名") or "").strip():
+            return False
+        if item.get("实收缺失"):
+            return True
+        return item.get("数量") is None or item.get("金额") is None
+
+    def _apply_recv(item, got):
+        amt, qty, unit = got
+        item["金额"] = amt
+        item["数量"] = qty
+        if unit:
+            item["单位"] = unit
+        item["实收缺失"] = False
+        remembered = str(item.get("品名") or "").strip()
+        if remembered:
+            seen_recv.append((remembered, amt, qty, unit or str(item.get("单位") or "")))
+
+    def _recv_owner(got):
+        """当前货的订行对得上就记在当前货。对不上时，找回前面还缺实收、订行对得上的那件。"""
+        if got is None:
+            return current
+        cur_order = current.get("_订") if _item_waiting(current) else None
+        if cur_order and _order_recv_close(cur_order, got):
+            return current
+        for it in items:
+            if it is current or not _item_waiting(it):
+                continue
+            order = it.get("_订")
+            if order and _order_recv_close(order, got):
+                return it
+        return current
+
     raw_lines = str(text or "").splitlines()
     i = 0
     n = len(raw_lines)
@@ -1377,20 +1507,28 @@ def parse_meicai_text(text):
                 pending_order = parsed
                 if pending_name:
                     pending_priced = True
+                elif current is not None and (
+                    current.get("数量") is None
+                    or current.get("金额") is None
+                    or current.get("实收缺失")
+                ):
+                    current["_订"] = parsed
             i += 1
             continue
         if kind == "name":
             # 美菜品名行以单位结尾（「大娃娃菜 优质 斤」）。后面这条盖住前面的广告文案，
             # 广告不再粘进品名；没有单位的说明行仍接在当前品名后面。
             # 上一段已是「品名 + 下行标价」且还没有「收」时，先交出行再换品名。
+            # 订行跟这一段走，后面的「收」才能按订行挂回这件货，而不是挂到下一件。
             if pending_priced and pending_name and _MEICAI_UNIT_TAIL_RE.search(payload):
-                name = _clean_meicai_name(pending_name)
+                raw_pending = pending_name
+                order = pending_order
                 pending_name = ""
                 pending_priced = False
-                if name:
+                if _clean_meicai_name(raw_pending):
                     _push(current)
                     current = None
-                    _push(_blank_meicai_item(name, current_oid))
+                    _push(_new_meicai_item(raw_pending, current_oid, order=order))
             if _MEICAI_UNIT_TAIL_RE.search(payload):
                 pending_order = None
                 pending_name = payload
@@ -1402,17 +1540,18 @@ def parse_meicai_text(text):
         if kind == "title":
             seen_goods = True
             if pending_name:
-                name = _clean_meicai_name(pending_name)
+                raw_pending = pending_name
+                order = pending_order
                 pending_name = ""
                 pending_priced = False
-                if name:
+                if _clean_meicai_name(raw_pending):
                     _push(current)
                     current = None
-                    _push(_blank_meicai_item(name, current_oid))
+                    _push(_new_meicai_item(raw_pending, current_oid, order=order))
             _push(current)
             parsed = _parse_meicai_amt_qty(payload)
             unit = parsed[2] if parsed else ""
-            current = _blank_meicai_item(_clean_meicai_name(payload), current_oid, unit)
+            current = _new_meicai_item(payload, current_oid, unit=unit)
             pending_name = ""
             pending_order = None
             pending_priced = False
@@ -1435,26 +1574,23 @@ def parse_meicai_text(text):
                 and not current.get("实收缺失")
             )
             if pending_name or current is None or closed:
+                raw_pending = pending_name
+                order = pending_order if raw_pending else None
                 _push(current)
-                name = _clean_meicai_name(pending_name) if pending_name else ""
-                current = _blank_meicai_item(name, current_oid)
+                if raw_pending:
+                    current = _new_meicai_item(raw_pending, current_oid, order=order)
+                else:
+                    current = _blank_meicai_item("", current_oid)
                 pending_name = ""
                 pending_priced = False
+                pending_order = None
             if not parsed:
                 current["实收缺失"] = True
                 current["数量"] = None
                 current["金额"] = None
                 i += 1
                 continue
-            amt, qty, unit = parsed
-            current["金额"] = amt
-            current["数量"] = qty
-            if unit:
-                current["单位"] = unit
-            current["实收缺失"] = False
-            remembered = str(current.get("品名") or "").strip()
-            if remembered:
-                seen_recv.append((remembered, amt, qty, unit or str(current.get("单位") or "")))
+            _apply_recv(_recv_owner(parsed), parsed)
             pending_order = None
             i += 1
             continue
@@ -1462,12 +1598,14 @@ def parse_meicai_text(text):
     if current is not None:
         _push(current)
     if pending_name and seen_goods:
-        name = _clean_meicai_name(pending_name)
-        if name:
-            _push(_blank_meicai_item(name, current_oid))
+        pending_item = _new_meicai_item(pending_name, current_oid, order=pending_order)
+        if str(pending_item.get("品名") or "").strip():
+            _push(pending_item)
 
+    items = _drop_meicai_promo_dupes(items)
     items = _meicai_drop_bundle_tiers(items)
     items = aggregate_meicai_items(items)
+    _strip_meicai_marks(items)
     suspects = []
     missing = sum(1 for it in items if it.get("实收缺失"))
     if missing:
