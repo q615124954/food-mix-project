@@ -6,9 +6,10 @@
 
 金标 samples/gold/meicai_2026-09-09.json 是复核落地后的口径，不是 OCR 像素猜测。
 OCR 文本里没有「收」时，数量和金额留空并标存疑。
-Shot1 / Shot2 金标同样是复核后的落地值。仓库里没有这两张的 OCR 文本时，
-不对它们做「解析结果等于金标行」的断言；一旦把文本放到
-samples/gold/ocr/meicai_shot1.ocr.txt 或 meicai_shot2.ocr.txt，回归会自动跑。
+Shot1 / Shot2 金标同样是复核后的落地值。
+samples/gold/ocr/meicai_shot1.ocr.txt、meicai_shot2.ocr.txt 是按本机错认形态整理的离线文本
+（香菜实收被下一件货接走、白壳中码、汽水碳酸饮料、促重行、美菜鲜坊、空数量小葱），
+解析结果必须和金标的行数、品名、数量、金额一致。
 Shot2 的弱 OCR（没有「收」行）必须标存疑，不能把金标里的实收数编出来。
 """
 import copy
@@ -1094,6 +1095,56 @@ class ShotGoldTargets(unittest.TestCase):
                 _assert_missing_receive_not_invented(self, parsed, gold, text)
         if not ran:
             self.skipTest("shot1/shot2 的 OCR 文本还没放进 samples/gold/ocr/")
+
+    def test_shot_misreads_land_on_gold_names(self):
+        """错认文本里的别名和错挂收，落地后就是金标品名，不留促重行和空数量小葱。"""
+        for name, banned in (
+            ("shot1", ("白壳中码", "汽水 碳酸饮料", "汽水碳酸饮料")),
+            ("shot2", ("促鸡毛菜", "促鱼腥草", "美菜鲜坊", "白壳中码")),
+        ):
+            text = _read_text(SHOT_OCR[name])
+            gold = _shot_gold(name)
+            parsed = core.parse_meicai_text(text)
+            _assert_filled_matches_gold(self, parsed, gold)
+            names = [it["品名"] for it in parsed["items"]]
+            for word in banned:
+                self.assertNotIn(word, "\n".join(names))
+        shot2 = core.parse_meicai_text(_read_text(SHOT_OCR["shot2"]))
+        scallion = next(it for it in shot2["items"] if it["品名"] == "小葱")
+        self.assertAlmostEqual(scallion["数量"], 8.0, places=2)
+        self.assertAlmostEqual(scallion["金额"], 71.31, places=2)
+        self.assertFalse(scallion["实收缺失"])
+        self.assertEqual([it["品名"] for it in shot2["items"]].count("鸡毛菜"), 1)
+        self.assertEqual([it["品名"] for it in shot2["items"]].count("香菜"), 1)
+        herb = next(it for it in shot2["items"] if it["品名"] == "鱼腥草")
+        self.assertAlmostEqual(herb["数量"], 1.0, places=2)
+        self.assertAlmostEqual(herb["金额"], 6.18, places=2)
+
+    def test_soda_typo_alias_and_single_promo_line_kept(self):
+        """汽水谈岁饮料换成百事可乐汽水。只有促销行时去掉「促」，不把这行丢掉。"""
+        text = "\n".join([
+            "美菜",
+            "送达时间 2026-09-02 06:00:00",
+            "订单号：2996559031 复制",
+            "汽水谈岁饮料 箱",
+            "订 ￥120.00/3.00箱",
+            "收 ￥120.00/3.00箱",
+            "促鸡毛菜 斤",
+            "订 ￥32.10/5.00斤",
+            "收 ￥32.10/5.00斤",
+            "付款信息",
+            "商品多退少补合计￥152.10",
+        ])
+        parsed = core.parse_meicai_text(text)
+        self.assertEqual([it["品名"] for it in parsed["items"]], ["百事可乐汽水", "鸡毛菜"])
+        soda, greens = parsed["items"]
+        self.assertAlmostEqual(soda["数量"], 3.0, places=2)
+        self.assertAlmostEqual(soda["金额"], 120.0, places=2)
+        self.assertEqual(soda["单位"], "箱")
+        self.assertAlmostEqual(greens["数量"], 5.0, places=2)
+        self.assertAlmostEqual(greens["金额"], 32.1, places=2)
+        self.assertFalse(soda["实收缺失"])
+        self.assertFalse(greens["实收缺失"])
 
 
 def _read_text(path):
