@@ -10,6 +10,7 @@ Shot1 / Shot2 金标同样是复核后的落地值。
 samples/gold/ocr/meicai_shot1.ocr.txt、meicai_shot2.ocr.txt 是按本机错认形态整理的离线文本
 （香菜实收被下一件货接走、白壳中码、汽水碳酸饮料、促重行、美菜鲜坊、空数量小葱），
 解析结果必须和金标的行数、品名、数量、金额一致。
+samples/gold/ocr/meicai_shot{1,2,3}.live.ocr.txt 是本机重跑的 OCR 原文，门禁以这三份为准。
 Shot2 的弱 OCR（没有「收」行）必须标存疑，不能把金标里的实收数编出来。
 """
 import copy
@@ -44,6 +45,11 @@ SHOT_OCR = {
 }
 SHOT3_OCR = os.path.join(ROOT, "samples", "gold", "ocr", "meicai_shot3.ocr.txt")
 SHOT3_TILED_OCR = os.path.join(ROOT, "samples", "gold", "ocr", "meicai_shot3.tiled.ocr.txt")
+LIVE_OCR = {
+    "shot1": os.path.join(ROOT, "samples", "gold", "ocr", "meicai_shot1.live.ocr.txt"),
+    "shot2": os.path.join(ROOT, "samples", "gold", "ocr", "meicai_shot2.live.ocr.txt"),
+    "shot3": os.path.join(ROOT, "samples", "gold", "ocr", "meicai_shot3.live.ocr.txt"),
+}
 
 
 def _ocr_text():
@@ -1198,6 +1204,85 @@ class ShotGoldTargets(unittest.TestCase):
         self.assertAlmostEqual(herb[0]["数量"], 1.0, places=2)
         self.assertAlmostEqual(herb[0]["金额"], 6.18, places=2)
         self.assertFalse(any(not str(it["品名"]).strip() for it in parsed["items"]))
+
+    def test_live_shot1_ocr_keeps_coriander_from_html_table(self):
+        """本机 Shot1 原文：正文没有香菜，香菜只在 HTML 表的「香菜优质斤 / ￥13.70/2.00斤」。
+
+        表里其余行正文已经有实收，不能再加一遍。落地仍是 6 行，香菜 2 斤 / 13.70。
+        """
+        text = _read_text(LIVE_OCR["shot1"])
+        self.assertIn("香菜优质斤", text)
+        self.assertIn("<table>", text)
+        self.assertNotIn("\n香菜", text)
+        parsed = core.parse_meicai_text(text)
+        coriander = [it for it in parsed["items"] if it["品名"] == "香菜"]
+        self.assertEqual(len(coriander), 1)
+        self.assertAlmostEqual(coriander[0]["数量"], 2.0, places=2)
+        self.assertAlmostEqual(coriander[0]["金额"], 13.70, places=2)
+        self.assertEqual(coriander[0]["单位"], "斤")
+        self.assertFalse(coriander[0]["实收缺失"])
+        self.assertEqual(len(parsed["items"]), 6)
+        self.assertEqual([it["品名"] for it in parsed["items"]].count("小葱"), 1)
+        self.assertEqual([it["品名"] for it in parsed["items"]].count("鲜鸡蛋 白壳"), 1)
+        self.assertEqual([it["品名"] for it in parsed["items"]].count("百事可乐汽水"), 1)
+        egg = next(it for it in parsed["items"] if it["品名"] == "鲜鸡蛋 白壳")
+        self.assertAlmostEqual(egg["数量"], 2.0, places=2)
+        self.assertAlmostEqual(egg["金额"], 41.56, places=2)
+        self.assertAlmostEqual(sum(it["金额"] for it in parsed["items"]), 258.23, places=2)
+
+    def test_live_shot2_ocr_splits_coriander_from_herb(self):
+        """本机 Shot2 原文：香菜和「收 ￥19.64/3.04斤」之间夹着促鱼腥草，鱼腥草另有 6.18。
+
+        香菜必须是 3.04/19.64，鱼腥草必须是 1/6.18，禁止加总成 4.04/25.82。
+        小葱的能力边界：全文只有一行标价「小葱（香葱）普通 斤 ￥26.91/3.00斤」，
+        没有「收」，也没有第二档 44.40/5。标价不是实收，不能编成 8/71.31。
+        三行同名收成一行，数量和金额留空。品名停在「小葱（香葱）普通」（「普通」贴在括号后，摘不掉）。
+        """
+        text = _read_text(LIVE_OCR["shot2"])
+        self.assertIn("香菜 优质 斤", text)
+        self.assertIn("收 ￥19.64/3.04斤", text)
+        self.assertIn("促鱼腥草 斤", text)
+        self.assertIn("￥6.18/1.00斤", text)
+        self.assertNotIn("44.40", text)
+        self.assertNotIn("\n收 ￥26.91", text)
+        parsed = core.parse_meicai_text(text)
+        coriander = [it for it in parsed["items"] if it["品名"] == "香菜"]
+        self.assertEqual(len(coriander), 1)
+        self.assertAlmostEqual(coriander[0]["数量"], 3.04, places=2)
+        self.assertAlmostEqual(coriander[0]["金额"], 19.64, places=2)
+        self.assertFalse(coriander[0]["实收缺失"])
+        herb = [it for it in parsed["items"] if it["品名"] == "鱼腥草"]
+        self.assertEqual(len(herb), 1)
+        self.assertAlmostEqual(herb[0]["数量"], 1.0, places=2)
+        self.assertAlmostEqual(herb[0]["金额"], 6.18, places=2)
+        self.assertNotAlmostEqual(herb[0]["数量"], 4.04, places=2)
+        self.assertNotAlmostEqual(herb[0]["金额"], 25.82, places=2)
+        scallions = [it for it in parsed["items"] if "小葱" in it["品名"]]
+        self.assertEqual(len(scallions), 1)
+        self.assertEqual(scallions[0]["品名"], "小葱（香葱）普通")
+        self.assertIsNone(scallions[0]["数量"])
+        self.assertIsNone(scallions[0]["金额"])
+        self.assertTrue(scallions[0]["实收缺失"])
+        self.assertNotEqual(scallions[0]["数量"], 8.0)
+        self.assertNotEqual(scallions[0]["金额"], 71.31)
+        egg = next(it for it in parsed["items"] if it["品名"] == "鲜鸡蛋 白壳")
+        self.assertAlmostEqual(egg["数量"], 2.0, places=2)
+        self.assertAlmostEqual(egg["金额"], 41.56, places=2)
+
+    def test_live_shot3_ocr_keeps_soup_bag_smaller_tier(self):
+        """本机 Shot3 原文：两档煲汤袋都有「收」，仍留较小的 1 板 / 4.80，不加总成 3/14.20。"""
+        text = _read_text(LIVE_OCR["shot3"])
+        parsed = core.parse_meicai_text(text)
+        bags = [it for it in parsed["items"] if "煲汤袋" in it["品名"]]
+        self.assertEqual(len(bags), 1)
+        self.assertAlmostEqual(bags[0]["数量"], 1.0, places=2)
+        self.assertAlmostEqual(bags[0]["金额"], 4.80, places=2)
+        self.assertEqual(bags[0]["单位"], "板")
+        self.assertNotAlmostEqual(bags[0]["数量"], 3.0, places=2)
+        self.assertNotAlmostEqual(bags[0]["金额"], 14.20, places=2)
+        greens = next(it for it in parsed["items"] if it["品名"] == "鸡毛菜")
+        self.assertAlmostEqual(greens["数量"], 3.0, places=2)
+        self.assertAlmostEqual(greens["金额"], 6.54, places=2)
 
     def test_soda_typo_alias_and_single_promo_line_kept(self):
         """汽水谈岁饮料换成百事可乐汽水。只有促销行时去掉「促」，不把这行丢掉。"""
