@@ -1057,6 +1057,82 @@ def _clean_meicai_name(raw):
     return _finalize_meicai_name(name)
 
 
+def _strip_glued_meicai_specs(compact):
+    """表格拉在一起的「香菜优质」没有空格，规格词切不出来。从末尾摘掉。"""
+    specs = sorted(_MEICAI_SPEC_TOKENS, key=len, reverse=True)
+    stripped = compact
+    changed = True
+    while changed and stripped:
+        changed = False
+        for spec in specs:
+            if len(stripped) > len(spec) and stripped.endswith(spec):
+                stripped = stripped[: -len(spec)]
+                changed = True
+                break
+    return stripped
+
+
+def _clean_meicai_table_name(raw):
+    """HTML 表单元格。已经换成金标名的不动；粘在一起的规格再摘一次。"""
+    name = _clean_meicai_name(raw)
+    compact = re.sub(r"\s+", "", name)
+    if name != compact and " " in name:
+        return name
+    stripped = _strip_glued_meicai_specs(compact)
+    if stripped and stripped != compact:
+        return _finalize_meicai_name(stripped)
+    return name
+
+
+def _meicai_table_only_rows(text, items, default_oid=""):
+    """正文没有的货，若整行 HTML 表里有「品名 + ￥金额/数量」，补一行。
+
+    Shot1 实机正文没有香菜，香菜只在 <table> 里。已经从「收」认出的货不重复加。
+    手写单的表没有「￥金额/数量」，这里加不出行。
+    """
+    existing = {
+        str(it.get("品名") or "").strip()
+        for it in items or []
+        if str(it.get("品名") or "").strip()
+    }
+    added = []
+    for row in parse_table(text or ""):
+        price = None
+        name_cell = ""
+        oid = default_oid or ""
+        for cell in row:
+            cell = str(cell or "").strip()
+            if not cell:
+                continue
+            parsed = _parse_meicai_amt_qty(cell)
+            if parsed and price is None:
+                price = parsed
+                continue
+            found_oid = re.search(r"订单号\s*[:：]\s*(\d{6,})", cell)
+            if found_oid:
+                oid = found_oid.group(1)
+                continue
+            if cell in ("复制", "等额收货"):
+                continue
+            if re.search(r"[\u4e00-\u9fff]", cell) and not name_cell:
+                name_cell = cell
+        if not price or not name_cell:
+            continue
+        amt, qty, unit = price
+        if amt is None or qty is None or amt <= 0 or qty <= 0:
+            continue
+        name = _clean_meicai_table_name(name_cell)
+        if not name or name in existing:
+            continue
+        item = _blank_meicai_item(name, oid, unit or _meicai_line_unit(name_cell))
+        item["金额"] = amt
+        item["数量"] = qty
+        item["实收缺失"] = False
+        added.append(item)
+        existing.add(name)
+    return added
+
+
 def _new_meicai_item(raw, order_id, unit="", order=None):
     """由原始品名行建一条货。记下促销角标和订行，供后面消重、把实收挂回去。"""
     if not unit:
@@ -1302,6 +1378,14 @@ def parse_meicai_text(text):
     连续几段都是这样时，下一条品名先把上一段交出去，不盖掉前面的品名。
     「收」单独一行、下一行是「￥金额/数量」时，与「收 ￥…」同样算实收。
     这笔「收」对不上当前货的订行、却对得上前面还缺实收的订行时，记回那一件。
+    品名行已经以单位结尾时，下一条品名先把这一行交出去，避免香菜被下一件货盖掉。
+    当前订行对不上这笔「收」、后面还有一笔对得上当前订行时，这笔记回前面同单位还在等的货，
+    不写到当前货上，避免香菜的实收和鱼腥草加总。
+    当前货还没有订行，且后面还有同名货带着自己的「收」时，这笔正数实收同样记回前面
+    同单位、后面不会再有自己的「收」的那件。香菜的 19.64 不和鱼腥草的 6.18 加总。
+    正文没有的货，若出现在 HTML 表的「品名 + ￥金额/数量」里，补进明细。
+    香菜只在表里时仍是 2 斤 / 13.70；已经认出的货不按表再加一遍。
+    广告后面的「收」若对得上前面某件货的订行，仍记回那一件，不当成孤儿丢掉。
     品名为空、数量和金额又是 0 或没有的，是游离「收」，不进明细。
     品名去掉前导「促」和「美菜鲜坊」。白壳中码、汽水碳酸饮料、汽水谈岁饮料换成金标名。
     带「促」的行若和另一行品名、单位、数量、金额都相同，是角标重行，不加总。
@@ -1395,20 +1479,36 @@ def parse_meicai_text(text):
             return end, parsed
         return None
 
+    def _earlier_waiting_order(parsed):
+        """前面还缺实收、订行对得上这笔「收」的货。没有则 None。"""
+        found = None
+        for it in items:
+            if not _item_waiting(it):
+                continue
+            order = it.get("_订")
+            if order and _order_recv_close(order, parsed):
+                found = it
+        return found
+
     def _recv_after_slogan_is_orphan(parsed):
         """广告夹在品名/订和「收」之间时，对不上这件货的订行就丢掉。
 
         没有订行也丢掉：没法证明这笔「收」属于这件货。
         订行接近（含几分钱、数量差 0.04 的补差）才留下。
+        对不上当前订行、但对得上前面还缺实收的订行时留下，主循环记回那一件。
         数字和前面另一件货的实收相同，仍当孤儿丢掉。
         同一品名已经记过的不算另一件货，两笔一样的货仍加总。
         """
+        amt, qty, unit = parsed
+        if _matches_other_goods_recv(amt, qty, unit, _waiting_goods_name()):
+            return True
+        if _earlier_waiting_order(parsed) is not None:
+            return False
         if not _name_waiting_for_recv():
             return True
         if pending_order is None or not _order_recv_close(pending_order, parsed):
             return True
-        amt, qty, unit = parsed
-        return _matches_other_goods_recv(amt, qty, unit, _waiting_goods_name())
+        return False
 
     def _skip_slogan_and_orphan_recv(start):
         """若广告后面那笔「收」是孤儿，返回跳过之后的下标；否则返回 None，只丢掉广告。"""
@@ -1451,20 +1551,158 @@ def parse_meicai_text(text):
         if remembered:
             seen_recv.append((remembered, amt, qty, unit or str(item.get("单位") or "")))
 
+    def _same_recv_unit(item, got):
+        iu = str((item or {}).get("单位") or "")
+        ru = (got or ("", "", ""))[2] or ""
+        return bool(iu and ru and iu == ru)
+
+    def _following_recvs(start):
+        """紧跟着的「收」，直到品名、订或付款。广告和坐标跳过。"""
+        found = []
+        j = start + 1
+        while j < n and not _meicai_goods_cutoff(raw_lines[j]):
+            kind_j, payload_j = _meicai_line_kind(raw_lines[j])
+            if kind_j in ("noise", "pay", "oid"):
+                j += 1
+                continue
+            if kind_j != "recv":
+                break
+            parsed_j = _parse_meicai_amt_qty(payload_j)
+            if (
+                parsed_j is None
+                and payload_j == "收"
+                and j + 1 < n
+                and _meicai_price_only_line(raw_lines[j + 1])
+            ):
+                parsed_j = _parse_meicai_amt_qty(raw_lines[j + 1])
+                j += 1
+            if parsed_j:
+                found.append(parsed_j)
+            j += 1
+        return found
+
+    def _nearest_open_same_unit(got, require_no_order):
+        """还缺实收、单位相同的最近一件。require_no_order 时跳过已经有订行的。"""
+        found = None
+        for it in items:
+            if it is current or not _item_waiting(it):
+                continue
+            if not _same_recv_unit(it, got):
+                continue
+            order = it.get("_订")
+            if require_no_order and order:
+                continue
+            if order and not _order_recv_close(order, got):
+                continue
+            found = it
+        return found
+
     def _recv_owner(got):
-        """当前货的订行对得上就记在当前货。对不上时，找回前面还缺实收、订行对得上的那件。"""
-        if got is None:
+        """当前货的订行对得上就记在当前货。对不上时，找回前面还缺实收、订行对得上的那件。
+
+        后面还有一笔「收」对得上当前订行时，这笔不是当前货的：记回前面同单位、
+        还没有订行（或订行不冲突）的那件。香菜的 19.64 不再写进鱼腥草，
+        鱼腥草留下自己的 6.18，两行不会加总成 4.04/25.82。
+        两行小葱都还没有订行、两笔「收」排在一起时，前一笔记回上一行。
+        """
+        if got is None or current is None:
             return current
         cur_order = current.get("_订") if _item_waiting(current) else None
         if cur_order and _order_recv_close(cur_order, got):
             return current
+        earlier = _earlier_waiting_order(got)
+        if earlier is not None and earlier is not current:
+            return earlier
+        followers = _following_recvs(i)
+        if cur_order and any(_order_recv_close(cur_order, nxt) for nxt in followers):
+            alt = _nearest_open_same_unit(got, require_no_order=True)
+            if alt is not None:
+                return alt
+        if (
+            _item_waiting(current)
+            and not cur_order
+            and len(followers) == 1
+            and _same_recv_unit(current, got)
+            and _same_recv_unit(current, followers[0])
+        ):
+            alt = _nearest_open_same_unit(got, require_no_order=True)
+            if alt is not None:
+                return alt
+        # 实机 Shot2：香菜后面先出现「促鱼腥草」，19.64 写在鱼腥草名下，
+        # 鱼腥草自己的 6.18 还在后面。当前货没有订行，不能把这笔收留下。
+        # 0 元收货（退掉的香菜、黄豆上的 ￥0.00）仍留在当前货，不挪到更早的行。
+        owner_name = str(current.get("品名") or "").strip() if _item_waiting(current) else ""
+        if (
+            owner_name
+            and _positive_recv(got)
+            and not (cur_order and _order_recv_close(cur_order, got))
+            and _later_same_name_has_recv(owner_name, i)
+        ):
+            alt = _nearest_open_without_later_recv(got)
+            if alt is not None:
+                return alt
+        return current
+
+    def _positive_recv(got):
+        amt, qty, _unit = got
+        return (
+            amt is not None
+            and qty is not None
+            and Decimal(str(amt)) > 0
+            and Decimal(str(qty)) > 0
+        )
+
+    def _block_has_recv(start):
+        """品名行之后、下一件别的货之前，有没有带数字的「收」。"""
+        j = start + 1
+        while j < n and not _meicai_goods_cutoff(raw_lines[j]):
+            kind_j, payload_j = _meicai_line_kind(raw_lines[j])
+            if kind_j == "recv":
+                parsed_j = _parse_meicai_amt_qty(payload_j)
+                if (
+                    parsed_j is None
+                    and payload_j == "收"
+                    and j + 1 < n
+                    and _meicai_price_only_line(raw_lines[j + 1])
+                ):
+                    parsed_j = _parse_meicai_amt_qty(raw_lines[j + 1])
+                if parsed_j and _positive_recv(parsed_j):
+                    return True
+                j += 1
+                continue
+            if kind_j in ("name", "title"):
+                return False
+            j += 1
+        return False
+
+    def _later_same_name_has_recv(name, start):
+        """后面还有同名货，并且那一段自己带着「收」。"""
+        if not name:
+            return False
+        j = start + 1
+        while j < n and not _meicai_goods_cutoff(raw_lines[j]):
+            kind_j, payload_j = _meicai_line_kind(raw_lines[j])
+            if kind_j in ("name", "title") and _clean_meicai_name(payload_j) == name:
+                if _block_has_recv(j):
+                    return True
+            j += 1
+        return False
+
+    def _nearest_open_without_later_recv(got):
+        """同单位、还缺实收，且后面没有自己的「收」的最近一件。"""
+        found = None
         for it in items:
             if it is current or not _item_waiting(it):
                 continue
+            if not _same_recv_unit(it, got):
+                continue
             order = it.get("_订")
-            if order and _order_recv_close(order, got):
-                return it
-        return current
+            if order and not _order_recv_close(order, got):
+                continue
+            if _later_same_name_has_recv(str(it.get("品名") or "").strip(), i):
+                continue
+            found = it
+        return found
 
     raw_lines = str(text or "").splitlines()
     i = 0
@@ -1518,9 +1756,12 @@ def parse_meicai_text(text):
         if kind == "name":
             # 美菜品名行以单位结尾（「大娃娃菜 优质 斤」）。后面这条盖住前面的广告文案，
             # 广告不再粘进品名；没有单位的说明行仍接在当前品名后面。
-            # 上一段已是「品名 + 下行标价」且还没有「收」时，先交出行再换品名。
+            # 上一段已是「品名 + 下行标价」，或品名本身已经以单位结尾时，
+            # 先交出行再换品名。只有标价才交出去的话，价格行被 OCR 挪走时香菜整行会被盖掉。
             # 订行跟这一段走，后面的「收」才能按订行挂回这件货，而不是挂到下一件。
-            if pending_priced and pending_name and _MEICAI_UNIT_TAIL_RE.search(payload):
+            if pending_name and _MEICAI_UNIT_TAIL_RE.search(payload) and (
+                pending_priced or _MEICAI_UNIT_TAIL_RE.search(pending_name)
+            ):
                 raw_pending = pending_name
                 order = pending_order
                 pending_name = ""
@@ -1602,6 +1843,7 @@ def parse_meicai_text(text):
         if str(pending_item.get("品名") or "").strip():
             _push(pending_item)
 
+    items.extend(_meicai_table_only_rows(text, items, current_oid))
     items = _drop_meicai_promo_dupes(items)
     items = _meicai_drop_bundle_tiers(items)
     items = aggregate_meicai_items(items)
