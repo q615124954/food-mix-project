@@ -1120,6 +1120,85 @@ class ShotGoldTargets(unittest.TestCase):
         self.assertAlmostEqual(herb["数量"], 1.0, places=2)
         self.assertAlmostEqual(herb["金额"], 6.18, places=2)
 
+    def test_shot_ocr_fixtures_keep_coriander_scallion_and_herb(self):
+        """实机三条只认仓库里的 OCR 原文，不认另外编的价目表。
+
+        Shot1：香菜 2 斤 / 13.70 在明细里，整单 6 行。
+        Shot2：小葱合并 8 斤 / 71.31；香菜单独一行；鱼腥草是 1 斤 / 6.18，不是 4.04/25.82。
+        """
+        shot1 = core.parse_meicai_text(_read_text(SHOT_OCR["shot1"]))
+        _assert_filled_matches_gold(self, shot1, _shot_gold("shot1"))
+        coriander = next(it for it in shot1["items"] if it["品名"] == "香菜")
+        self.assertAlmostEqual(coriander["数量"], 2.0, places=2)
+        self.assertAlmostEqual(coriander["金额"], 13.70, places=2)
+        self.assertEqual(len(shot1["items"]), 6)
+        self.assertAlmostEqual(sum(it["金额"] for it in shot1["items"]), 258.23, places=2)
+
+        shot2 = core.parse_meicai_text(_read_text(SHOT_OCR["shot2"]))
+        _assert_filled_matches_gold(self, shot2, _shot_gold("shot2"))
+        scallion = next(it for it in shot2["items"] if it["品名"] == "小葱")
+        self.assertAlmostEqual(scallion["数量"], 8.0, places=2)
+        self.assertAlmostEqual(scallion["金额"], 71.31, places=2)
+        self.assertFalse(scallion["实收缺失"])
+        self.assertEqual([it["品名"] for it in shot2["items"]].count("香菜"), 1)
+        coriander = next(it for it in shot2["items"] if it["品名"] == "香菜")
+        self.assertAlmostEqual(coriander["数量"], 3.04, places=2)
+        self.assertAlmostEqual(coriander["金额"], 19.64, places=2)
+        herb = next(it for it in shot2["items"] if it["品名"] == "鱼腥草")
+        self.assertAlmostEqual(herb["数量"], 1.0, places=2)
+        self.assertAlmostEqual(herb["金额"], 6.18, places=2)
+        self.assertNotAlmostEqual(herb["数量"], 4.04, places=2)
+        self.assertNotAlmostEqual(herb["金额"], 25.82, places=2)
+
+    def test_shot1_fixture_keeps_coriander_when_price_line_moves(self):
+        """同一份 Shot1 原文里，香菜的标价和订行被挪到下一件货之后，整行仍是 2/13.70。
+
+        品名若被下一条盖掉，13.70 会写进鸡蛋或直接消失，明细和变成 244.53。
+        """
+        text = _read_text(SHOT_OCR["shot1"])
+        moved = text.replace("￥13.70/2.00斤\n订 ￥13.70/2.00斤\n", "", 1)
+        parsed = core.parse_meicai_text(moved)
+        coriander = next(it for it in parsed["items"] if it["品名"] == "香菜")
+        egg = next(it for it in parsed["items"] if it["品名"] == "鲜鸡蛋 白壳")
+        self.assertAlmostEqual(coriander["数量"], 2.0, places=2)
+        self.assertAlmostEqual(coriander["金额"], 13.70, places=2)
+        self.assertFalse(coriander["实收缺失"])
+        self.assertAlmostEqual(egg["数量"], 2.0, places=2)
+        self.assertAlmostEqual(egg["金额"], 41.56, places=2)
+        self.assertEqual(len(parsed["items"]), 6)
+        self.assertFalse(any(not str(it["品名"]).strip() for it in parsed["items"]))
+
+    def test_shot2_fixture_does_not_add_coriander_into_herb(self):
+        """同一份 Shot2 原文：广告挡在错挂的「收」前面，再多一行鱼腥草。
+
+        香菜仍是 3.04/19.64，鱼腥草仍是 1/6.18。两行小葱仍合并成 8/71.31。
+        """
+        text = _read_text(SHOT_OCR["shot2"])
+        text = text.replace(
+            "收 ￥19.64/3.04斤\n",
+            "优质，拒绝欺骗！\n收 ￥19.64/3.04斤\n",
+            1,
+        )
+        text = text.replace(
+            "促鱼腥草 斤\n",
+            "促鱼腥草 斤\n￥6.18/1.00斤\n订 ￥6.18/1.00斤\n鱼腥草 斤\n",
+            1,
+        )
+        parsed = core.parse_meicai_text(text)
+        scallion = next(it for it in parsed["items"] if it["品名"] == "小葱")
+        self.assertAlmostEqual(scallion["数量"], 8.0, places=2)
+        self.assertAlmostEqual(scallion["金额"], 71.31, places=2)
+        self.assertFalse(scallion["实收缺失"])
+        coriander = [it for it in parsed["items"] if it["品名"] == "香菜"]
+        self.assertEqual(len(coriander), 1)
+        self.assertAlmostEqual(coriander[0]["数量"], 3.04, places=2)
+        self.assertAlmostEqual(coriander[0]["金额"], 19.64, places=2)
+        herb = [it for it in parsed["items"] if it["品名"] == "鱼腥草"]
+        self.assertEqual(len(herb), 1)
+        self.assertAlmostEqual(herb[0]["数量"], 1.0, places=2)
+        self.assertAlmostEqual(herb[0]["金额"], 6.18, places=2)
+        self.assertFalse(any(not str(it["品名"]).strip() for it in parsed["items"]))
+
     def test_soda_typo_alias_and_single_promo_line_kept(self):
         """汽水谈岁饮料换成百事可乐汽水。只有促销行时去掉「促」，不把这行丢掉。"""
         text = "\n".join([
