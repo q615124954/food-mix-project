@@ -48,3 +48,5 @@ Thumbs.db
 # 样本目录里跑出来的字节码仍然忽略
 samples/**/__pycache__/
 samples/**/*.pyc
+# 视觉对照实验的本地输出。无密钥时也是空表，实跑结果不是金标。
+samples/vision_exp/out/
