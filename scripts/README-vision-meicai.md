@@ -1,6 +1,10 @@
 # 美菜电子小票视觉模型对照
 
-实验脚本，只用来人工对比。复核页和手写单的生产默认仍是 **HunyuanOCR**（`POST /v1/images/ocr`）。本脚本不接入 `webapp`，也不会把视觉模型写成默认。
+实验脚本，只用来人工对比，不写回复核页。
+
+复核页里，美菜电子小票默认走 **Qwen3.5-Flash**（`POST /v1/chat/completions`，见 `meicai_vision.py`）。要改用 Qwen3-VL-Plus，设置 `MEICAI_VISION_MODEL=Qwen3-VL-Plus`。密钥仍是 `HUNYUAN_API_KEY`（空则 `MOLLI_ARK_API_KEY`）。手写采购单的生产默认仍是 **HunyuanOCR**（`POST /v1/images/ocr`）。
+
+Shot3 煲汤袋实收（模型常见 3/14.2，金标 1/4.8）是已知缺口，默认模型不为此改成更贵的型号。
 
 没有密钥时脚本照样打印对照表，但**不发请求**。行命中、实付一致、编造行、耗时留空，这些空格子不是实测 0。仓库里不预写实跑数字。运维配好密钥后重跑，表才会填上。
 

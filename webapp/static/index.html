@@ -260,7 +260,10 @@ function renderCurrent() {
   const ocrRef = document.getElementById('ocr-total-ref');
   if (ocrRef) {
     const ot = inv.order_total;
-    ocrRef.textContent = (ot != null && ot !== '') ? `（OCR 认出合计 ¥${ot}，仅供参考）` : '（OCR 未认出合计）';
+    const meicai = inv.kind === 'meicai';
+    const filled = meicai ? `（结算后合计 ¥${ot}，仅供参考）` : `（OCR 认出合计 ¥${ot}，仅供参考）`;
+    const empty = meicai ? '（未认出结算后合计）' : '（OCR 未认出合计）';
+    ocrRef.textContent = (ot != null && ot !== '') ? filled : empty;
   }
   recomputeTotal();
   document.getElementById('tbl-title').textContent = inv.filename;
@@ -270,7 +273,9 @@ function renderCurrent() {
     noteEl.textContent = note;
     noteEl.style.display = note ? 'block' : 'none';
   }
-  document.getElementById('btn-confirm').disabled = !inv.ocr_done || inv.status === 'merged';
+  const confirmBtn = document.getElementById('btn-confirm');
+  confirmBtn.disabled = !inv.ocr_done || inv.status === 'merged';
+  confirmBtn.textContent = inv.kind === 'meicai' ? '确认并同步' : '确认落地';
 
   const panel = document.getElementById('img-panel');
   panel.innerHTML = `<img src="/images/${encodeURIComponent(inv.filename)}" onclick="this.style.cursor='zoom-out';this.style.maxWidth='none';this.style.maxHeight='none'" title="点击放大/还原">`;
@@ -463,8 +468,22 @@ async function submitConfirm() {
     const r = await fetch(`/api/invoice/${encodeURIComponent(inv.filename)}/confirm`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
     });
-    if (r.ok) { dirty = false; paidDirty = false; toast('已落地'); await refresh(); }
-    else { const e = await r.json(); toast('落地失败：' + (e.detail || '未知错误'), true); }
+    const data = await r.json();
+    if (r.ok) {
+      dirty = false;
+      paidDirty = false;
+      const sync = data.material_sync;
+      if (sync && sync.synced) {
+        renderSyncResult(sync);
+        toast('已确认并同步到日物料');
+      } else if (sync) {
+        toast(sync.reason || '已确认，尚未写入日物料', true);
+      } else {
+        toast('已落地');
+      }
+      await refresh();
+    }
+    else { toast('落地失败：' + (data.detail || '未知错误'), true); }
   } catch (err) {
     toast('请求失败：' + err.message, true);
   }

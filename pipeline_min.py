@@ -6,6 +6,7 @@
 import os
 import io
 import re
+import tempfile
 import html as html_lib
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 import requests
@@ -195,6 +196,37 @@ def call_ocr(image_path, timeout=600, enhance=False):
     注：模力方舟 OCR 平台侧偶发极慢（实测 400+ 秒/张），超时须放宽到 10 分钟。"""
     buf, name = prepare_image(image_path, enhance)
     return _post_ocr_buf(buf, name, timeout)
+
+
+def call_ocr_top_strip(image_path, timeout=600):
+    """长截图只把顶部一条送给 HunyuanOCR，用来判断是不是美菜。
+
+    顶条已经像美菜时，调用方改走视觉模型，不再把整图分条 OCR 的正文拿来填数量。
+    顶条不像美菜、或这一步失败时返回空串，调用方继续原来的整段识别（手写单仍走那条）。
+    临时文件名以 meicai-top- 开头，测试可以把它和整图 OCR 分开。
+    """
+    try:
+        img = Image.open(image_path)
+        img = ImageOps.exif_transpose(img)
+        w, h = img.size
+    except Exception:
+        return ""
+    if w <= 0 or h <= 0:
+        return ""
+    strip_h = min(h, OCR_SLICE_HEIGHT)
+    crop = img.crop((0, 0, w, strip_h)).convert("RGB")
+    fd, tmp = tempfile.mkstemp(prefix="meicai-top-", suffix=".jpg")
+    os.close(fd)
+    try:
+        crop.save(tmp, format="JPEG", quality=85)
+        return call_ocr(tmp, timeout=timeout) or ""
+    except Exception:
+        return ""
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def looks_like_long_screenshot(path):

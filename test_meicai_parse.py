@@ -360,6 +360,47 @@ class MeicaiParse(unittest.TestCase):
         self.assertAlmostEqual(items[1]["金额"], 44.40, places=2)
 
 
+def _vision_review_doc():
+    """ocr_one 在判成美菜之后应采用的复核文档，故意和 OCR 正文解析结果不同。"""
+    return {
+        "kind": "美菜",
+        "date": "2026-09-09",
+        "paid": 10.0,
+        "order_total": 10.0,
+        "order_ids": ["3002160333"],
+        "note": "订单号 3002160333",
+        "items": [{
+            "品名": "来自视觉",
+            "数量": 1.5,
+            "金额": 10.0,
+            "单位": "斤",
+            "渠道": "美菜",
+            "订单号": "3002160333",
+            "实收缺失": False,
+            "单价": 6.67,
+            "勾稽": "OK",
+            "日期": "2026-09-09",
+        }],
+        "suspects": [],
+        "model": "Qwen3.5-Flash",
+    }
+
+
+class _VisionStub:
+    def __init__(self):
+        self.calls = []
+        self.doc = _vision_review_doc()
+        self._old = webapp.recognize_meicai_image
+        webapp.recognize_meicai_image = self._call
+
+    def _call(self, path):
+        self.calls.append(path)
+        return copy.deepcopy(self.doc)
+
+    def close(self):
+        webapp.recognize_meicai_image = self._old
+
+
 class MeicaiRoute(unittest.TestCase):
     def setUp(self):
         self._call = webapp.core.call_ocr
@@ -383,20 +424,26 @@ class MeicaiRoute(unittest.TestCase):
             return _ocr_text()
 
         webapp.core.call_ocr = fake
-        res = webapp.ocr_one("meicai_2026-09-09.png")
+        stub = _VisionStub()
+        try:
+            res = webapp.ocr_one("meicai_2026-09-09.png")
+        finally:
+            stub.close()
         self.assertEqual(calls, [False])
+        self.assertEqual(len(stub.calls), 1)
         self.assertEqual(res["kind"], "meicai")
+        self.assertEqual(res["vision_model"], "Qwen3.5-Flash")
         self.assertEqual(res["date"], "2026-09-09")
-        self.assertEqual(res["order_total"], 163.25)
-        self.assertEqual(res["paid_total"], 163.25)
-        self.assertEqual(len(res["items"]), 7)
-        gold = _gold()["日物料采购_复核后期望行"]
-        for got, want in zip(res["items"], gold):
-            self.assertEqual(got.get("原品名") or got["品名"], want["name"])
-            self.assertAlmostEqual(got["数量"], want["qty"], places=2)
-            self.assertAlmostEqual(got["金额"], want["amt"], places=2)
-            self.assertNotEqual(got.get("归属"), "员工餐")
-        self.assertEqual(res["meicai_part"]["order_ids"], _gold()["order_ids"])
+        self.assertEqual(res["order_total"], 10.0)
+        self.assertEqual(res["paid_total"], 10.0)
+        self.assertEqual([it["品名"] for it in res["items"]], ["来自视觉"])
+        self.assertAlmostEqual(res["items"][0]["数量"], 1.5, places=2)
+        self.assertNotEqual(res["items"][0].get("归属"), "员工餐")
+        self.assertEqual(res["meicai_part"]["order_ids"], ["3002160333"])
+        # 同一段 OCR 若走旧解析会是金标 7 行。复核行必须来自视觉文档。
+        parsed = core.parse_meicai_text(_ocr_text())
+        self.assertEqual(len(parsed["items"]), 7)
+        self.assertNotEqual(len(res["items"]), len(parsed["items"]))
 
     def test_day_merge_on_invoices_and_land_trace(self):
         text = _ocr_text()
@@ -616,19 +663,22 @@ class LongScreenshot(unittest.TestCase):
 
         webapp.core.call_ocr_tiled = tiled
         webapp.core.call_ocr = full
+        stub = _VisionStub()
         try:
             res = webapp.ocr_one("long.png")
         finally:
+            stub.close()
             webapp.core.call_ocr = old_call
             webapp.core.call_ocr_tiled = old_tiled
             webapp._paths.clear()
             webapp._paths.update(old_paths)
         self.assertEqual(seen["tiled"], 1)
-        # 长图会再打一次整图，但整图不是美菜实收，分数更低，仍用分条原文。
-        self.assertEqual(seen["full"], 1)
+        # 顶条不像美菜，所以还会打整图。整图不是美菜实收，分条原文负责判定，明细来自视觉。
+        self.assertEqual(seen["full"], 2)
+        self.assertEqual(len(stub.calls), 1)
         self.assertEqual(res["kind"], "meicai")
-        self.assertEqual(len(res["items"]), 7)
-        self.assertAlmostEqual(res["items"][0]["数量"], 3.08, places=2)
+        self.assertEqual([it["品名"] for it in res["items"]], ["来自视觉"])
+        self.assertNotIn("白菜", [it["品名"] for it in res["items"]])
 
     def test_ocr_one_prefers_full_when_it_has_more_recv(self):
         """分条没有可用「收」、整图「收」多出足够行数时，用整图原文。不把订货数写成实收。"""
@@ -661,17 +711,20 @@ class LongScreenshot(unittest.TestCase):
 
         webapp.core.call_ocr_tiled = tiled
         webapp.core.call_ocr = full
+        stub = _VisionStub()
         try:
             res = webapp.ocr_one("long.png")
         finally:
+            stub.close()
             webapp.core.call_ocr = old_call
             webapp.core.call_ocr_tiled = old_tiled
             webapp._paths.clear()
             webapp._paths.update(old_paths)
+        # 顶条 OCR 与整图是同一次 mock，顶条已经像美菜，不再分条，明细来自视觉而不是实收解析。
         self.assertEqual(res["kind"], "meicai")
-        self.assertEqual(len(res["items"]), 7)
-        self.assertAlmostEqual(res["items"][0]["数量"], 3.08, places=2)
-        self.assertAlmostEqual(res["items"][0]["金额"], 19.59, places=2)
+        self.assertEqual(len(stub.calls), 1)
+        self.assertEqual([it["品名"] for it in res["items"]], ["来自视觉"])
+        self.assertNotAlmostEqual(res["items"][0]["金额"], 19.59, places=2)
 
     def _ocr_long(self, size, tiled_text, full_text):
         tmp = tempfile.TemporaryDirectory()
@@ -689,17 +742,23 @@ class LongScreenshot(unittest.TestCase):
 
         def full(path, timeout=600, enhance=False):
             seen["full"] += 1
+            # 顶条故意不像美菜，分条/整图择优仍会跑。判成美菜之后明细改由视觉文档填。
+            if os.path.basename(path).startswith("meicai-top-"):
+                return "普通照片，没有订单号"
             return full_text
 
         webapp.core.call_ocr_tiled = tiled
         webapp.core.call_ocr = full
+        stub = _VisionStub()
         try:
             res = webapp.ocr_one("long.png")
         finally:
+            stub.close()
             webapp.core.call_ocr = old_call
             webapp.core.call_ocr_tiled = old_tiled
             webapp._paths.clear()
             webapp._paths.update(old_paths)
+        seen["vision"] = len(stub.calls)
         return res, seen
 
     def test_crushed_full_does_not_beat_tiled_with_as_many_recv(self):
@@ -727,8 +786,10 @@ class LongScreenshot(unittest.TestCase):
         self.assertEqual(core.meicai_recv_count(tiled_text), core.meicai_recv_count(full_text))
         res, seen = self._ocr_long((1080, 6000), tiled_text, full_text)
         self.assertEqual(seen["tiled"], 1)
-        self.assertEqual(seen["full"], 1)
-        self.assertEqual([it["品名"] for it in res["items"]], ["小葱"])
+        self.assertEqual(seen["full"], 2)
+        self.assertEqual(seen["vision"], 1)
+        self.assertEqual(res["kind"], "meicai")
+        self.assertEqual([it["品名"] for it in res["items"]], ["来自视觉"])
 
     def test_one_extra_recv_does_not_let_shrunk_full_win(self):
         """压瘦的整图只多一行「收」时仍用分条。不拿糊掉的字盖过原宽切片。"""
@@ -754,8 +815,9 @@ class LongScreenshot(unittest.TestCase):
         ])
         self.assertFalse(core.shrunk_full_beats_tiled(tiled_text, full_text))
         res, seen = self._ocr_long((1080, 6000), tiled_text, full_text)
-        self.assertEqual(seen["full"], 1)
-        self.assertEqual([it["品名"] for it in res["items"]], ["小葱"])
+        self.assertEqual(seen["full"], 2)
+        self.assertEqual(seen["vision"], 1)
+        self.assertEqual([it["品名"] for it in res["items"]], ["来自视觉"])
 
     def test_full_wins_only_when_recv_margin_is_met(self):
         """分条「收」明显更少（少够 MEICAI_FULL_RECV_MARGIN 行）时才退回整图。"""
@@ -789,10 +851,10 @@ class LongScreenshot(unittest.TestCase):
         self.assertFalse(core.shrunk_full_beats_tiled(tiled_text, short_full))
         res, seen = self._ocr_long((1080, 6000), tiled_text, full_text)
         self.assertEqual(seen["tiled"], 1)
-        self.assertEqual(seen["full"], 1)
-        self.assertEqual([it["品名"] for it in res["items"]], names)
-        self.assertAlmostEqual(res["items"][1]["数量"], 1.0, places=2)
-        self.assertAlmostEqual(res["items"][1]["金额"], 6.0, places=2)
+        self.assertEqual(seen["full"], 2)
+        self.assertEqual(seen["vision"], 1)
+        self.assertEqual([it["品名"] for it in res["items"]], ["来自视觉"])
+        self.assertNotEqual([it["品名"] for it in res["items"]], names)
 
     def test_mild_shrink_does_not_win_on_extra_goods_lines(self):
         """1080×3000 也会把长边收到 2048。整图多一行品名、没有多出来的「收」，仍用分条。"""
@@ -818,8 +880,9 @@ class LongScreenshot(unittest.TestCase):
         self.assertGreater(core.full_frame_shrink_ratio(1080, 3000), core.CRUSHED_FULL_FRAME_RATIO)
         self.assertGreater(core.meicai_ocr_quality(full_text), core.meicai_ocr_quality(tiled_text))
         self.assertFalse(core.shrunk_full_beats_tiled(tiled_text, full_text))
-        res, _seen = self._ocr_long((1080, 3000), tiled_text, full_text)
-        self.assertEqual([it["品名"] for it in res["items"]], ["小葱"])
+        res, seen = self._ocr_long((1080, 3000), tiled_text, full_text)
+        self.assertEqual(seen["vision"], 1)
+        self.assertEqual([it["品名"] for it in res["items"]], ["来自视觉"])
 
     def test_long_handwriting_stays_on_tiled_text(self):
         """两份都不像美菜时不换文本。手写单仍走原来的表解析。"""
@@ -842,9 +905,16 @@ class LongScreenshot(unittest.TestCase):
 
         webapp.core.call_ocr_tiled = tiled
         webapp.core.call_ocr = full
+
+        def boom(_path):
+            raise AssertionError("手写长图不应调用美菜视觉识别")
+
+        old_vision = webapp.recognize_meicai_image
+        webapp.recognize_meicai_image = boom
         try:
             res = webapp.ocr_one("long.png")
         finally:
+            webapp.recognize_meicai_image = old_vision
             webapp.core.call_ocr = old_call
             webapp.core.call_ocr_tiled = old_tiled
             webapp._paths.clear()
@@ -872,15 +942,23 @@ class LongScreenshot(unittest.TestCase):
         def fake(path, timeout=600, enhance=False):
             return text
 
+        parsed = core.parse_meicai_text(text)
+        self.assertEqual(len(parsed["items"]), 1)
+        self.assertAlmostEqual(parsed["items"][0]["数量"], 8.0, places=2)
+        self.assertAlmostEqual(parsed["items"][0]["金额"], 71.31, places=2)
+
+        old_call = webapp.core.call_ocr
         webapp.core.call_ocr = fake
-        res = webapp.ocr_one("meicai_scallion.png")
+        stub = _VisionStub()
+        try:
+            res = webapp.ocr_one("meicai_scallion.png")
+        finally:
+            stub.close()
+            webapp.core.call_ocr = old_call
+        self.assertEqual(len(stub.calls), 1)
         self.assertEqual(res["kind"], "meicai")
         self.assertEqual(len(res["items"]), 1)
-        row = res["items"][0]
-        self.assertEqual(row["单位"], "斤")
-        self.assertAlmostEqual(row["数量"], 8.0, places=2)
-        self.assertAlmostEqual(row["金额"], 71.31, places=2)
-        self.assertAlmostEqual(row["单价"], 8.91, places=2)
+        self.assertEqual(res["items"][0]["品名"], "来自视觉")
         self.assertEqual(len(res["meicai_part"]["items"]), 1)
 
     def test_ocr_one_handwriting_keeps_duplicate_names(self):
@@ -894,8 +972,18 @@ class LongScreenshot(unittest.TestCase):
         def fake(path, timeout=600, enhance=False):
             return html
 
+        def boom(_path):
+            raise AssertionError("手写单不应调用美菜视觉识别")
+
+        old_call = webapp.core.call_ocr
         webapp.core.call_ocr = fake
-        res = webapp.ocr_one("hand_scallion.png")
+        old_vision = webapp.recognize_meicai_image
+        webapp.recognize_meicai_image = boom
+        try:
+            res = webapp.ocr_one("hand_scallion.png")
+        finally:
+            webapp.recognize_meicai_image = old_vision
+            webapp.core.call_ocr = old_call
         self.assertEqual(res["kind"], "handwriting")
         self.assertEqual([it["品名"] for it in res["items"]], ["小葱", "小葱"])
         self.assertAlmostEqual(res["items"][0]["数量"], 3.0, places=2)

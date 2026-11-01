@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """美菜电子小票：视觉模型对照实验。
 
-只给人工跑。不接入 webapp，不改复核页默认。
+只给人工跑对照，不写回复核页。
+复核页的美菜截图默认是 Qwen3.5-Flash（meicai_vision.py）。
 手写采购单仍走 HunyuanOCR。本脚本的基线也是 HunyuanOCR
 `/v1/images/ocr` 加 pipeline_min.parse_meicai_text。
 
@@ -876,6 +877,7 @@ def run_report(
         "experiment": "meicai_electronic_receipt_vision_compare",
         "production_default_model": core.MODEL,
         "vision_is_production_default": False,
+        "meicai_production_model": FALLBACK_MODEL,
         "handwriting_ocr": BASELINE_MODEL,
         "ocr_url": core.API_URL,
         "chat_url": core.CHAT_URL,
@@ -927,7 +929,8 @@ def _report_note(has_key, dry_run, any_live):
         return (
             "未读取到 HUNYUAN_API_KEY 或 MOLLI_ARK_API_KEY，未调用模力方舟。"
             "行命中、实付一致、编造行、耗时留空，不是实测 0。"
-            "生产复核仍走 HunyuanOCR。实跑对照由运维持密钥后重跑本脚本填写，仓库不预写数字。"
+            "复核页里美菜电子小票默认 Qwen3.5-Flash，手写单仍走 HunyuanOCR。"
+            "实跑对照由运维持密钥后重跑本脚本填写，仓库不预写数字。"
         )
     if dry_run:
         return "dry-run：不发请求。对照数字留空，不是实测 0。"
@@ -957,8 +960,10 @@ def render_markdown(report):
         "",
         report.get("note") or "",
         "",
-        "生产默认模型仍是 **%s**（`/v1/images/ocr`）。本表来自实验脚本，不会写回复核页。"
-        % report.get("production_default_model"),
+        "手写单仍是 **%s**。美菜电子小票复核默认 **%s**"
+        "（`MEICAI_VISION_MODEL=Qwen3-VL-Plus` 可改）。本表来自实验脚本，不会写回复核页。"
+        % (report.get("handwriting_ocr") or report.get("production_default_model"),
+           report.get("meicai_production_model") or "Qwen3.5-Flash"),
         "",
     ]
     if not report.get("contains_live_measurements"):
