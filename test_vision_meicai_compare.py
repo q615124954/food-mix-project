@@ -152,7 +152,10 @@ class ReportShapeTests(unittest.TestCase):
         self.assertFalse(report["contains_live_measurements"])
         self.assertFalse(report["vision_is_production_default"])
         self.assertEqual(report["production_default_model"], "HunyuanOCR")
+        self.assertEqual(report["meicai_production_model"], "Qwen3.5-Flash")
+        self.assertEqual(report["handwriting_ocr"], "HunyuanOCR")
         self.assertEqual(report["fallback_model"], "Qwen3.5-Flash")
+        self.assertIn("Qwen3.5-Flash", report["note"])
         self.assertIn("未读取到", report["note"])
         runs = report["samples"][0]["runs"]
         self.assertEqual([run["model"] for run in runs], [

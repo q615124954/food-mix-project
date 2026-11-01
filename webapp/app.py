@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 采购单审核工作台后端
-流程：扫描文件夹 → 后台批量 OCR → 网页审核修正 → 确认后落地 xlsx
-复用 pipeline_min 的 OCR/解析/单价推导/日期提取逻辑
+手写单：扫描文件夹 → HunyuanOCR → 解析 → 网页复核 → 确认后落地 xlsx
+美菜电子小票：同一套复核页，识别改走视觉模型（默认 Qwen3.5-Flash）→ 确认后同步日物料
+复用 pipeline_min 的解析/单价推导/日期提取，以及 sync_to_material
 """
 import os
 import sys
@@ -22,6 +23,7 @@ CENT = Decimal("0.01")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pipeline_min as core
+import meicai_vision
 import name_match
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -696,21 +698,45 @@ def correct_item_names(items):
     return items
 
 
-def _ticket_from_ocr(text, filename):
+def recognize_meicai_image(path):
+    """美菜截图的识别入口。测试替换这一层，避免打到模力方舟。"""
+    return meicai_vision.recognize(path)
+
+
+def _ticket_from_vision(path, text, filename):
+    """视觉 JSON 填进现有美菜复核结构。日期、订单号在模型没给时才借用 OCR 原文。"""
+    doc = recognize_meicai_image(path)
+    items = list(doc.get("items") or [])
+    core.derive_price(items)
+    date = str(doc.get("date") or "").strip() or core.extract_date(text or "", filename)
+    order_ids = list(doc.get("order_ids") or [])
+    if not order_ids:
+        order_ids = core.extract_meicai_order_ids(text or "")
+    paid = doc.get("paid")
+    note = doc.get("note") or ""
+    if not note and order_ids:
+        note = "订单号 " + "、".join(str(oid) for oid in order_ids)
+    for it in items:
+        it["日期"] = date
+    return {
+        "text": text or "",
+        "rows": [],
+        "items": items,
+        "date": date,
+        "order_total": paid,
+        "order_ids": order_ids,
+        "note": note,
+        "kind": "meicai",
+        "meicai_suspects": list(doc.get("suspects") or []),
+        "vision_model": doc.get("model") or meicai_vision.selected_model(),
+    }
+
+
+def _ticket_from_ocr(text, filename, image_path=None):
     if core.is_meicai_ocr(text):
-        parsed = core.parse_meicai_text(text)
-        items, _stat = core.derive_price(parsed["items"])
-        return {
-            "text": text,
-            "rows": [],
-            "items": items,
-            "date": parsed["date"] or core.extract_date(text, filename),
-            "order_total": parsed.get("paid"),
-            "order_ids": parsed.get("order_ids") or [],
-            "note": parsed.get("note") or "",
-            "kind": "meicai",
-            "meicai_suspects": parsed.get("suspects") or [],
-        }
+        if not image_path:
+            raise RuntimeError("美菜截图缺少原图，无法走视觉识别")
+        return _ticket_from_vision(image_path, text, filename)
     rows = core.parse_table(text)
     items, _stat = core.derive_price(core.parse_line_items(rows))
     return {
@@ -812,13 +838,22 @@ def _pack_meicai(chosen, items, date):
         "note": note,
         "kind": "meicai",
         "meicai_part": part,
+        "vision_model": chosen.get("vision_model") or "",
     }
 
 
 def ocr_one(filename):
     path = os.path.join(_paths["input_dir"], filename)
-    text = _ocr_text_for_path(path)
-    chosen = _ticket_from_ocr(text, filename)
+    chosen = None
+    # 长截图先看顶部一条。已经是美菜就直接视觉识别，不再分条 HunyuanOCR 填数量。
+    # 顶条不像美菜（或这一步失败）时，下面的整段识别与手写单原来一致。
+    if core.looks_like_long_screenshot(path):
+        header = core.call_ocr_top_strip(path)
+        if core.is_meicai_ocr(header):
+            chosen = _ticket_from_vision(path, header, filename)
+    if chosen is None:
+        text = _ocr_text_for_path(path)
+        chosen = _ticket_from_ocr(text, filename, path)
     # 漏识别兜底。已经认出明细、只是空序号偏多：仍只做原来的阴影补偿，避免每张单多打几次 OCR。
     # 一行内容都没有（粉纸复写 + 手影，表格只剩序号）：按 shadow → red → flat 各识一次，取最全的那次。
     # 增强把表认丢、或内容不比当前多，都不覆盖。增强没认出日期时留下原图的日期。
@@ -831,7 +866,7 @@ def ocr_one(filename):
         )
         for strategy in strategies:
             try:
-                cand = _ticket_from_ocr(core.call_ocr(path, enhance=strategy), filename)
+                cand = _ticket_from_ocr(core.call_ocr(path, enhance=strategy), filename, path)
             except Exception:
                 continue
             if cand.get("kind") == "meicai" or core.ocr_parse_richer(
@@ -923,10 +958,12 @@ def _ocr_one_inv(inv):
                 inv["order_ids"] = res.get("order_ids") or []
                 inv["note"] = res.get("note") or ""
                 inv["meicai_part"] = res.get("meicai_part")
+                inv["vision_model"] = res.get("vision_model") or ""
             else:
                 inv["order_ids"] = []
                 inv["note"] = ""
                 inv["meicai_part"] = None
+                inv["vision_model"] = ""
             inv["ocr_done"] = True
             inv["error"] = ""
             return True
@@ -2348,6 +2385,39 @@ def get_image(filename: str):
     return FileResponse(p)
 
 
+def _sync_meicai_after_confirm():
+    """美菜确认后把落地表同步进日物料。
+
+    sync_to_material 成功后会删掉财务中间表。没配物料表、或同步失败时留下中间表，
+    确认状态已经写下，页面上的「同步到物料明细」可以再试。手写单不走这里。
+    """
+    material = str(_paths.get("material_file") or "").strip()
+    if not material or not os.path.exists(material):
+        return {
+            "synced": False,
+            "reason": "未配置可用的物料明细表，美菜已确认。配置后点「同步到物料明细」写入日物料",
+        }
+    try:
+        results, backup = sync_to_material("DeepSeek-V4-Pro")
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        return {"synced": False, "reason": detail}
+    except PermissionError:
+        return {
+            "synced": False,
+            "reason": "物料明细表被占用，请关闭 WPS/Excel 后点「同步到物料明细」",
+        }
+    except Exception as exc:
+        return {"synced": False, "reason": "同步日物料失败：%s" % exc}
+    return {
+        "synced": True,
+        "reason": "",
+        "count": len(results),
+        "backup": backup,
+        "results": results,
+    }
+
+
 def _mark_blank_date(filename):
     """确认时日期为空：标为存疑，保持未确认，不写落地表。"""
     for inv in _state["invoices"]:
@@ -2438,7 +2508,10 @@ def confirm(filename: str, payload: ConfirmPayload):
             inv["suspects"] = [paid_suspect] if paid_suspect else []
             inv["status"] = "confirmed"
             save_state()
-            return {"ok": True}
+            body = {"ok": True}
+            if kind == "meicai":
+                body["material_sync"] = _sync_meicai_after_confirm()
+            return body
     raise HTTPException(404, "未找到该票据")
 
 
