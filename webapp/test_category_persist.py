@@ -118,6 +118,16 @@ def test_normalize_item_keeps_chosen_category_and_does_not_invent_vegetable():
     assert "类别" not in missing
     assert missing.get("类别") != "蔬菜"
 
+    # 手写单：整单类别覆盖行上的类别
+    overwritten = app.normalize_item({"品名": "牛腩", "类别": "蔬菜"}, category="肉类")
+    assert overwritten["类别"] == "肉类"
+    # 美菜：行上已有类别不覆盖；空行才用默认
+    kept_line = app.normalize_item(
+        {"品名": "牛腩", "类别": "肉类"}, category="蔬菜", only_if_blank=True)
+    assert kept_line["类别"] == "肉类"
+    filled = app.normalize_item({"品名": "白菜", "数量": 1, "金额": 2}, category="蔬菜", only_if_blank=True)
+    assert filled["类别"] == "蔬菜"
+
 
 def test_confirm_persists_category_for_reopen(isolated):
     app._state["invoices"] = [_pending()]
@@ -304,3 +314,172 @@ def test_frontend_does_not_default_category_to_vegetable():
     assert '|| "蔬菜"' not in html
     assert "请先选择类别（不会默认成蔬菜）" in html
     assert "不会默认成蔬菜" in html
+    # 美菜按行选类别，按钮仍是「确认并同步」；手写单仍要求整单类别。
+    assert "inv.kind === 'meicai' ? '确认并同步' : '确认落地'" in html
+    assert 'data-k="类别"' in html
+    assert "默认类别" in html
+    assert "有明细未选类别。请选择默认类别，或为每一行选择蔬菜/肉类（不会默认成蔬菜）" in html
+
+
+def _meicai(filename="mix.png"):
+    return {
+        "filename": filename,
+        "status": "pending",
+        "ocr_done": True,
+        "kind": "meicai",
+        "date": DATE,
+        "items": [],
+    }
+
+
+def test_meicai_confirm_lands_each_line_category_and_does_not_restamp_meat(isolated, monkeypatch):
+    """默认类别是蔬菜时，肉行仍落地为肉类，空行才用默认。同步按行进对应的表。"""
+    calls = []
+    monkeypatch.setattr(app, "map_product_code", _fake_map(calls))
+    app._state["invoices"] = [_meicai()]
+    result = app.confirm("mix.png", app.ConfirmPayload(
+        date=DATE, category="蔬菜", paid_total=75,
+        items=[
+            {"品名": "白菜", "数量": 1, "单价": 10, "金额": 10, "类别": "蔬菜", "渠道": "美菜"},
+            {"品名": "牛腩", "数量": 2, "单价": 30, "金额": 60, "类别": "肉类", "渠道": "美菜"},
+            {"品名": "土豆", "数量": 1, "单价": 5, "金额": 5, "类别": "", "渠道": "美菜"},
+        ],
+    ))
+    assert result["ok"] is True
+    assert "material_sync" in result
+
+    inv = app._state["invoices"][0]
+    assert inv["status"] == "confirmed"
+    assert inv["category"] == "蔬菜"
+    assert [it["类别"] for it in inv["items"]] == ["蔬菜", "肉类", "蔬菜"]
+    assert all(it["渠道"] == "美菜" for it in inv["items"])
+
+    wb = load_workbook(os.path.join(app._paths["output_dir"], app.LAND_FILENAME))
+    ws = wb.active
+    assert [ws.cell(r, 2).value for r in range(2, 5)] == ["蔬菜", "肉类", "蔬菜"]
+    assert [ws.cell(r, 3).value for r in range(2, 5)] == ["白菜", "牛腩", "土豆"]
+    cat_merges = [mr for mr in ws.merged_cells.ranges if mr.min_col == 2 and mr.max_row > mr.min_row]
+    assert cat_merges == []
+    assert any(mr.min_col == 1 and mr.max_row > mr.min_row for mr in ws.merged_cells.ranges)
+    wb.close()
+
+    serial = app._excel_serial(DATE)
+    _material(app._paths["material_file"], serial)
+    app.sync_to_material("test-model")
+    assert ("牛腩", "肉类") in calls
+    assert ("牛腩", "蔬菜") not in calls
+    assert ("白菜", "蔬菜") in calls
+    booked = load_workbook(app._paths["material_file"])
+    assert _qty(booked["肉类采购"], "牛腩") == 2
+    assert _qty(booked["日物料采购"], "白菜") == 1
+    assert _qty(booked["日物料采购"], "牛腩") is None
+
+
+def test_meicai_confirm_requires_default_only_when_a_line_lacks_category(isolated):
+    app._state["invoices"] = [_meicai()]
+    with pytest.raises(HTTPException) as ei:
+        app.confirm("mix.png", app.ConfirmPayload(
+            date=DATE, category="",
+            items=[
+                {"品名": "牛腩", "数量": 1, "单价": 30, "金额": 30, "类别": "肉类"},
+                {"品名": "白菜", "数量": 1, "单价": 2, "金额": 2},
+            ],
+        ))
+    assert ei.value.status_code == 400
+    assert "不会默认写成蔬菜" in ei.value.detail
+    assert app._state["invoices"][0]["status"] == "pending"
+    assert not os.path.exists(os.path.join(app._paths["output_dir"], app.LAND_FILENAME))
+
+    app.confirm("mix.png", app.ConfirmPayload(
+        date=DATE, category="", paid_total=32,
+        items=[
+            {"品名": "牛腩", "数量": 1, "单价": 30, "金额": 30, "类别": "肉类"},
+            {"品名": "白菜", "数量": 1, "单价": 2, "金额": 2, "类别": "蔬菜"},
+        ],
+    ))
+    inv = app._state["invoices"][0]
+    assert inv["status"] == "confirmed"
+    assert inv["category"] == ""
+    assert [it["类别"] for it in inv["items"]] == ["肉类", "蔬菜"]
+    wb = load_workbook(os.path.join(app._paths["output_dir"], app.LAND_FILENAME))
+    ws = wb.active
+    assert [ws.cell(r, 2).value for r in range(2, 4)] == ["肉类", "蔬菜"]
+    wb.close()
+
+
+def test_handwriting_confirm_still_stamps_whole_invoice_category(isolated):
+    inv = _pending("hand.jpg")
+    inv["kind"] = "handwriting"
+    app._state["invoices"] = [inv]
+    result = app.confirm("hand.jpg", app.ConfirmPayload(
+        date=DATE, category="肉类", paid_total=80,
+        items=[
+            {"品名": "牛腩", "原品名": "牛腩", "数量": 2, "单价": 30, "金额": 60, "类别": "蔬菜"},
+            {"品名": "牛骨", "原品名": "牛骨", "数量": 1, "单价": 20, "金额": 20, "类别": "蔬菜"},
+        ],
+    ))
+    assert result == {"ok": True}
+    saved = app._state["invoices"][0]
+    assert saved["category"] == "肉类"
+    assert [it["类别"] for it in saved["items"]] == ["肉类", "肉类"]
+    wb = load_workbook(os.path.join(app._paths["output_dir"], app.LAND_FILENAME))
+    ws = wb.active
+    assert ws.cell(2, 2).value == "肉类"
+    assert ws.cell(3, 2).value in (None, "肉类")
+    assert any(mr.min_col == 2 and mr.max_row > mr.min_row for mr in ws.merged_cells.ranges)
+    wb.close()
+
+
+def test_hint_line_category_only_when_catalog_is_unique(monkeypatch):
+    monkeypatch.setattr(app, "_legal_names", {app.normalize_pin("白菜")})
+    monkeypatch.setattr(app, "_meat_names", {app.normalize_pin("牛腩")})
+    monkeypatch.setattr(app, "_name_map", {"蔬菜": {"青菜": "白菜"}, "肉类": {"牛腩块": "牛腩"}})
+    monkeypatch.setattr(app, "_code_map", {"蔬菜": {}, "肉类": {"吊龙": "M1"}})
+    assert app.hint_line_category("白菜") == "蔬菜"
+    assert app.hint_line_category("牛腩") == "肉类"
+    assert app.hint_line_category("青菜") == "蔬菜"
+    assert app.hint_line_category("吊龙") == "肉类"
+    assert app.hint_line_category("鱼腥草") == ""
+    assert app.hint_line_category("") == ""
+    monkeypatch.setattr(app, "_legal_names", {app.normalize_pin("牛腩")})
+    assert app.hint_line_category("牛腩") == ""
+
+
+def test_pack_meicai_prefills_line_category_without_guessing(monkeypatch):
+    monkeypatch.setattr(app, "_legal_names", {app.normalize_pin("白菜")})
+    monkeypatch.setattr(app, "_legal_name_list", [])
+    monkeypatch.setattr(app, "_meat_names", {app.normalize_pin("牛腩")})
+    monkeypatch.setattr(app, "_name_map", {"蔬菜": {}, "肉类": {}})
+    monkeypatch.setattr(app, "_code_map", {"蔬菜": {}, "肉类": {}})
+    monkeypatch.setattr(app, "_name_dict", {"蔬菜": {}, "肉类": {}})
+    packed = app._pack_meicai(
+        {"order_total": 11, "order_ids": [], "note": "", "meicai_suspects": []},
+        [
+            {"品名": "白菜", "数量": 1, "金额": 4, "类别": ""},
+            {"品名": "牛腩", "数量": 1, "金额": 6, "类别": "蔬菜"},
+            {"品名": "不知道", "数量": 1, "金额": 1},
+        ],
+        DATE,
+    )
+    assert [it["类别"] for it in packed["items"]] == ["蔬菜", "蔬菜", ""]
+
+
+def test_load_legal_names_reads_meat_sheet_for_hints(isolated):
+    saved = (
+        set(app._legal_names), list(app._legal_name_list), dict(app._legal_units),
+        dict(app._legal_codes), dict(app._hist_prices),
+        set(app._meat_names), list(app._meat_name_list), app._catalog_error,
+    )
+    try:
+        _material(app._paths["material_file"], app._excel_serial(DATE))
+        app.load_legal_names()
+        assert app.normalize_pin("白菜") in app._legal_names
+        assert app.normalize_pin("牛腩") in app._meat_names
+        assert app.normalize_pin("牛腩") not in app._legal_names
+        assert app.normalize_pin("白菜") not in app._meat_names
+        assert not app._catalog_error
+    finally:
+        app._legal_names, app._legal_name_list = saved[0], saved[1]
+        app._legal_units, app._legal_codes, app._hist_prices = saved[2], saved[3], saved[4]
+        app._meat_names, app._meat_name_list = saved[5], saved[6]
+        app._catalog_error = saved[7]

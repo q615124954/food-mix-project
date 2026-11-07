@@ -52,6 +52,9 @@ _legal_name_list = []
 _legal_units = {}
 # 合法品名 → 物料代码（日物料采购 B 列）。确认回流时跟别名一起记下。
 _legal_codes = {}
+# 肉类采购品名（归一化）。只给美菜行类别预填，不参与员工餐归属。
+_meat_names = set()
+_meat_name_list = []
 # 物料明细表这次没加载成功的说明；空字符串表示没配置或已加载。
 _catalog_error = ""
 # 品名各日期单价 {品名: {Excel日期序列号: 金额÷数量}}，来自物料表，用于数量/金额存疑判定
@@ -152,11 +155,14 @@ def load_legal_names():
     没有「日物料采购」或读不到品名：记下 _catalog_error，清空品名表，复核页直接显示。
     """
     global _legal_names, _legal_name_list, _legal_units, _hist_prices, _legal_codes, _catalog_error
+    global _meat_names, _meat_name_list
     _legal_names = set()
     _legal_name_list = []
     _legal_units = {}
     _hist_prices = {}
     _legal_codes = {}
+    _meat_names = set()
+    _meat_name_list = []
     _catalog_error = ""
     material = _paths.get("material_file", "") or ""
     if not material:
@@ -197,6 +203,7 @@ def load_legal_names():
                 hp = _row_day_prices(header, vals)
                 if hp:
                     _hist_prices[raw] = hp
+        _read_meat_catalog_names(wb)
         wb.close()
     except Exception:
         _legal_names = set()
@@ -204,6 +211,8 @@ def load_legal_names():
         _legal_units = {}
         _hist_prices = {}
         _legal_codes = {}
+        _meat_names = set()
+        _meat_name_list = []
         _catalog_error = (
             "物料明细表加载失败：文件已损坏或无法读取。"
             "已暂停按品名归员工餐，请检查物料明细表后重新应用路径。"
@@ -214,6 +223,73 @@ def load_legal_names():
             "物料明细表加载失败：没有读到品名。"
             "已暂停按品名归员工餐，请检查「日物料采购」后重新应用路径。"
         )
+
+
+def _read_meat_catalog_names(wb):
+    """读「肉类采购」品名，供美菜行类别预填。没有这张表或读失败就留空，不影响日物料。"""
+    global _meat_names, _meat_name_list
+    _meat_names = set()
+    _meat_name_list = []
+    if "肉类采购" not in getattr(wb, "sheetnames", []):
+        return
+    try:
+        mws = wb["肉类采购"]
+        for vals in mws.iter_rows(min_row=3, values_only=True):
+            v = vals[3] if vals and len(vals) > 3 else None
+            if v and str(v).strip():
+                raw = str(v).strip()
+                _meat_name_list.append(raw)
+                _meat_names.add(normalize_pin(raw))
+    except Exception:
+        _meat_names = set()
+        _meat_name_list = []
+
+
+def _table_has_name(table, norm):
+    if not isinstance(table, dict) or not norm:
+        return False
+    for key, val in table.items():
+        if norm == normalize_pin(key) or norm == normalize_pin(val):
+            return True
+    return False
+
+
+def hint_line_category(name):
+    """美菜行类别预填。只在日物料/肉类里恰好一边对上时返回，两边都有或都没有则留空。
+
+    对得上的来源：物料表品名、归并映射的别名或标准名、品名→物料代码的键。
+    不做模糊匹配，对不上就不猜。
+    """
+    norm = normalize_pin(name)
+    if not norm:
+        return ""
+    hits = set()
+    if norm in _legal_names:
+        hits.add("蔬菜")
+    if norm in _meat_names:
+        hits.add("肉类")
+    for cat in CATEGORY_SHEET:
+        if _table_has_name(_name_map.get(cat), norm):
+            hits.add(cat)
+        codes = _code_map.get(cat) if isinstance(_code_map, dict) else None
+        if isinstance(codes, dict) and any(normalize_pin(key) == norm for key in codes):
+            hits.add(cat)
+    if hits == {"蔬菜"}:
+        return "蔬菜"
+    if hits == {"肉类"}:
+        return "肉类"
+    return ""
+
+
+def _prefill_meicai_categories(items):
+    """已是蔬菜/肉类的保留。否则按物料表提示预填，不确定就留空。"""
+    for it in items or []:
+        current = str(it.get("类别") or "").strip()
+        if current in CATEGORY_SHEET:
+            it["类别"] = current
+            continue
+        it["类别"] = hint_line_category(it.get("品名"))
+    return items
 
 
 def catalog_status_messages():
@@ -816,6 +892,7 @@ def _pack_meicai(chosen, items, date):
     order_total = chosen.get("order_total")
     order_ids = list(chosen.get("order_ids") or [])
     note = chosen.get("note") or ""
+    _prefill_meicai_categories(items)
     correct_item_names(items)
     suspects = _meicai_review_suspects(date, items, order_total, chosen.get("meicai_suspects"))
     total = core.sum_amount(items)
@@ -1106,9 +1183,13 @@ def _num(v):
         return v
 
 
-def normalize_item(it, category=None):
-    """规范化明细。category 为确认时用户选择的类别。
-    未传入时保留明细上已有的类别；两边都没有则不填，不默认成蔬菜。"""
+def normalize_item(it, category=None, *, only_if_blank=False):
+    """规范化明细。
+
+    category 是确认时选用的类别。手写单传入整单类别，覆盖行上已有的类别。
+    only_if_blank=True（美菜）：行上已有蔬菜/肉类时保留，只有空着才用 category。
+    两边都没有则不填，不默认成蔬菜。
+    """
     out = {
         "品名": it.get("品名", ""),
         "原品名": it.get("原品名", ""),
@@ -1126,10 +1207,13 @@ def normalize_item(it, category=None):
         out["单位"] = str(it.get("单位"))
     if it.get("人工补录"):
         out["人工补录"] = True
-    if category not in (None, ""):
+    line = str(it.get("类别") or "").strip()
+    if only_if_blank and line in CATEGORY_SHEET:
+        cat = line
+    elif category not in (None, ""):
         cat = str(category).strip()
     else:
-        cat = str(it.get("类别") or "").strip()
+        cat = line
     if cat:
         out["类别"] = cat
     return out
@@ -1148,7 +1232,8 @@ def confirmed_categories():
 
 def resolve_sync_category(saved, land_cat):
     """同步用类别：优先确认时保存的类别；没有保存值时沿用落地表上的类别。
-    两边都没有时返回空串，调用方必须提示，不得默认成蔬菜。"""
+    两边都没有时返回空串，调用方必须提示，不得默认成蔬菜。
+    美菜按行落地时，调用方不传整单类别，以免盖掉行上的肉类/蔬菜。"""
     saved = str(saved or "").strip()
     if saved:
         return saved
@@ -1896,6 +1981,11 @@ def sync_to_material(model):
     # 用哨兵区分「还没读到任何单据」和「来源图片本身是空的」
     cur_src = object()
     saved_cats = confirmed_categories()
+    invoice_kinds = {
+        inv.get("filename"): str(inv.get("kind") or "")
+        for inv in _state.get("invoices", [])
+        if inv.get("filename")
+    }
     for r in lws.iter_rows(min_row=2, values_only=True):
         name = r[col["品名"]] if "品名" in col else None
         if name is None:
@@ -1920,7 +2010,12 @@ def sync_to_material(model):
         cat = r[col["类别"]] if "类别" in col else ""
         if cat:
             cur_cat = cat
-        cur_cat = resolve_sync_category(saved_cats.get(cur_src), cur_cat)
+        saved = saved_cats.get(cur_src)
+        if invoice_kinds.get(cur_src) == "meicai":
+            # 整单类别只是美菜空行的默认值。同步按落地表这一行的类别走，
+            # 不能因为单据标了蔬菜就把肉行改去日物料采购。
+            saved = None
+        cur_cat = resolve_sync_category(saved, cur_cat)
         qty = r[col["数量"]] if "数量" in col else None
         amt = r[col["金额"]] if "金额" in col else None
         price = r[col["单价"]] if "单价" in col else None
@@ -2233,7 +2328,11 @@ def sync_to_material(model):
 
 # ===== 落地写 xlsx =====
 def _merge_by_source(ws):
-    """按「来源图片」分组合并：日期/类别/合计/实付合计四列纵向合并并居中"""
+    """按「来源图片」分组合并：日期/合计/实付合计纵向合并并居中。
+
+    类别只在同一张单里都相同（或都空）时合并。美菜蔬菜肉类混开时按行保留，
+    避免合并单元格只留下首行类别。
+    """
     from openpyxl.styles import Alignment
     for mr in list(ws.merged_cells.ranges):
         ws.unmerge_cells(str(mr))
@@ -2255,7 +2354,14 @@ def _merge_by_source(ws):
         end = start
         while end + 1 <= ws.max_row and ws.cell(end + 1, img_col).value == key:
             end += 1
-        merge_cols = [date_col, cat_col, total_col] + ([paid_col] if paid_col else [])
+        distinct_cats = set()
+        for r in range(start, end + 1):
+            text = str(ws.cell(r, cat_col).value or "").strip()
+            if text:
+                distinct_cats.add(text)
+        merge_cols = [date_col, total_col] + ([paid_col] if paid_col else [])
+        if len(distinct_cats) <= 1:
+            merge_cols.append(cat_col)
         for col in merge_cols:
             if end > start:
                 ws.merge_cells(start_row=start, start_column=col, end_row=end, end_column=col)
@@ -2308,8 +2414,13 @@ def append_land(filename, date, category, total, paid_total, items, note=""):
         for it in items:
             if not _line_has_content(it):
                 continue
+            # 行上有蔬菜/肉类就写这一行；没有才用整单类别。
+            # 手写单确认时已经把整单类别写入每一行，落地表仍是整单一类。
+            row_cat = str(it.get("类别") or "").strip()
+            if row_cat not in CATEGORY_SHEET:
+                row_cat = category
             ws.append([
-                date, category, it.get("品名"), it.get("数量"),
+                date, row_cat, it.get("品名"), it.get("数量"),
                 it.get("单价"), it.get("金额"), filename, total, paid_total,
                 excel_attr(it),
                 bool(it.get("品名编辑")),
@@ -2418,6 +2529,15 @@ def _sync_meicai_after_confirm():
     }
 
 
+def _confirm_learn_category(it, category, kind):
+    """回流学习用的类别。美菜用该行类别，手写单用整单类别。"""
+    if kind == "meicai":
+        line = str(it.get("类别") or "").strip()
+        if line in CATEGORY_SHEET:
+            return line
+    return category
+
+
 def _mark_blank_date(filename):
     """确认时日期为空：标为存疑，保持未确认，不写落地表。"""
     for inv in _state["invoices"]:
@@ -2438,9 +2558,6 @@ def confirm(filename: str, payload: ConfirmPayload):
         _mark_blank_date(filename)
         raise HTTPException(400, "日期为空，请人工补填日期后再确认（本次未写入 Excel）")
     category = str(payload.category or "").strip()
-    if category not in CATEGORY_SHEET:
-        raise HTTPException(400, "请选择类别（蔬菜或肉类）后再确认；缺少类别时不会默认写成蔬菜")
-    items = [normalize_item(it, category) for it in payload.items]
     # 归属以确认时的最终品名重新判定（人工改过品名也生效）；员工区标记来自识别或人工补录
     note = ""
     kind = ""
@@ -2452,11 +2569,29 @@ def confirm(filename: str, payload: ConfirmPayload):
             kind = inv.get("kind") or ""
             break
     if kind == "meicai":
+        # 行上已有蔬菜/肉类就保留。空行才用整单类别当默认。
+        # 有内容的行最后都必须是蔬菜或肉类；因此只在还有空行时才要求整单类别。
+        default = category if category in CATEGORY_SHEET else None
+        items = [normalize_item(it, default, only_if_blank=True) for it in payload.items]
+        if any(
+            _line_has_content(it) and str(it.get("类别") or "") not in CATEGORY_SHEET
+            for it in items
+        ):
+            raise HTTPException(
+                400,
+                "有明细未选类别。请选择默认类别（蔬菜或肉类），或为每一行选择类别；缺少类别时不会默认写成蔬菜",
+            )
         for it in items:
             it["渠道"] = "美菜"
-    assign_attribution(items, category)
+    else:
+        if category not in CATEGORY_SHEET:
+            raise HTTPException(400, "请选择类别（蔬菜或肉类）后再确认；缺少类别时不会默认写成蔬菜")
+        items = [normalize_item(it, category) for it in payload.items]
+    assign_attribution(items, category if category in CATEGORY_SHEET else None)
     # 员工餐? 在落地前按同步置信度归物料。人工改过的名字、员工区和海底捞不会进这里。
-    promote_tentative_staff_items(items, category, "DeepSeek-V4-Pro")
+    # 美菜没给整单类别时不要调用：函数会把空类别当成蔬菜。
+    if category in CATEGORY_SHEET:
+        promote_tentative_staff_items(items, category, "DeepSeek-V4-Pro")
     order_total = None
     for inv in _state["invoices"]:
         if inv["filename"] == filename:
@@ -2474,18 +2609,23 @@ def confirm(filename: str, payload: ConfirmPayload):
         right_name = it.get("品名", "")
         if name_match.forbidden_auto_map(raw_name, right_name):
             continue
-        learn_name(category, raw_name, right_name)
-        remember_material_alias(category, raw_name, right_name)
+        learn_cat = _confirm_learn_category(it, category, kind)
+        if learn_cat not in CATEGORY_SHEET:
+            continue
+        learn_name(learn_cat, raw_name, right_name)
+        remember_material_alias(learn_cat, raw_name, right_name)
     # code_map 联动：本次确认的全部品名集合之外/品名被改动的旧映射条目失效，
     # 避免人工纠正品名后，旧的「旧品名→代码」映射继续误同步到新单据。
+    # 美菜按该行类别失效，避免肉行的改名清掉蔬菜映射。
     confirmed_names = {str(it.get("品名", "")).strip() for it in items}
-    code_map_cat = _code_map.setdefault(category, {})
     if any(it.get("品名编辑") for it in items):
         for it in items:
             if it.get("品名编辑"):
                 raw_old = str(it.get("原品名", "")).strip()
                 if raw_old and raw_old not in confirmed_names:
-                    code_map_cat.pop(raw_old, None)
+                    learn_cat = _confirm_learn_category(it, category, kind)
+                    if learn_cat in CATEGORY_SHEET:
+                        _code_map.setdefault(learn_cat, {}).pop(raw_old, None)
         save_code_map()
     # 合计 = 所有品名金额累加（不再区分员工餐/物料），所有明细行都落地
     total = core.sum_amount(items)
@@ -2500,7 +2640,7 @@ def confirm(filename: str, payload: ConfirmPayload):
             except Exception as e:
                 raise HTTPException(500, f"落地文件写入失败：{e}")
             inv["date"] = payload.date
-            inv["category"] = category
+            inv["category"] = category if category in CATEGORY_SHEET else ""
             inv["total"] = total
             inv["paid_total"] = paid
             inv["items"] = items

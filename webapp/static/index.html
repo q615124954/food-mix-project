@@ -118,7 +118,7 @@
       <button type="button" class="gray" id="btn-prev">上一张</button>
       <button type="button" class="gray" id="btn-next">下一张</button>
       <label>日期 <input type="date" id="fld-date"><span id="date-warn" class="field-warn" style="display:none" title="日期未识别">❗</span></label>
-      <label>类别 <select id="fld-category"><option value="">请选择</option><option value="蔬菜">蔬菜</option><option value="肉类">肉类</option></select><span id="category-warn" class="field-warn" style="display:none" title="该单据没有保存类别，请手动选择。不会默认成蔬菜。">❗</span></label>
+      <label><span id="category-label">类别</span> <select id="fld-category"><option value="">请选择</option><option value="蔬菜">蔬菜</option><option value="肉类">肉类</option></select><span id="category-warn" class="field-warn" style="display:none" title="该单据没有保存类别，请手动选择。不会默认成蔬菜。">❗</span></label>
       <button type="button" class="green" id="btn-confirm">确认落地</button>
       <button type="button" class="green" id="btn-sync">同步到物料明细</button>
       <button type="button" class="gray" id="btn-rescan">重新扫描</button>
@@ -132,7 +132,7 @@
         <div class="hint" id="tbl-note" style="display:none"></div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th style="width:32%">品名</th><th style="width:22%">数量</th><th style="width:22%">单价</th><th style="width:24%">金额</th></tr></thead>
+            <thead><tr id="item-head"><th style="width:32%">品名</th><th style="width:22%">数量</th><th style="width:22%">单价</th><th style="width:24%">金额</th></tr></thead>
             <tbody id="tbody"></tbody>
           </table>
         </div>
@@ -238,29 +238,89 @@ function renderList() {
   });
 }
 
+function lineCat(it) {
+  const c = String((it && it['类别']) || '').trim();
+  return (c === '蔬菜' || c === '肉类') ? c : '';
+}
+
+function lineHasContent(it) {
+  if (!it) return false;
+  if (String(it['品名'] || '').trim()) return true;
+  if (it['数量'] != null && it['数量'] !== '') return true;
+  return it['金额'] != null && it['金额'] !== '';
+}
+
+function meicaiLineNeedsCategory(inv) {
+  return (inv.items || []).some(it => lineHasContent(it) && !lineCat(it));
+}
+
+function categoryWarnVisible(inv, topCat) {
+  if (!inv) return !topCat;
+  if (inv.kind === 'meicai') return meicaiLineNeedsCategory(inv) && topCat !== '蔬菜' && topCat !== '肉类';
+  return !topCat;
+}
+
+function defaultCatOptionText() {
+  const v = document.getElementById('fld-category').value;
+  return (v === '蔬菜' || v === '肉类') ? ('默认（' + v + '）') : '默认';
+}
+
+function refreshCategoryWarn() {
+  const cw = document.getElementById('category-warn');
+  const inv = state.invoices[cur];
+  const top = document.getElementById('fld-category').value;
+  if (!cw) return;
+  cw.style.display = categoryWarnVisible(inv, top) ? 'inline' : 'none';
+  if (inv && inv.kind === 'meicai') {
+    cw.title = '有明细没选类别时，用这里的默认类别补上。不会默认成蔬菜。';
+  } else {
+    cw.title = '该单据没有保存类别，请手动选择。不会默认成蔬菜。';
+  }
+}
+
+const HAND_HEAD = '<th style="width:32%">品名</th><th style="width:22%">数量</th><th style="width:22%">单价</th><th style="width:24%">金额</th>';
+const MEICAI_HEAD = '<th style="width:28%">品名</th><th style="width:18%">类别</th><th style="width:18%">数量</th><th style="width:18%">单价</th><th style="width:18%">金额</th>';
+
 function renderCurrent() {
   if (cur < 0 || cur >= state.invoices.length) {
     document.getElementById('img-panel').innerHTML = '<div class="empty">暂无票据</div>';
     document.getElementById('tbody').innerHTML = '';
+    const head = document.getElementById('item-head');
+    if (head) head.innerHTML = HAND_HEAD;
+    const label = document.getElementById('category-label');
+    if (label) label.textContent = '类别';
     return;
   }
   const inv = state.invoices[cur];
+  const meicai = inv.kind === 'meicai';
   document.getElementById('fld-date').value = inv.date || '';
   const dw = document.getElementById('date-warn');
   if (dw) dw.style.display = inv.date ? 'none' : 'inline';
-  // 确认后用保存的类别；未确认时显示明细上识别出的类别。都没有则留空并提示，不默认蔬菜。
-  const itemCat = inv.items && inv.items[0] && inv.items[0]['类别'];
-  const rawCat = String(inv.category || itemCat || '').trim();
+  const label = document.getElementById('category-label');
+  if (label) label.textContent = meicai ? '默认类别' : '类别';
+  const panelBox = document.querySelector('.table-panel');
+  if (panelBox) panelBox.style.width = meicai ? '540px' : '';
+  const head = document.getElementById('item-head');
+  if (head) head.innerHTML = meicai ? MEICAI_HEAD : HAND_HEAD;
+  // 手写单：确认后用保存的类别；未确认时显示首行识别出的类别。都没有则留空，不默认蔬菜。
+  // 美菜：上方是空行的默认类别，不拿第一行当成整单类别。未确认且每一行都是同一类别时，显示那个类别。
+  let rawCat = String(inv.category || '').trim();
+  if (!meicai) {
+    const itemCat = inv.items && inv.items[0] && inv.items[0]['类别'];
+    rawCat = String(inv.category || itemCat || '').trim();
+  } else if (!rawCat && inv.status !== 'confirmed') {
+    const cats = (inv.items || []).map(lineCat).filter(Boolean);
+    const uniq = [...new Set(cats)];
+    if (uniq.length === 1 && cats.length === (inv.items || []).length && cats.length) rawCat = uniq[0];
+  }
   const catSel = document.getElementById('fld-category');
   catSel.value = rawCat;
   if (catSel.value !== rawCat) catSel.value = '';
-  const cw = document.getElementById('category-warn');
-  if (cw) cw.style.display = catSel.value ? 'none' : 'inline';
+  refreshCategoryWarn();
   syncDefaultPaid();
   const ocrRef = document.getElementById('ocr-total-ref');
   if (ocrRef) {
     const ot = inv.order_total;
-    const meicai = inv.kind === 'meicai';
     const filled = meicai ? `（结算后合计 ¥${ot}，仅供参考）` : `（OCR 认出合计 ¥${ot}，仅供参考）`;
     const empty = meicai ? '（未认出结算后合计）' : '（OCR 未认出合计）';
     ocrRef.textContent = (ot != null && ot !== '') ? filled : empty;
@@ -288,7 +348,8 @@ function renderCurrent() {
     else if (inv.error) msg = inv.error;
     else if (inv.ocr_done) msg = '未识别到内容';
     else msg = '识别中…';
-    tb.innerHTML = `<tr><td colspan="4" class="empty" style="text-align:center">${msg}</td></tr>`;
+    const cols = meicai ? 5 : 4;
+    tb.innerHTML = `<tr><td colspan="${cols}" class="empty" style="text-align:center">${msg}</td></tr>`;
     return;
   }
   inv.items.forEach((it, idx) => {
@@ -296,8 +357,16 @@ function renderCurrent() {
     const warn = (flag, tip) => flag ? `<span class="field-warn" title="${tip}">❗</span>` : '';
     const staffTag = it['归属'] === '员工餐'
       ? `<span class="tag-staff${it['归属待确认'] ? ' confirm' : ''}" title="${esc((it['归属依据'] || '员工餐') + (it['归属待确认'] ? '，请人工确认' : ''))}">员工餐${it['归属待确认'] ? '?' : ''}</span>` : '';
+    if (meicai) it['类别'] = lineCat(it);
+    const catCell = meicai ? `
+      <td><select data-k="类别" data-row="${idx}" title="空着则用上方默认类别">
+        <option value=""${it['类别'] ? '' : ' selected'}>${esc(defaultCatOptionText())}</option>
+        <option value="蔬菜"${it['类别'] === '蔬菜' ? ' selected' : ''}>蔬菜</option>
+        <option value="肉类"${it['类别'] === '肉类' ? ' selected' : ''}>肉类</option>
+      </select></td>` : '';
     tr.innerHTML = `
       <td><div class="cell"><input data-k="品名" data-row="${idx}" value="${esc(it['品名'] || '')}">${staffTag}${warn(it['品名存疑'], it['建议品名'] ? esc('建议改为：' + it['建议品名'] + '（请人工确认）') : '品名可能不准确')}</div></td>
+      ${catCell}
       <td><div class="cell"><input data-k="数量" data-row="${idx}" data-trigger="true" value="${esc(it['数量'] != null ? it['数量'] : '')}">${warn(it['数量存疑'], esc(it['存疑说明'] || '数量缺失或为0'))}</div></td>
       <td><div class="cell"><input data-k="单价" data-row="${idx}" value="${esc(it['单价'] != null ? it['单价'] : '')}"></div></td>
       <td><div class="cell"><input data-k="金额" data-row="${idx}" data-trigger="true" value="${esc(it['金额'] != null ? it['金额'] : '')}">${warn(it['金额存疑'], esc(it['存疑说明'] || '金额缺失'))}</div></td>`;
@@ -310,6 +379,14 @@ function renderCurrent() {
         else if (inp.dataset.k === '单价') inv.items[row]['单价'] = toNum(inp.value);
         else if (inp.dataset.k === '金额') inv.items[row]['金额'] = toNum(inp.value);
         if (inp.dataset.trigger) recompute(row);
+        if (meicai) refreshCategoryWarn();
+      });
+    });
+    tr.querySelectorAll('select').forEach(sel => {
+      sel.addEventListener('change', () => {
+        dirty = true;
+        inv.items[+sel.dataset.row]['类别'] = sel.value;
+        refreshCategoryWarn();
       });
     });
     tb.appendChild(tr);
@@ -319,8 +396,15 @@ function renderCurrent() {
 document.getElementById('fld-date').addEventListener('input', () => { dirty = true; });
 document.getElementById('fld-category').addEventListener('change', () => {
   dirty = true;
-  const cw = document.getElementById('category-warn');
-  if (cw) cw.style.display = document.getElementById('fld-category').value ? 'none' : 'inline';
+  const sel = document.getElementById('fld-category');
+  const inv = state.invoices[cur];
+  // 美菜上方只是空行的默认，不改已经选过的行类别。
+  if (inv && inv.kind === 'meicai') inv.category = sel.value;
+  refreshCategoryWarn();
+  const label = defaultCatOptionText();
+  document.querySelectorAll('#tbody select[data-k="类别"] option[value=""]').forEach(op => {
+    op.textContent = label;
+  });
 });
 document.getElementById('fld-paid').addEventListener('input', () => { dirty = true; paidDirty = true; updatePaidHint(); });
 
@@ -454,7 +538,13 @@ async function submitConfirm() {
   const inv = state.invoices[cur];
   if (!inv) return;
   const category = document.getElementById('fld-category').value;
-  if (!category) {
+  const meicai = inv.kind === 'meicai';
+  if (meicai) {
+    if (meicaiLineNeedsCategory(inv) && category !== '蔬菜' && category !== '肉类') {
+      toast('有明细未选类别。请选择默认类别，或为每一行选择蔬菜/肉类（不会默认成蔬菜）', true);
+      return;
+    }
+  } else if (!category) {
     toast('请先选择类别（不会默认成蔬菜）', true);
     return;
   }
@@ -462,7 +552,11 @@ async function submitConfirm() {
     date: document.getElementById('fld-date').value.trim(),
     category: category,
     paid_total: paidValue(),
-    items: inv.items.map(it => ({ '品名': it['品名'], '原品名': it['原品名'], '品名编辑': it['品名编辑'], '数量': it['数量'], '单价': it['单价'], '金额': it['金额'], '员工区': !!it['员工区'], '人工补录': !!it['人工补录'], '渠道': it['渠道'] || '', '订单号': it['订单号'] || '', '单位': it['单位'] || '' }))
+    items: inv.items.map(it => {
+      const row = { '品名': it['品名'], '原品名': it['原品名'], '品名编辑': it['品名编辑'], '数量': it['数量'], '单价': it['单价'], '金额': it['金额'], '员工区': !!it['员工区'], '人工补录': !!it['人工补录'], '渠道': it['渠道'] || '', '订单号': it['订单号'] || '', '单位': it['单位'] || '' };
+      if (meicai) row['类别'] = lineCat(it);
+      return row;
+    })
   };
   try {
     const r = await fetch(`/api/invoice/${encodeURIComponent(inv.filename)}/confirm`, {
