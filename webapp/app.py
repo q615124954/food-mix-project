@@ -2,7 +2,8 @@
 """
 采购单审核工作台后端
 手写单：扫描文件夹 → HunyuanOCR → 解析 → 网页复核 → 确认后落地 xlsx
-美菜电子小票：同一套复核页，识别改走视觉模型（默认 Qwen3.5-Flash）→ 确认后同步日物料
+美菜电子小票：同一套复核页，识别改走视觉模型（默认 Qwen3.5-Flash）→ 确认只记账
+物料明细由「同步到物料明细」按全部已确认单据一次性汇总写入
 复用 pipeline_min 的解析/单价推导/日期提取，以及 sync_to_material
 """
 import os
@@ -1925,8 +1926,85 @@ def _restore_material_backup(backup, material):
         shutil.copy2(backup, material)
 
 
+def _confirmed_invoices():
+    """状态里已确认、且日期可落地的单据。未确认不在这里。"""
+    found = []
+    for inv in _state.get("invoices") or []:
+        filename = inv.get("filename")
+        if not filename or inv.get("status") != "confirmed":
+            continue
+        if not _land_date_text(inv.get("date")):
+            continue
+        found.append(inv)
+    return found
+
+
+def _unconfirmed_filenames():
+    """明确还没确认的文件名。空状态、或旧单没写 status 时返回空集，落地表原样参与同步。"""
+    blocked = {"pending", "merged"}
+    return {
+        inv.get("filename")
+        for inv in (_state.get("invoices") or [])
+        if inv.get("filename") and inv.get("status") in blocked
+    }
+
+
+def _land_filenames():
+    """落地表里已有的来源图片。文件不存在时返回 None。"""
+    land = land_file()
+    if not land or not os.path.exists(land):
+        return None
+    from openpyxl import load_workbook
+    wb = load_workbook(land, read_only=True, data_only=True)
+    try:
+        ws = wb["已落地"] if "已落地" in wb.sheetnames else wb.active
+        header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
+        names = [str(h).strip() if h else "" for h in header]
+        try:
+            idx = names.index("来源图片")
+        except ValueError:
+            return set()
+        found = set()
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if idx < len(row) and row[idx]:
+                found.add(row[idx])
+        return found
+    finally:
+        wb.close()
+
+
+def _fill_missing_confirmed_into_land():
+    """把已确认、但当前落地表里没有的单据按状态补回去。
+
+    确认只写落地表，不写物料。同步成功后会删掉这张中间表，已确认明细仍留在状态里。
+    下次同步先补全已确认集合再按日期+物料汇总，避免只剩最后一张单把前单盖掉。
+    已经在表里的单据不重写，免得盖掉落地表上的类别。状态里没有任何单据时不动落地表。
+    """
+    if not (_state.get("invoices") or []):
+        return
+    confirmed = _confirmed_invoices()
+    present = _land_filenames()
+    if present is None:
+        missing = confirmed
+    else:
+        missing = [inv for inv in confirmed if inv["filename"] not in present]
+    for inv in missing:
+        append_land(
+            inv["filename"],
+            _land_date_text(inv.get("date")),
+            str(inv.get("category") or ""),
+            inv.get("total"),
+            inv.get("paid_total"),
+            list(inv.get("items") or []),
+            note=str(inv.get("note") or ""),
+        )
+
+
 def _delete_finance_intermediate():
-    """物料明细已经写完并且回读通过之后，删掉财务目录下的落地表。删不掉要报错，不能当成成功。"""
+    """物料明细已经写完并且回读通过之后，删掉财务目录下的落地表。删不掉要报错，不能当成成功。
+
+    已确认明细留在状态里。下次同步会按已确认集合把落地表补全后再汇总。
+    """
     path = land_file()
     if not path or not os.path.exists(path):
         return
@@ -1949,13 +2027,17 @@ def _row_amount(row):
 
 
 def sync_to_material(model):
-    """把落地表数据同步到物料明细表（写前自动备份，只写数量+金额，单价/合计靠公式）。
+    """把已确认单据同步到物料明细表（写前自动备份，只写数量+金额，单价/合计靠公式）。
 
     同一天同一物料若出现在多张已确认单据中，数量和金额先按日期+物料汇总再写入。
-    写入的是落地表全部已确认单据的合计，不在单元格旧值上累加，因此重复同步幂等。
+    写入的是全部已确认单据的合计，不在单元格旧值上累加，因此重复同步幂等。
+    未确认的单据不参与。确认本身不写物料明细。
     """
+    _fill_missing_confirmed_into_land()
     land = land_file()
     if not os.path.exists(land):
+        if _state.get("invoices") and not _confirmed_invoices():
+            raise HTTPException(400, "没有已确认的单据，未写入物料明细")
         raise HTTPException(400, f"落地表不存在：{land}")
     material = _paths.get("material_file", "")
     if not material or not os.path.exists(material):
@@ -1980,6 +2062,8 @@ def sync_to_material(model):
     cur_paid = ""
     # 用哨兵区分「还没读到任何单据」和「来源图片本身是空的」
     cur_src = object()
+    cur_skip = False
+    pending_files = _unconfirmed_filenames()
     saved_cats = confirmed_categories()
     invoice_kinds = {
         inv.get("filename"): str(inv.get("kind") or "")
@@ -2003,10 +2087,13 @@ def sync_to_material(model):
             # 合计/实付也只认本单自己的值：本单没填实付时不能沿用上一张单的实付
             cur_total = ""
             cur_paid = ""
+            cur_skip = src in pending_files
         else:
             own_date = _land_date_text(date)
             if own_date:
                 cur_date = own_date
+        if cur_skip:
+            continue
         cat = r[col["类别"]] if "类别" in col else ""
         if cat:
             cur_cat = cat
@@ -2042,6 +2129,8 @@ def sync_to_material(model):
                      "name_edited": name_edited, "staff_zone": staff_zone})
     lwb.close()
     if not rows:
+        if _state.get("invoices") and not _confirmed_invoices():
+            raise HTTPException(400, "没有已确认的单据，未写入物料明细")
         raise HTTPException(400, "落地表没有可同步的数据")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2496,39 +2585,6 @@ def get_image(filename: str):
     return FileResponse(p)
 
 
-def _sync_meicai_after_confirm():
-    """美菜确认后把落地表同步进日物料。
-
-    sync_to_material 成功后会删掉财务中间表。没配物料表、或同步失败时留下中间表，
-    确认状态已经写下，页面上的「同步到物料明细」可以再试。手写单不走这里。
-    """
-    material = str(_paths.get("material_file") or "").strip()
-    if not material or not os.path.exists(material):
-        return {
-            "synced": False,
-            "reason": "未配置可用的物料明细表，美菜已确认。配置后点「同步到物料明细」写入日物料",
-        }
-    try:
-        results, backup = sync_to_material("DeepSeek-V4-Pro")
-    except HTTPException as exc:
-        detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
-        return {"synced": False, "reason": detail}
-    except PermissionError:
-        return {
-            "synced": False,
-            "reason": "物料明细表被占用，请关闭 WPS/Excel 后点「同步到物料明细」",
-        }
-    except Exception as exc:
-        return {"synced": False, "reason": "同步日物料失败：%s" % exc}
-    return {
-        "synced": True,
-        "reason": "",
-        "count": len(results),
-        "backup": backup,
-        "results": results,
-    }
-
-
 def _confirm_learn_category(it, category, kind):
     """回流学习用的类别。美菜用该行类别，手写单用整单类别。"""
     if kind == "meicai":
@@ -2648,10 +2704,8 @@ def confirm(filename: str, payload: ConfirmPayload):
             inv["suspects"] = [paid_suspect] if paid_suspect else []
             inv["status"] = "confirmed"
             save_state()
-            body = {"ok": True}
-            if kind == "meicai":
-                body["material_sync"] = _sync_meicai_after_confirm()
-            return body
+            # 确认只记账。物料明细等用户点「同步到物料明细」，按全部已确认单据汇总。
+            return {"ok": True}
     raise HTTPException(404, "未找到该票据")
 
 

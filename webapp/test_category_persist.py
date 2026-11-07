@@ -314,8 +314,10 @@ def test_frontend_does_not_default_category_to_vegetable():
     assert '|| "蔬菜"' not in html
     assert "请先选择类别（不会默认成蔬菜）" in html
     assert "不会默认成蔬菜" in html
-    # 美菜按行选类别，按钮仍是「确认并同步」；手写单仍要求整单类别。
-    assert "inv.kind === 'meicai' ? '确认并同步' : '确认落地'" in html
+    # 美菜确认只记账；物料明细走单独的「同步到物料明细」。手写单仍要求整单类别。
+    assert "inv.kind === 'meicai' ? '确认' : '确认落地'" in html
+    assert "确认并同步" not in html
+    assert "同步到物料明细" in html
     assert 'data-k="类别"' in html
     assert "默认类别" in html
     assert "有明细未选类别。请选择默认类别，或为每一行选择蔬菜/肉类（不会默认成蔬菜）" in html
@@ -345,8 +347,8 @@ def test_meicai_confirm_lands_each_line_category_and_does_not_restamp_meat(isola
             {"品名": "土豆", "数量": 1, "单价": 5, "金额": 5, "类别": "", "渠道": "美菜"},
         ],
     ))
-    assert result["ok"] is True
-    assert "material_sync" in result
+    assert result == {"ok": True}
+    assert "material_sync" not in result
 
     inv = app._state["invoices"][0]
     assert inv["status"] == "confirmed"
@@ -462,6 +464,110 @@ def test_pack_meicai_prefills_line_category_without_guessing(monkeypatch):
         DATE,
     )
     assert [it["类别"] for it in packed["items"]] == ["蔬菜", "蔬菜", ""]
+
+
+def _qty_amt(ws, name):
+    for r in range(3, ws.max_row + 1):
+        if ws.cell(r, 4).value == name:
+            return ws.cell(r, 6).value, ws.cell(r, 8).value
+    return None, None
+
+
+def _seed_mixed_material(path):
+    """香菜、鱼腥草、鲜牛腩都预填 99/999，用来区分「确认没写物料」和「同步覆盖成合计」。"""
+    serial = app._excel_serial(DATE)
+    wb = Workbook()
+    meat = wb.active
+    meat.title = "肉类采购"
+    _sheet(meat, serial, [("M-BEEF", "鲜牛腩")])
+    meat.cell(3, 6, 99)
+    meat.cell(3, 8, 999)
+    veg = wb.create_sheet("日物料采购")
+    _sheet(veg, serial, [("V-CIL", "香菜"), ("V-HOUT", "鱼腥草")])
+    veg.cell(3, 6, 99)
+    veg.cell(3, 8, 999)
+    veg.cell(4, 6, 99)
+    veg.cell(4, 8, 999)
+    wb.save(path)
+
+
+def _mix_payload(items, paid):
+    return app.ConfirmPayload(date=DATE, category="蔬菜", paid_total=paid, items=items)
+
+
+def test_confirm_does_not_write_material_and_sync_skips_unconfirmed(isolated):
+    """未确认的单即使落地表里有行，同步也不进物料。确认本身不改物料表。"""
+    _seed_mixed_material(app._paths["material_file"])
+    app._state["invoices"] = [_meicai("a.png"), _meicai("b.png")]
+    app.confirm("a.png", _mix_payload([
+        {"品名": "香菜", "数量": 1, "单价": 10, "金额": 10, "类别": "蔬菜"},
+        {"品名": "鲜牛腩", "数量": 2, "单价": 30, "金额": 60, "类别": "肉类"},
+    ], 70))
+    booked = load_workbook(app._paths["material_file"])
+    assert _qty_amt(booked["肉类采购"], "鲜牛腩") == (99, 999)
+    assert _qty_amt(booked["日物料采购"], "香菜") == (99, 999)
+    booked.close()
+
+    app.append_land("b.png", DATE, "肉类", 270, 270, [
+        {"品名": "鲜牛腩", "数量": 9, "单价": 30, "金额": 270, "类别": "肉类"},
+        {"品名": "鱼腥草", "数量": 3, "单价": 5, "金额": 15, "类别": "蔬菜"},
+    ])
+    app.sync_to_material("test-model")
+    booked = load_workbook(app._paths["material_file"])
+    assert _qty_amt(booked["肉类采购"], "鲜牛腩") == (2, 60)
+    assert _qty_amt(booked["日物料采购"], "香菜") == (1, 10)
+    assert _qty_amt(booked["日物料采购"], "鱼腥草") == (99, 999)
+    assert _qty_amt(booked["日物料采购"], "鲜牛腩") == (None, None)
+    assert _qty_amt(booked["肉类采购"], "香菜") == (None, None)
+    booked.close()
+
+
+def test_same_day_two_meicai_confirms_then_one_sync_sums_each_line(isolated):
+    """同日两张混装先后确认，再点一次同步：鲜牛腩 3/90，菜各算各的。再同步、再确认都不翻倍、不丢前单。"""
+    _seed_mixed_material(app._paths["material_file"])
+    app._state["invoices"] = [_meicai("a.png"), _meicai("b.png")]
+    app.confirm("a.png", _mix_payload([
+        {"品名": "香菜", "数量": 1, "单价": 10, "金额": 10, "类别": "蔬菜"},
+        {"品名": "鲜牛腩", "数量": 2, "单价": 30, "金额": 60, "类别": "肉类"},
+    ], 70))
+    app.confirm("b.png", _mix_payload([
+        {"品名": "鱼腥草", "数量": 3, "单价": 5, "金额": 15, "类别": "蔬菜"},
+        {"品名": "鲜牛腩", "数量": 1, "单价": 30, "金额": 30, "类别": "肉类"},
+    ], 45))
+    # 两张都已确认，但还没点同步
+    booked = load_workbook(app._paths["material_file"])
+    assert _qty_amt(booked["肉类采购"], "鲜牛腩") == (99, 999)
+    booked.close()
+
+    app.sync_to_material("test-model")
+    booked = load_workbook(app._paths["material_file"])
+    assert _qty_amt(booked["肉类采购"], "鲜牛腩") == (3, 90)
+    assert _qty_amt(booked["日物料采购"], "香菜") == (1, 10)
+    assert _qty_amt(booked["日物料采购"], "鱼腥草") == (3, 15)
+    assert _qty_amt(booked["日物料采购"], "鲜牛腩") == (None, None)
+    assert _qty_amt(booked["肉类采购"], "香菜") == (None, None)
+    assert _qty_amt(booked["肉类采购"], "鱼腥草") == (None, None)
+    booked.close()
+    assert not os.path.exists(app.land_file())
+
+    # 中间表已删，再同步仍按状态里的已确认集合重算，不能变成空，也不能翻倍
+    app.sync_to_material("test-model")
+    booked = load_workbook(app._paths["material_file"])
+    assert _qty_amt(booked["肉类采购"], "鲜牛腩") == (3, 90)
+    assert _qty_amt(booked["日物料采购"], "香菜") == (1, 10)
+    assert _qty_amt(booked["日物料采购"], "鱼腥草") == (3, 15)
+    booked.close()
+
+    app.confirm("a.png", _mix_payload([
+        {"品名": "香菜", "数量": 1, "单价": 10, "金额": 10, "类别": "蔬菜"},
+        {"品名": "鲜牛腩", "数量": 2, "单价": 30, "金额": 60, "类别": "肉类"},
+    ], 70))
+    app.sync_to_material("test-model")
+    booked = load_workbook(app._paths["material_file"])
+    assert _qty_amt(booked["肉类采购"], "鲜牛腩") == (3, 90)
+    assert _qty_amt(booked["日物料采购"], "香菜") == (1, 10)
+    assert _qty_amt(booked["日物料采购"], "鱼腥草") == (3, 15)
+    booked.close()
 
 
 def test_load_legal_names_reads_meat_sheet_for_hints(isolated):

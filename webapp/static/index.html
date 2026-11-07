@@ -335,7 +335,7 @@ function renderCurrent() {
   }
   const confirmBtn = document.getElementById('btn-confirm');
   confirmBtn.disabled = !inv.ocr_done || inv.status === 'merged';
-  confirmBtn.textContent = inv.kind === 'meicai' ? '确认并同步' : '确认落地';
+  confirmBtn.textContent = inv.kind === 'meicai' ? '确认' : '确认落地';
 
   const panel = document.getElementById('img-panel');
   panel.innerHTML = `<img src="/images/${encodeURIComponent(inv.filename)}" onclick="this.style.cursor='zoom-out';this.style.maxWidth='none';this.style.maxHeight='none'" title="点击放大/还原">`;
@@ -566,15 +566,7 @@ async function submitConfirm() {
     if (r.ok) {
       dirty = false;
       paidDirty = false;
-      const sync = data.material_sync;
-      if (sync && sync.synced) {
-        renderSyncResult(sync);
-        toast('已确认并同步到日物料');
-      } else if (sync) {
-        toast(sync.reason || '已确认，尚未写入日物料', true);
-      } else {
-        toast('已落地');
-      }
+      toast(inv.kind === 'meicai' ? '已确认' : '已落地');
       await refresh();
     }
     else { toast('落地失败：' + (data.detail || '未知错误'), true); }

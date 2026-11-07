@@ -318,26 +318,26 @@ class ConfirmSyncTests(unittest.TestCase):
         self.assertTrue(os.path.exists(webapp.land_file()))
         self.assertEqual(webapp._state["invoices"][0]["status"], "confirmed")
 
-    def test_meicai_confirm_syncs_and_drops_land_file(self):
+    def test_meicai_confirm_does_not_sync_or_touch_material(self):
         material = os.path.join(self.tmp.name, "material.xlsx")
         with open(material, "wb") as handle:
             handle.write(b"placeholder")
         webapp._paths["material_file"] = material
         webapp._state["invoices"] = [self._invoice("meicai.png", "meicai")]
         result = webapp.confirm("meicai.png", self._payload())
-        self.assertTrue(result["ok"])
-        self.assertEqual(self.sync_calls, ["DeepSeek-V4-Pro"])
-        self.assertTrue(result["material_sync"]["synced"])
-        self.assertEqual(result["material_sync"]["count"], 1)
-        self.assertFalse(os.path.exists(webapp.land_file()))
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(self.sync_calls, [])
+        self.assertNotIn("material_sync", result)
+        self.assertTrue(os.path.exists(webapp.land_file()))
         self.assertEqual(webapp._state["invoices"][0]["status"], "confirmed")
+        with open(material, "rb") as handle:
+            self.assertEqual(handle.read(), b"placeholder")
 
     def test_meicai_without_material_keeps_land_file(self):
         webapp._state["invoices"] = [self._invoice("meicai.png", "meicai")]
         result = webapp.confirm("meicai.png", self._payload())
-        self.assertTrue(result["ok"])
-        self.assertFalse(result["material_sync"]["synced"])
-        self.assertIn("物料明细表", result["material_sync"]["reason"])
+        self.assertEqual(result, {"ok": True})
+        self.assertNotIn("material_sync", result)
         self.assertEqual(self.sync_calls, [])
         self.assertTrue(os.path.exists(webapp.land_file()))
         self.assertEqual(webapp._state["invoices"][0]["status"], "confirmed")
