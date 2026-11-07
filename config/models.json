@@ -1,0 +1,6 @@
+{
+  "vision_model": "Qwen3.5-Flash",
+  "api_base": "https://ai.gitee.com/v1",
+  "map_confidence": 0.8,
+  "temperature": 0
+}

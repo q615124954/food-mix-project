@@ -1,0 +1,12 @@
+{
+  "name_column": 4,
+  "unit_column": 5,
+  "code_column": 2,
+  "amount_column_offset": 2,
+  "category_sheets": {
+    "蔬菜": "日物料采购",
+    "肉类": "肉类采购"
+  },
+  "writable_sheets": ["日物料采购", "肉类采购"],
+  "never_write_sheets": ["员工餐"]
+}

@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+webapp/state.json
+webapp/settings.json
+webapp/aliases.local.json
+*.bak_*
+.DS_Store
+.idea/
+.vscode/
+.pytest_cache/

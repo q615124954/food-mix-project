@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>电子账单入账</title>
+<style>
+  :root {
+    --bg: #f3f1ea;
+    --ink: #1f2933;
+    --muted: #5c6b73;
+    --line: #ddd6c8;
+    --panel: #fffdf8;
+    --green: #1f7a4d;
+    --green-dark: #155c39;
+    --amber: #a15c07;
+    --red: #9f2d2d;
+    --blue: #1d4e89;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    height: 100vh;
+    display: flex;
+    color: var(--ink);
+    background: var(--bg);
+    font-family: "Source Han Sans SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+  }
+  button, input, select { font: inherit; }
+  button { cursor: pointer; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .side {
+    width: 320px;
+    flex: none;
+    background: var(--panel);
+    border-right: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .side header, .paths, .progress { padding: 14px 16px; border-bottom: 1px solid var(--line); }
+  .side h1 { margin: 0 0 4px; font-size: 18px; }
+  .side p, .hint, .meta { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+  .paths label { display: block; margin: 8px 0 4px; font-size: 12px; color: var(--muted); }
+  .paths input { width: 100%; padding: 7px 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+  .paths button, .toolbar button, .sync-head button {
+    border: 0;
+    border-radius: 6px;
+    padding: 7px 12px;
+    background: var(--green);
+    color: white;
+  }
+  .paths button { width: 100%; margin-top: 10px; }
+  .progress { display: flex; justify-content: space-between; font-size: 12px; }
+  .list { overflow: auto; flex: 1; }
+  .item { padding: 10px 16px; border-bottom: 1px solid #eee6d8; cursor: pointer; }
+  .item.active { background: #e7f3ec; }
+  .item .name { font-size: 13px; word-break: break-all; }
+  .item .meta { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
+  .badge { font-size: 11px; color: white; border-radius: 99px; padding: 1px 7px; }
+  .b-pending { background: #8a8175; }
+  .b-recognized { background: var(--blue); }
+  .b-confirmed { background: var(--green); }
+  .b-error { background: var(--red); }
+  main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .toolbar {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+    padding: 10px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  .toolbar button.secondary { background: #5c6b73; }
+  .toolbar button.warn { background: var(--amber); }
+  .toolbar label { font-size: 13px; display: flex; gap: 6px; align-items: center; }
+  .toolbar input[type="date"] { padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; }
+  .banner {
+    display: none;
+    margin: 0;
+    padding: 8px 14px;
+    background: #fde8e8;
+    color: var(--red);
+    font-size: 13px;
+  }
+  .work { flex: 1; min-height: 0; display: flex; }
+  .picture {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    background: #e7e2d6;
+  }
+  .picture img { max-width: 100%; max-height: 100%; object-fit: contain; background: white; box-shadow: 0 8px 24px rgba(0,0,0,.12); }
+  .editor {
+    width: 560px;
+    max-width: 52vw;
+    background: var(--panel);
+    border-left: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .editor h2 { margin: 0; padding: 12px 14px 0; font-size: 15px; }
+  .editor .hint { padding: 6px 14px 10px; }
+  .table-wrap { overflow: auto; flex: 1; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { border-bottom: 1px solid #eee6d8; padding: 6px; text-align: left; vertical-align: top; }
+  th { position: sticky; top: 0; background: #f7f3ea; font-weight: 600; }
+  td input, td select { width: 100%; border: 1px solid transparent; background: transparent; padding: 4px; border-radius: 4px; }
+  td input:focus, td select:focus { outline: 2px solid #b7d7c4; border-color: var(--green); background: white; }
+  .raw { color: var(--muted); font-size: 12px; }
+  .reason { color: var(--amber); font-size: 12px; margin-top: 3px; }
+  .reason.bad { color: var(--red); }
+  .reason.ok { color: var(--green-dark); }
+  .empty { color: var(--muted); padding: 28px 16px; }
+  .toast {
+    position: fixed;
+    left: 50%;
+    bottom: 24px;
+    transform: translateX(-50%);
+    background: #1f2933;
+    color: white;
+    padding: 10px 14px;
+    border-radius: 8px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .2s;
+    max-width: min(560px, 90vw);
+  }
+  .toast.show { opacity: 1; }
+  .drawer {
+    display: none;
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    width: min(640px, calc(100vw - 32px));
+    max-height: 60vh;
+    background: white;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: 0 12px 40px rgba(0,0,0,.16);
+    flex-direction: column;
+  }
+  .drawer.show { display: flex; }
+  .sync-head, .sync-note { padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  .sync-head { display: flex; justify-content: space-between; align-items: center; font-weight: 600; }
+  .drawer .body { overflow: auto; }
+  .tag-skip { color: var(--red); }
+  .tag-write { color: var(--green-dark); }
+  @media (max-width: 960px) {
+    body { flex-direction: column; height: auto; }
+    .side { width: auto; max-height: 42vh; }
+    .work { flex-direction: column; }
+    .editor { width: auto; max-width: none; }
+    .picture { min-height: 240px; }
+  }
+</style>
+</head>
+<body>
+  <aside class="side">
+    <header>
+      <h1>电子账单入账</h1>
+      <p>视觉识别后按行复核。确认只锁定，同步才写入物料表。一期不写员工餐。</p>
+    </header>
+    <div class="paths">
+      <label>电子单目录</label>
+      <input id="input-dir" placeholder="放美菜等电子单截图的文件夹">
+      <label>物料明细表 .xlsx</label>
+      <input id="material-file" placeholder="含「日物料采购」「肉类采购」的表">
+      <button id="apply-scan" type="button">扫描目录</button>
+    </div>
+    <div class="progress"><span>进度</span><span id="summary">尚未扫描</span></div>
+    <div class="list" id="list"></div>
+  </aside>
+  <main>
+    <div class="toolbar">
+      <button id="recognize" class="secondary" type="button">识别当前</button>
+      <button id="recognize-all" class="secondary" type="button">识别未确认</button>
+      <label>日期 <input id="bill-date" type="date"></label>
+      <button id="save" class="secondary" type="button">保存修改</button>
+      <button id="remap" class="secondary" type="button">重新匹配</button>
+      <button id="confirm" type="button">确认（不写表）</button>
+      <button id="unconfirm" class="warn" type="button">取消确认</button>
+      <button id="add-line" class="secondary" type="button">补一行</button>
+      <button id="sync" type="button">同步到物料明细</button>
+    </div>
+    <div id="banner" class="banner"></div>
+    <div class="work">
+      <div class="picture" id="picture"><div class="empty">选择一张电子单</div></div>
+      <section class="editor">
+        <h2 id="title">明细</h2>
+        <p class="hint" id="note">每一行单独选蔬菜或肉类。找不到的品名、对不上的单位会在同步时跳过。</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>票面</th>
+                <th>物料品名</th>
+                <th>数量</th>
+                <th>单位</th>
+                <th>金额</th>
+                <th>行类别</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="rows"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </main>
+  <div id="toast" class="toast"></div>
+  <section id="drawer" class="drawer">
+    <div class="sync-head"><span>同步结果</span><button id="close-drawer" class="secondary" type="button">关闭</button></div>
+    <div class="sync-note" id="sync-note"></div>
+    <div class="body"><table><thead><tr><th>结果</th><th>日期</th><th>表</th><th>品名</th><th>数量</th><th>金额</th><th>说明</th></tr></thead><tbody id="sync-rows"></tbody></table></div>
+  </section>
+<script>
+const STATUS = { pending: "未识别", recognized: "待复核", confirmed: "已确认", error: "失败" };
+const $ = (id) => document.getElementById(id);
+let invoices = [];
+let current = null;
+let catalog = { sheets: { "蔬菜": [], "肉类": [] }, error: "" };
+let toastTimer = 0;
+
+function toast(text) {
+  const node = $("toast");
+  node.textContent = text;
+  node.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => node.classList.remove("show"), 3200);
+}
+
+async function api(url, options) {
+  const response = await fetch(url, options);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.detail || "请求失败");
+  return data;
+}
+
+function badge(status) {
+  return `<span class="badge b-${status}">${STATUS[status] || status}</span>`;
+}
+
+function renderList() {
+  const counts = invoices.reduce((acc, item) => { acc[item.status] = (acc[item.status] || 0) + 1; return acc; }, {});
+  $("summary").textContent = `共 ${invoices.length} · 已确认 ${counts.confirmed || 0} · 待复核 ${counts.recognized || 0}`;
+  $("list").replaceChildren();
+  if (!invoices.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "目录里还没有 jpg / png / webp 截图";
+    $("list").appendChild(empty);
+    return;
+  }
+  for (const item of invoices) {
+    const node = document.createElement("div");
+    node.className = "item" + (current && current.id === item.id ? " active" : "");
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = item.filename;
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.innerHTML = badge(item.status);
+    const date = document.createElement("span");
+    date.textContent = item.date || "无日期";
+    meta.appendChild(date);
+    node.appendChild(name);
+    node.appendChild(meta);
+    node.addEventListener("click", () => openInvoice(item.id));
+    $("list").appendChild(node);
+  }
+}
+
+function optionsFor(category, selected) {
+  const names = (catalog.sheets && catalog.sheets[category]) || [];
+  const select = document.createElement("select");
+  select.className = "name";
+  const blank = document.createElement("option");
+  blank.value = "";
+  blank.textContent = "（不写入）";
+  select.appendChild(blank);
+  const seen = new Set();
+  for (const item of names) {
+    seen.add(item.name);
+    const option = document.createElement("option");
+    option.value = item.name;
+    option.textContent = item.unit ? `${item.name}（${item.unit}）` : item.name;
+    select.appendChild(option);
+  }
+  if (selected && !seen.has(selected)) {
+    const option = document.createElement("option");
+    option.value = selected;
+    option.textContent = selected;
+    select.appendChild(option);
+  }
+  select.value = selected || "";
+  return select;
+}
+
+function renderInvoice() {
+  $("rows").replaceChildren();
+  if (!current) {
+    $("title").textContent = "明细";
+    $("picture").replaceChildren(Object.assign(document.createElement("div"), { className: "empty", textContent: "选择一张电子单" }));
+    return;
+  }
+  $("title").textContent = current.filename;
+  $("bill-date").value = current.date || "";
+  const locked = current.status === "confirmed";
+  for (const id of ["bill-date", "save", "remap", "confirm", "add-line", "recognize"]) {
+    $(id).disabled = locked || current.status === "pending" && id !== "recognize";
+  }
+  $("recognize").disabled = locked;
+  $("unconfirm").disabled = !locked;
+  const picture = document.createElement("img");
+  picture.alt = current.filename;
+  picture.src = `/api/invoices/${encodeURIComponent(current.id)}/image?t=${Date.now()}`;
+  picture.addEventListener("error", () => {
+    $("picture").textContent = "图片读不出来";
+  });
+  $("picture").replaceChildren(picture);
+  const banner = $("banner");
+  const messages = [current.catalog_error, current.warning, current.error].filter(Boolean);
+  banner.style.display = messages.length ? "block" : "none";
+  banner.textContent = messages.join(" ");
+  for (const line of current.lines) {
+    const tr = document.createElement("tr");
+    tr.dataset.line = String(line.line_no);
+    const raw = document.createElement("td");
+    const rawName = document.createElement("div");
+    rawName.className = "raw";
+    rawName.textContent = line.raw_name || "（补录）";
+    const reason = document.createElement("div");
+    const preview = line.preview || {};
+    reason.className = "reason" + (preview.will_write ? " ok" : " bad");
+    const bits = [line.map_reason, preview.reason].filter(Boolean);
+    if (preview.will_write) bits.push(`落表 ${preview.write_qty || ""}${preview.write_unit || ""}`);
+    if (line.suggestion && line.map_status !== "model") bits.push(`建议 ${line.suggestion}`);
+    reason.textContent = bits.join(" · ");
+    raw.append(rawName, reason);
+    const nameCell = document.createElement("td");
+    const select = optionsFor(line.category, line.name);
+    select.disabled = locked;
+    select.addEventListener("change", () => { line.name = select.value; });
+    nameCell.appendChild(select);
+    const qty = field(line.qty ?? "", "qty", locked, (value) => { line.qty = value; });
+    const unit = field(line.unit || "", "unit", locked, (value) => { line.unit = value; });
+    const amount = field(line.amount ?? "", "amount", locked, (value) => { line.amount = value; });
+    const categoryCell = document.createElement("td");
+    const category = document.createElement("select");
+    category.className = "category";
+    for (const value of ["", "蔬菜", "肉类"]) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = value || "未分";
+      category.appendChild(option);
+    }
+    category.value = line.category || "";
+    category.disabled = locked;
+    category.addEventListener("change", () => {
+      line.category = category.value;
+      const next = optionsFor(line.category, line.name);
+      next.disabled = locked;
+      next.addEventListener("change", () => { line.name = next.value; });
+      nameCell.replaceChildren(next);
+    });
+    categoryCell.appendChild(category);
+    const removeCell = document.createElement("td");
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "secondary";
+    remove.textContent = "删";
+    remove.disabled = locked;
+    remove.addEventListener("click", () => {
+      current.lines = current.lines.filter((item) => item.line_no !== line.line_no);
+      renderInvoice();
+    });
+    removeCell.appendChild(remove);
+    tr.append(raw, nameCell, qty, unit, amount, categoryCell, removeCell);
+    $("rows").appendChild(tr);
+  }
+  if (!current.lines.length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 7;
+    td.className = "empty";
+    td.textContent = current.status === "pending" ? "还没识别" : "没有明细";
+    tr.appendChild(td);
+    $("rows").appendChild(tr);
+  }
+}
+
+function field(value, className, locked, onInput) {
+  const td = document.createElement("td");
+  const input = document.createElement("input");
+  input.className = className;
+  input.value = value;
+  input.disabled = locked;
+  input.addEventListener("input", () => onInput(input.value));
+  td.appendChild(input);
+  return td;
+}
+
+function payload() {
+  return {
+    date: $("bill-date").value,
+    lines: (current.lines || []).map((line) => ({
+      line_no: line.line_no,
+      name: line.name || "",
+      qty: line.qty ?? "",
+      unit: line.unit || "",
+      amount: line.amount ?? "",
+      category: line.category || "",
+    })),
+  };
+}
+
+async function openInvoice(id) {
+  current = await api(`/api/invoices/${encodeURIComponent(id)}`);
+  renderList();
+  renderInvoice();
+}
+
+async function refreshList(selectId) {
+  const data = await api("/api/invoices");
+  invoices = data.invoices;
+  renderList();
+  if (selectId) await openInvoice(selectId);
+}
+
+async function loadShell() {
+  const [settings, listed, books] = await Promise.all([
+    api("/api/settings"),
+    api("/api/invoices"),
+    api("/api/catalog"),
+  ]);
+  $("input-dir").value = settings.input_dir || "";
+  $("material-file").value = settings.material_file || "";
+  invoices = listed.invoices;
+  catalog = books;
+  renderList();
+  const last = await api("/api/sync/last");
+  if (last && last.synced_at) showSync(last);
+}
+
+function showSync(result) {
+  $("sync-note").textContent = result.synced_at
+    ? `${result.synced_at} · 已确认 ${ (result.invoices || []).length } 张 · 不写员工餐${result.backup ? " · 已备份" : ""}`
+    : "还没有同步过";
+  const body = $("sync-rows");
+  body.replaceChildren();
+  for (const row of result.written || []) {
+    body.appendChild(syncRow("写入", row.date, row.sheet, row.name, row.qty, row.amount, row.unit || "", false));
+  }
+  for (const row of result.skipped || []) {
+    body.appendChild(syncRow("跳过", row.date, row.sheet, row.raw_name || row.name, "", "", row.reason, true));
+  }
+  if (!(result.written || []).length && !(result.skipped || []).length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 7;
+    td.textContent = "没有可显示的行";
+    tr.appendChild(td);
+    body.appendChild(tr);
+  }
+  $("drawer").classList.add("show");
+}
+
+function syncRow(label, date, sheet, name, qty, amount, note, skipped) {
+  const tr = document.createElement("tr");
+  for (const text of [label, date || "", sheet || "", name || "", qty ?? "", amount ?? "", note || ""]) {
+    const td = document.createElement("td");
+    td.textContent = text;
+    if (text === label) td.className = skipped ? "tag-skip" : "tag-write";
+    tr.appendChild(td);
+  }
+  return tr;
+}
+
+$("apply-scan").addEventListener("click", async () => {
+  try {
+    await api("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ input_dir: $("input-dir").value, material_file: $("material-file").value }) });
+    const data = await api("/api/scan", { method: "POST" });
+    invoices = data.invoices;
+    catalog = await api("/api/catalog");
+    current = null;
+    renderList();
+    renderInvoice();
+    toast(`扫到 ${invoices.length} 张`);
+  } catch (error) { toast(error.message); }
+});
+
+$("recognize").addEventListener("click", async () => {
+  if (!current) return;
+  try {
+    current = await api(`/api/invoices/${encodeURIComponent(current.id)}/recognize`, { method: "POST" });
+    await refreshList(current.id);
+    toast("识别完成，请按行复核");
+  } catch (error) { toast(error.message); if (current) await refreshList(current.id); }
+});
+
+$("recognize-all").addEventListener("click", async () => {
+  const targets = invoices.filter((item) => item.status !== "confirmed");
+  let failed = 0;
+  for (const item of targets) {
+    try { await api(`/api/invoices/${encodeURIComponent(item.id)}/recognize`, { method: "POST" }); }
+    catch (_error) { failed += 1; }
+  }
+  await refreshList(current && current.id);
+  toast(failed ? `识别结束，${failed} 张失败` : "未确认的单据已识别");
+});
+
+$("save").addEventListener("click", async () => {
+  if (!current) return;
+  try {
+    current = await api(`/api/invoices/${encodeURIComponent(current.id)}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload()) });
+    await refreshList(current.id);
+    toast("已保存，尚未写入物料表");
+  } catch (error) { toast(error.message); }
+});
+
+$("remap").addEventListener("click", async () => {
+  if (!current) return;
+  try {
+    await api(`/api/invoices/${encodeURIComponent(current.id)}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload()) });
+    current = await api(`/api/invoices/${encodeURIComponent(current.id)}/remap`, { method: "POST" });
+    await refreshList(current.id);
+    toast("已按当前行类别重新匹配");
+  } catch (error) { toast(error.message); }
+});
+
+$("confirm").addEventListener("click", async () => {
+  if (!current) return;
+  try {
+    current = await api(`/api/invoices/${encodeURIComponent(current.id)}/confirm`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload()) });
+    await refreshList(current.id);
+    toast("已确认。物料表还没改，要点「同步到物料明细」");
+  } catch (error) { toast(error.message); }
+});
+
+$("unconfirm").addEventListener("click", async () => {
+  if (!current) return;
+  try {
+    current = await api(`/api/invoices/${encodeURIComponent(current.id)}/unconfirm`, { method: "POST" });
+    await refreshList(current.id);
+    toast("已取消确认");
+  } catch (error) { toast(error.message); }
+});
+
+$("add-line").addEventListener("click", () => {
+  if (!current || current.status === "confirmed") return;
+  const max = current.lines.reduce((n, line) => Math.max(n, line.line_no), 0);
+  current.lines.push({ line_no: max + 1, raw_name: "", name: "", qty: "", unit: "", amount: "", category: "", map_status: "unmapped", map_reason: "补录行，选物料品名后才会落表", preview: { will_write: false, reason: "尚未保存" }, suggestion: "" });
+  renderInvoice();
+});
+
+$("sync").addEventListener("click", async () => {
+  if (!window.confirm("只同步已经点过「确认」的单据，页面上还没确认的修改不会写入。单元格按已确认合计重写，不与旧数相加。员工餐不写。继续？")) return;
+  try {
+    const result = await api("/api/sync", { method: "POST" });
+    showSync(result);
+    toast(`写入 ${result.written.length} 格汇总，跳过 ${result.skipped.length} 行`);
+  } catch (error) { toast(error.message); }
+});
+
+$("close-drawer").addEventListener("click", () => $("drawer").classList.remove("show"));
+loadShell().catch((error) => toast(error.message));
+</script>
+</body>
+</html>
