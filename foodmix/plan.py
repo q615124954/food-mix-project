@@ -36,8 +36,8 @@ class Skip:
 class Write:
     sheet: str
     row: int
-    qty_col: int
-    amt_col: int
+    qty_col: int | None
+    amt_col: int | None
     name: str
     code: str
     unit: str
@@ -45,6 +45,7 @@ class Write:
     qty: Decimal | None
     amount: Decimal | None
     invoice_ids: list[str] = field(default_factory=list)
+    serial: int | None = None
 
 
 def _skip(line: BillLine, reason: str, sheet: str = "") -> Skip:
@@ -57,7 +58,7 @@ def build_plan(
     rules: list[UnitRule],
     layout: SheetLayout,
 ) -> tuple[list[Write], list[Skip]]:
-    """按行类别选表，再按日期 + 物料行汇总。不读单元格旧值。"""
+    """按行类别选表，再按日期 + 物料行汇总。不读单元格旧值。缺日期列时仍列入写入计划，由同步补列。"""
     buckets: dict[tuple, dict] = {}
     order: list[tuple] = []
     skipped: list[Skip] = []
@@ -82,22 +83,22 @@ def build_plan(
             skipped.append(_skip(line, f"「{label}」在「{sheet}」中找不到，跳过不写", sheet))
             continue
         serial = excel_serial(line.date)
-        date_col = catalog.sheets[sheet].dates.get(serial) if serial is not None else None
-        if date_col is None:
-            skipped.append(_skip(line, f"「{sheet}」没有日期 {line.date} 的数量/金额列，未写入", sheet))
+        if serial is None:
+            skipped.append(_skip(line, f"日期 {line.date} 无法识别，未写入", sheet))
             continue
         converted = convert_quantity(item.name, line.qty, line.unit, item.unit, rules)
         if not converted.ok:
             skipped.append(_skip(line, converted.reason, sheet))
             continue
-        key = (sheet, item.row, date_col.qty_col)
+        date_col = catalog.sheets[sheet].dates.get(serial)
+        key = (sheet, item.row, serial)
         bucket = buckets.get(key)
         if bucket is None:
             bucket = {
                 "sheet": sheet,
                 "row": item.row,
-                "qty_col": date_col.qty_col,
-                "amt_col": date_col.amt_col,
+                "qty_col": date_col.qty_col if date_col else None,
+                "amt_col": date_col.amt_col if date_col else None,
                 "name": item.name,
                 "code": item.code,
                 "unit": item.unit,
@@ -105,6 +106,7 @@ def build_plan(
                 "qty": None,
                 "amount": None,
                 "invoice_ids": [],
+                "serial": serial,
             }
             buckets[key] = bucket
             order.append(key)

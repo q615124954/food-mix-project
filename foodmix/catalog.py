@@ -80,24 +80,33 @@ def _date_cells(ws, row: int) -> list[tuple[int, int]]:
     return found
 
 
-def _parse_sheet(ws, sheet_name: str, layout: SheetLayout) -> ParsedSheet:
-    header_row = None
+def _find_header_row(ws, sheet_name: str) -> int:
     for row in range(1, min(ws.max_row or 1, 40) + 1):
         labels = [str(ws.cell(row, col).value or "").strip() for col in range(1, 7)]
         if "品名" in labels and _date_cells(ws, row):
-            header_row = row
-            break
-    if header_row is None:
-        raise AppError(f"「{sheet_name}」找不到同时带品名和日期列的表头")
-    dates: dict[int, DateCol] = {}
+            return row
+    raise AppError(f"「{sheet_name}」找不到同时带品名和日期列的表头")
+
+
+def inspect_dates(ws, sheet_name: str, layout: SheetLayout) -> tuple[int, dict[int, DateCol], dict[int, int]]:
+    """返回表头行、能写入的日期列，以及序列号在但「数量/金额」对不上的列。"""
+    header_row = _find_header_row(ws, sheet_name)
     sub = header_row + 1
+    dates: dict[int, DateCol] = {}
+    broken: dict[int, int] = {}
     for col, serial in _date_cells(ws, header_row):
         qty_label = str(ws.cell(sub, col).value or "").strip()
         amt_col = col + layout.amount_column_offset
         amt_label = str(ws.cell(sub, amt_col).value or "").strip()
         if qty_label != "数量" or amt_label != "金额":
+            broken.setdefault(serial, col)
             continue
         dates[serial] = DateCol(serial=serial, qty_col=col, amt_col=amt_col)
+    return header_row, dates, broken
+
+
+def _parse_sheet(ws, sheet_name: str, layout: SheetLayout) -> ParsedSheet:
+    header_row, dates, _broken = inspect_dates(ws, sheet_name, layout)
     items: list[Item] = []
     seen: set[str] = set()
     for row in range(header_row + 2, (ws.max_row or 0) + 1):
